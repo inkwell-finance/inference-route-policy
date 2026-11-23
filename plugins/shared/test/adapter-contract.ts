@@ -104,6 +104,27 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().inference().length, 0);
   });
 
+  test(`C1, C14: ${name}: a base URL with an empty query is read with its "?", and a request that drops it is stopped`, async () => {
+    const harness = await make("zdr");
+    const base = harness.model.baseUrl;
+    harness.model.baseUrl = `${base}?`;
+    harness.wireUrl = `${base}/chat/completions?`;
+    assert.ok((await harness.request()).sent, "sent with the ? it was read with");
+    const path = new URL(base).pathname;
+    assert.deepEqual(gateway().requests.map((r) => `${r.method} ${r.path}`), [`GET ${path}/route-policy?`, `GET ${path}/models?`, `POST ${path}/chat/completions?`]);
+    harness.wireUrl = `${base}/chat/completions`;
+    assert.match((await harness.request()).error ?? "", /is not one the plugin released/);
+    assert.equal(gateway().inference().length, 1);
+  });
+
+  test(`C1, C14: ${name}: a configured header that is not a string is not read as context, so a transport that sends it anyway is stopped`, async () => {
+    const harness = await make("zdr");
+    Object.assign(harness.model, { headers: { "x-tenant": 7 } });
+    assert.match((await harness.request()).error ?? "", /is not one the plugin released: .*it carries authorization, x-tenant besides the usual ones/);
+    assert.ok(gateway().requests.filter((r) => r.method === "GET").every((r) => r.headers["x-tenant"] === undefined), "the metadata reads did not carry it");
+    assert.equal(gateway().inference().length, 0);
+  });
+
   test(`C5, C14: ${name}: with two sessions in one process and requests in flight together, each response goes to the session that sent the request`, async () => {
     const first = await make("zdr");
     const second = await make("notrain");

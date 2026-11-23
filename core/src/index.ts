@@ -190,6 +190,14 @@ function valueFailure(key: string, value: Value, attest: ReadonlySet<string>, so
 const defined = (listed: ReadonlySet<string>, baseline: readonly string[]): ReadonlySet<string> => new Set(baseline.filter((value) => listed.has(value)));
 
 /**
+ * Whether a string fits the policy grammar and limits alone (S1 to S4, S16), whatever its keys and values mean.
+ * A policy from a later revision passes; `parsePolicy` decides what a given gateway accepts.
+ */
+export function fitsPolicyGrammar(text: string): Result<true> {
+  return walk(text, () => null) ?? { ok: true, value: true };
+}
+
+/**
  * Parses one carrier's policy against what the gateway accepts (S1 to S10, S16). The result is the whole policy or
  * the first failure in the spec's order of checks.
  */

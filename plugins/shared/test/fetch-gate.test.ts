@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { addRelease, addWatcher, type Release } from "../src/fetch-gate.ts";
-import type { Completion } from "../src/request.ts";
+import { placeOf, type Completion } from "../src/request.ts";
 import { fakeGateway, type FakeGateway } from "./fixtures.ts";
 
 let gateway: FakeGateway;
@@ -186,6 +186,75 @@ test("C3: repeated Route-Applied lines reach the reader as one joined value", as
   gateway.replies.inference = { status: 200, headers: { "route-applied": ["provider=aurora", "provider=basalt"] }, body: {} };
   await (await post()).text();
   assert.deepEqual(owner.completions[0]?.result.applied, ["provider=aurora, provider=basalt"]);
+});
+
+test("C1, C14: a request goes only where fetch puts it on the wire for the released base URL, and each form that differs there is stopped", async () => {
+  // Every POST no release matches is stopped, wherever it goes.
+  removals.push(addWatcher({ check: () => "not released", stopped: () => {} }));
+  const G = new URL(gateway.base).origin;
+  const port = new URL(gateway.base).port;
+  // `target` is the request target the gateway receives, or, for a request that must not go, why it is stopped.
+  type Row = { name: string; base: string; url: string; target: string | RegExp };
+  const rows: Row[] = [
+    { name: "trailing slash on the base", base: `${G}/v1/`, url: `${G}/v1/chat/completions`, target: "/v1/chat/completions" },
+    { name: "an empty segment after the base", base: `${G}/v1/`, url: `${G}/v1//chat/completions`, target: /not released/ },
+    { name: "dot segments, resolved before sending", base: `${G}/v1`, url: `${G}/v1/x/../chat/completions`, target: "/v1/chat/completions" },
+    { name: "a percent-encoded path, not decoded", base: `${G}/v1`, url: `${G}/v%31/chat/completions`, target: /not released/ },
+    { name: "+ in the query, kept", base: `${G}/v1?q=a+b`, url: `${G}/v1/chat/completions?q=a+b`, target: "/v1/chat/completions?q=a+b" },
+    { name: "%20 for +", base: `${G}/v1?q=a+b`, url: `${G}/v1/chat/completions?q=a%20b`, target: /not released/ },
+    { name: "percent-encoding case", base: `${G}/v1?q=%2b`, url: `${G}/v1/chat/completions?q=%2B`, target: /not released/ },
+    { name: "uppercase scheme, lowercased before sending", base: `${G}/v1`, url: `HTTP://127.0.0.1:${port}/v1/chat/completions`, target: "/v1/chat/completions" },
+    { name: "a trailing dot on an IPv4 host, removed before sending", base: `${G}/v1`, url: `http://127.0.0.1.:${port}/v1/chat/completions`, target: "/v1/chat/completions" },
+    { name: "a fragment, never sent", base: `${G}/v1`, url: `${G}/v1/chat/completions#part`, target: "/v1/chat/completions" },
+    { name: "an empty query before a fragment", base: `${G}/v1?`, url: `${G}/v1/chat/completions?#part`, target: "/v1/chat/completions?" },
+    { name: "an empty query dropped", base: `${G}/v1?`, url: `${G}/v1/chat/completions`, target: /not released/ },
+    { name: "credentials in the URL", base: `${G}/v1`, url: `http://user:secret@127.0.0.1:${port}/v1/chat/completions`, target: /credentials/ },
+  ];
+  for (const row of rows) {
+    gateway.requests.length = 0;
+    const place = placeOf(row.base);
+    assert.ok(place !== null, row.name);
+    const owner = release({ ...place });
+    const sending = fetch(row.url, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY });
+    if (row.target instanceof RegExp) {
+      await assert.rejects(sending, row.target, row.name);
+      assert.equal(gateway.requests.length, 0, row.name);
+    } else {
+      await (await sending).text();
+      assert.deepEqual([gateway.requests.map((r) => r.path), owner.completions.length], [[row.target], 1], row.name);
+    }
+    // An unused release is withdrawn, so each row starts with only its own.
+    removals.pop()?.();
+  }
+});
+
+test("C1, C14: header lines as fetch sends them: repeated lines go as one joined line, and values trimmed, as the release was read", async () => {
+  watchAll();
+  const owner = release({ context: [["authorization", "Bearer k"], ["x-tenant", "a, b"]] });
+  await (await post({ headers: [["Authorization", "  Bearer k  "], ["x-tenant", "a"], ["X-Tenant", "b"], ["route-policy", "zdr"]] })).text();
+  assert.equal(owner.completions.length, 1);
+  const raw = gateway.inference()[0]?.rawHeaders ?? [];
+  const lines = (name: string): string[] => raw.flatMap((value, i) => (i % 2 === 1 && raw[i - 1]?.toLowerCase() === name ? [value] : []));
+  assert.deepEqual([lines("x-tenant"), lines("authorization")], [["a, b"], ["Bearer k"]], "one line each, as the metadata reads sent them");
+});
+
+test("C1, C14: a base URL is the same place however the parser was handed it, and a different one when the parser keeps the difference", () => {
+  const same: [string, string][] = [
+    ["HTTP://GateWay.Test/v1", "http://gateway.test/v1"],
+    ["http://gateway.test:80/v1", "http://gateway.test/v1"],
+    ["https://gateway.test:443/v1", "https://gateway.test/v1"],
+    ["http://[0:0:0:0:0:0:0:1]:8/v1", "http://[::1]:8/v1"],
+    ["http://gateway.test/a/./b/../v1/", "http://gateway.test/a/v1"],
+    ["http://gateway.test/v1#part", "http://gateway.test/v1"],
+  ];
+  for (const [given, base] of same) assert.deepEqual(placeOf(given), { base, query: "" }, given);
+  const different: [string, string][] = [
+    ["http://gateway.test./v1", "http://gateway.test/v1"],
+    ["http://gateway.test/V1", "http://gateway.test/v1"],
+    ["http://gateway.test/%761", "http://gateway.test/v1"],
+  ];
+  for (const [given, other] of different) assert.notDeepEqual(placeOf(given), placeOf(other), given);
+  assert.equal(placeOf("http://user:secret@gateway.test/v1"), null, "credentials in the URL name no place fetch can send to");
 });
 
 test("C1: a GET is never stopped, and a POST no watcher claims goes", async () => {

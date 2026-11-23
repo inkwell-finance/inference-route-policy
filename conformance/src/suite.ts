@@ -1,9 +1,9 @@
 import {
-  baselineSupport, combinePolicies, formatRefused, isEvidenceUri, isProviderId, keysOf, meets, parseDetection,
+  baselineSupport, combinePolicies, fitsPolicyGrammar, formatRefused, isEvidenceUri, isProviderId, keysOf, meets, parseDetection,
   parsePolicy, parsePublishedFacts, parseRefused, publishedRoutes, REFUSAL_STATUS, someRouteMeets, splitModel,
   type Detection, type Policy, type PublishedRoute, type RefusalReason, type Support,
 } from "../../core/src/index.ts";
-import { request, sent, type Credential, type Observation, type Probe } from "./http.ts";
+import { parseBase, request, sent, type Credential, type Observation, type Probe } from "./http.ts";
 import { applied, auditResults, noResult, type AuditId, type Exchange, type ResultContext } from "./outcomes.ts";
 
 export const INFERENCE_ENDPOINTS = ["chat/completions", "responses", "messages"] as const;
@@ -84,7 +84,7 @@ function schemaProblem(body: unknown): string | undefined {
 }
 
 function discover(body: unknown, support: Support): Model[] {
-  const catalogs = new Map<string, Model["routes"]>();
+  const catalogs = new Map<string, unknown>();
   const providers = new Set<string>();
   for (const entry of list(member(body, "data")) ?? []) {
     const id = member(entry, "id");
@@ -93,11 +93,13 @@ function discover(body: unknown, support: Support): Model[] {
       const provider = member(route, "provider");
       if (isProviderId(provider)) providers.add(provider);
     }
-    if (splitModel(id).policy === null) catalogs.set(id, publishedRoutes(body, id));
+    if (splitModel(id).policy === null) catalogs.set(id, catalogs.has(id) ? null : entry);
   }
   const unknown = unused(providers, "routeprobe");
   const models: Model[] = [];
-  for (const [id, routes] of catalogs) {
+  for (const [id, entry] of catalogs) {
+    if (entry === null) continue;
+    const routes = publishedRoutes({ data: [entry] }, id);
     const texts = new Set(["zdr", "notrain", "bits=1", "bits=64", "region=us", "region=de", "attest=weights", "attest=prompt", "attest=weights,prompt", `only=${unknown}`, `ignore=${unknown}`, `order=${unknown}`]);
     for (const sort of support.sort) texts.add(`sort=${sort}`);
     for (const [provider, route] of routes) {
@@ -200,10 +202,7 @@ function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
 }
 
 export async function runConformance(options: Options): Promise<Report> {
-  const base = new URL(options.base);
-  if ((base.protocol !== "http:" && base.protocol !== "https:") || base.href.includes("#") || base.username || base.password) {
-    throw new TypeError("base must be an HTTP(S) API base URL without a fragment or credentials");
-  }
+  const base = parseBase(options.base);
   const endpoints = options.endpoints ?? INFERENCE_ENDPOINTS;
   if (endpoints.length === 0 || endpoints.some((endpoint) => !INFERENCE_ENDPOINTS.includes(endpoint))) throw new TypeError("provide at least one recognized inference endpoint");
   const checks: Check[] = [];
@@ -290,27 +289,30 @@ export async function runConformance(options: Options): Promise<Report> {
     if (firstFailure !== undefined) throw firstFailure;
   });
   await check("G22", "only credentialed detection may report a policy, valid under its own lists", async () => {
-    let inspected = 0;
+    let missing: string | undefined;
     for (const current of detectionScopes) {
       const reply = current.detectionReply;
-      if (reply === undefined) continue;
-      inspected++;
-      if (member(reply.body, "key_policy") === undefined) continue;
-      if (current.credential === undefined) {
-        throw mismatch(metadata("route-policy", current), reply.received, "key_policy absent for anonymous detection");
+      if (reply === undefined || reply.body === null || typeof reply.body !== "object" || Array.isArray(reply.body)) {
+        missing ??= "an inspectable detection object under each supplied credential and anonymously";
+        continue;
       }
-      // Status and version belong to G20, not to the validity of this policy.
-      const body = { route_policy: "1", ...Object.fromEntries(["keys", "attest", "sort", "key_policy"]
-        .flatMap((name) => {
-          const value = member(reply.body, name);
-          return value === undefined ? [] : [[name, value]];
-        })) };
+      const keyPolicy = member(reply.body, "key_policy");
+      if (keyPolicy === undefined) continue;
+      const probe = metadata("route-policy", current);
+      if (current.credential === undefined) throw mismatch(probe, reply.received, "key_policy absent for anonymous detection");
+      if (typeof keyPolicy !== "string") throw mismatch(probe, reply.received, "key_policy is a string");
+      const syntax = fitsPolicyGrammar(keyPolicy);
+      if (!syntax.ok) throw mismatch(probe, reply.received, `key_policy fits the policy grammar: ${syntax.detail}`);
+      // Status and version belong to G20. The core checks the bound policy
+      // against the full advertised lists, including later-revision entries.
+      const body = { ...reply.body, route_policy: "1" };
       const parsed = parseDetection({ status: 200, body, credentialed: true });
-      if (!parsed.ok && parsed.key === "key_policy") {
-        throw mismatch(metadata("route-policy", current), reply.received, `key_policy valid under the advertised lists: ${parsed.detail}`);
+      if (!parsed.ok) {
+        if (parsed.key === "key_policy") throw mismatch(probe, reply.received, `key_policy valid under the advertised lists: ${parsed.detail}`);
+        missing ??= `valid advertised lists to check key_policy: ${parsed.key ?? "detection"} ${parsed.detail}`;
       }
     }
-    if (inspected !== detectionScopes.size) return "an inspectable detection reply under each supplied credential and anonymously";
+    return missing;
   });
   await check("G23", "unique model and provider ids with valid published facts and evidence for each credential", async () => {
     let firstFailure: unknown;
@@ -450,6 +452,7 @@ export async function runConformance(options: Options): Promise<Report> {
       if (!knowBound) return "a plain key default this suite can interpret";
       if (positive !== undefined) await expect(inference(positive.model.id, undefined, positive.text), "suffixed request resolves to a qualifying route or unavailable", allowedOrUnavailable(positive.allowed));
       if (negative !== undefined) await expect(inference(negative.model.id, undefined, negative.text), "unsatisfiable suffix returns 400 unsatisfiable", unsatisfiable);
+      if (positive === undefined && negative === undefined) return "an accepted policy to probe the suffix carrier";
     });
     await run("G9", "the HTTP header applies and two differently cased field lines refuse without a key", async () => {
       if (first === undefined) return needModel;
@@ -458,6 +461,7 @@ export async function runConformance(options: Options): Promise<Report> {
       if (!knowBound) return "a plain key default this suite can interpret";
       if (positive !== undefined) await expect(inference(positive.model.id, positive.text), "header routes only among matching providers or returns unavailable", allowedOrUnavailable(positive.allowed));
       if (negative !== undefined) await expect({ ...inference(negative.model.id, negative.text), mixedCasePolicy: true }, "a mixed-case Route-Policy header applies even when unsatisfiable", unsatisfiable);
+      if (positive === undefined && negative === undefined) return "an accepted policy to probe a single Route-Policy header";
     });
     await run("G10", "a bound key policy applies with no explicit carrier", async () => {
       if (policyBound === undefined) return "a usable credential with a detected, interpretable policy (supply --policy-key)";
@@ -471,7 +475,7 @@ export async function runConformance(options: Options): Promise<Report> {
       if (first === undefined) return needModel;
       await expect(inference(first.id, "bits=0", "only=x,x"), "first failing carrier is the header, whose key is bits", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(first.id, "only=x,x", "bits=0"), "swapping malformed carriers reports only, the header's first failure", (r) => refusal(r, "unsupported", "only"));
-      if (!knowBound) return "a plain key default this suite can interpret";
+      if (!knowBound || positive === undefined) return "a satisfiable accepted policy under an interpretable key default to test carrier combination";
       for (const left of positives) {
         const right = positives.find((candidate) => candidate.model === left.model && keysOf(candidate.policy)[0] !== keysOf(left.policy)[0] && !candidate.allowed.some((id) => left.allowed.includes(id)));
         if (right === undefined) continue;
@@ -678,11 +682,13 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       if (!ran) return "an accepted provider-selection key and a suitable published model";
     });
-    await run("G25", "malformed bodies, unknown models, and rejected credentials take precedence", async () => {
+    await run("G25", "the observed ordinary errors take precedence over policy checks", async () => {
       const malformed = bodyProbe("{");
       const malformedControl = await ordinaryError(malformed);
       await compareOwn(malformedControl, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] });
       await compareOwn(await ordinaryError(bodyProbe('{"model":4}')), { ...bodyProbe('{"model":4}'), policies: [INVALID_POLICY] });
+      const missingModel = bodyProbe("{}");
+      await compareOwn(await ordinaryError(missingModel), { ...missingModel, policies: [INVALID_POLICY] });
       await compareOwn(await ordinaryError(inference("")), inference("", INVALID_POLICY, INVALID_POLICY));
       const missing: string[] = [];
       const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
@@ -747,25 +753,29 @@ export async function runConformance(options: Options): Promise<Report> {
     });
     await run("G26", "ordinary traffic without a policy carries neither refusal nor evidence", async () => {
       if (detection?.keyPolicy !== null || first === undefined) return "a known unbound ordinary credential and a published base model";
-      await expect(inference(first.id), "without any policy, neither Route-Refused nor Route-Evidence", (r) => r.refused.length === 0 && r.evidence.length === 0);
+      const reply = await expect(inference(first.id), "without any policy, neither Route-Refused nor Route-Evidence", (r) => r.refused.length === 0 && r.evidence.length === 0);
+      if (isBareError(reply)) return "a policy-free response distinguishable from an own error";
     });
     await run("G29", "unsupported takes precedence over an otherwise unsatisfiable policy", async () => {
       if (negative === undefined || !knowBound) return "a supported policy no published route meets";
       await expect(inference(negative.model.id, "bits=0", negative.text), "invalid header takes precedence over unsatisfiable suffix", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(negative.model.id, negative.text, "bits=0"), "invalid suffix takes precedence over unsatisfiable header", (r) => refusal(r, "unsupported", "bits"));
     });
-    const endpointExchanges = exchanges.slice(firstExchange);
-    // A refusal with a different credential may use a different endpoint envelope.
-    const unmatched = new Set(endpointExchanges.filter(({ probe, reply }) => reply.refused.length > 0
-      && !endpointExchanges.some(({ probe: sample, ordinaryControl, reply: ordinary }) => sample.credential === probe.credential && ordinaryControl && ordinary.hasBody))
-      .map(({ probe }) => probe.credential));
-    for (const credential of unmatched) {
-      for (const raw of ["{", '{"model":4}']) {
-        const sample = await observe({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) }).catch(() => undefined);
-        if (sample !== undefined && isBareError(sample.reply)) sample.ordinaryControl = true;
+    const contextFor = (probe: Probe) => resultContext(probe, scopeFor(probe));
+    let audit = auditResults(exchanges.slice(firstExchange), contextFor);
+    if (audit.shapeControlsNeeded.size > 0) {
+      const observed = exchanges.slice(firstExchange);
+      for (const credential of audit.shapeControlsNeeded.keys()) {
+        const seen = new Set(observed.filter(({ probe, ordinaryControl }) => ordinaryControl && probe.credential === credential).map(({ probe }) => probe.raw));
+        // Change the kind of input error, not the endpoint or credential.
+        for (const raw of ["{", '{"model":4}', "{}", "[]", '{"model":null}', "", '{"model":false}']) {
+          if (seen.has(raw)) continue;
+          const sample = await observe({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) }).catch(() => undefined);
+          if (sample !== undefined && isBareError(sample.reply)) sample.ordinaryControl = true;
+        }
       }
+      audit = auditResults(exchanges.slice(firstExchange), contextFor);
     }
-    const audit = auditResults(exchanges.slice(firstExchange), (probe) => resultContext(probe, scopeFor(probe)));
     const audited = (id: AuditId, detail: string, missing?: string) => {
       const failure = audit.failures.get(id);
       const existing = checks.find((entry) => entry.id === id && entry.endpoint === endpoint);
@@ -776,13 +786,11 @@ export async function runConformance(options: Options): Promise<Report> {
       else if (failure !== undefined || (existing.status === "PASS" && missing !== undefined)) Object.assign(existing, verdict);
     };
     for (const [id] of audit.failures) audited(id, "");
-    audited("G6", "observed relays met the combined policy");
-    audited("G15", "observed policy relays named a published provider", audit.sawPolicyRelay ? undefined : "a relay for a request with a policy");
+    audited("G15", "observed policy relays named a published provider", audit.sawCatalogRelay ? undefined : "a policy relay with a published model catalog to verify its provider");
     audited("G17", "observed relays gave evidence exactly when required", audit.sawAttestationRelay ? undefined : "a relay for a policy with attest");
     audited("G19", "observed refusals and relays used exclusive single result headers", audit.sawPolicyResult ? undefined : "an observed policy refusal or relay");
-    audited("G26", "observed policy-free traffic carried neither refusal nor evidence");
-    audited("G34", "every observed refusal matched an endpoint error shape", audit.sawRefusal && audit.comparedErrorShape && !audit.unpairedErrorShape
-      ? undefined : audit.sawRefusal ? "an ordinary error body under the same credential for each observed refusal" : "an observed refusal");
+    audited("G34", "observed refusals matched the sampled endpoint error shapes", audit.sawRefusal
+      ? audit.shapeControlsNeeded.values().next().value : "an observed refusal");
   }
 
   return { checks, passed: checks.filter((c) => c.status === "PASS").length, failed: checks.filter((c) => c.status === "FAIL").length, skipped: checks.filter((c) => c.status === "SKIP").length };

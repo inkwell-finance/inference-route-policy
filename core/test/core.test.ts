@@ -9,6 +9,7 @@ import {
   combinePolicies,
   formatApplied,
   formatDetection,
+  fitsPolicyGrammar,
   formatPolicy,
   formatRefused,
   hasRequirements,
@@ -1407,4 +1408,29 @@ test("C6: a bound policy that repeats a key or an item makes the reply no detect
     assert.equal(reply.key, "key_policy", bound);
   }
   assert.equal(parseDetection({ route_policy: "1", key_policy: "zdr+notrain" }).ok, true);
+});
+
+test("S1, S3, S16: fitsPolicyGrammar judges grammar and limits alone, so a later revision's keys and values pass", () => {
+  for (const text of ["zdr", "zdr+bits=8", "later", "later=x,y+zdr", "bits=999", "zdr=yes", "sort=unknown", "region=zz"]) {
+    assert.deepEqual(fitsPolicyGrammar(text), { ok: true, value: true }, text);
+  }
+  const failed = (text: string) => {
+    const result = fitsPolicyGrammar(text);
+    assert.ok(!result.ok, text);
+    return result.key;
+  };
+  assert.equal(failed(""), null);
+  assert.equal(failed("zdr+"), null);
+  assert.equal(failed("ZDR"), null);
+  assert.equal(failed("zdr+zdr"), "zdr");
+  assert.equal(failed("only=a,a"), "only");
+  assert.equal(failed("only="), "only");
+  assert.equal(failed("only=a b"), "only");
+  const pairs = (count: number, value: string) => Array.from({ length: count }, (_, i) => `k${String(i).padStart(2, "0")}=${value}`).join("+");
+  assert.equal(new TextEncoder().encode(pairs(16, "x".repeat(28))).length, 527);
+  assert.equal(failed(pairs(16, "x".repeat(28))), null);
+  assert.equal(fitsPolicyGrammar(pairs(15, "x".repeat(28))).ok, true);
+  assert.equal(failed(pairs(17, "x")), null);
+  assert.equal(fitsPolicyGrammar(pairs(16, "x")).ok, true);
+  assert.equal(failed(`only=${"a".repeat(33)}`), "only");
 });

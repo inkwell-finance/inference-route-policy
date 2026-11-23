@@ -59,13 +59,37 @@ export const credentialed = (context: RequestContext): boolean => context.some((
 
 export const contextKey = (context: RequestContext): string => JSON.stringify(context);
 
-/** Where a request goes: the base URL without its query, and the query, which every request there carries too. */
+/**
+ * Where a request goes: the base URL without its query, and the query, which every request there carries too.
+ * Both are as `fetch` puts them on the wire: the URL parser's serialization, which is the request target `fetch`
+ * sends (scheme and host lowercased, default port and dot segments removed, percent-encoding and `+` kept as
+ * given). Metadata reads and the released request are both read through it, so equal here is equal on the wire.
+ */
 export interface Place {
+  /** Scheme, host, and path, without trailing slashes. */
   base: string;
+  /** "" when the URL has no query, "?" when it has an empty one, else "?" and the query as sent. */
   query: string;
 }
 
-/** A base URL as a place, or null when it is not an absolute URL. Trailing slashes are dropped from the path. */
+/**
+ * The query as `fetch` sends it, its "?" included. `URL.search` is "" both for no query and for an empty one,
+ * which are different targets on the wire (RFC 3986, 6.2.3); the serialization keeps the "?" of an empty one.
+ */
+function queryOf(url: URL): string {
+  if (url.search !== "") return url.search;
+  // Without its fragment, a URL whose serialization ends in "?" has an empty query.
+  const bare = new URL(url.href);
+  bare.hash = "";
+  return bare.href.endsWith("?") ? "?" : "";
+}
+
+/** A URL `fetch` can send: credentials in it make `fetch` refuse the request, so they name no place. */
+function sendable(url: URL): boolean {
+  return url.username === "" && url.password === "";
+}
+
+/** A base URL as a place, or null when it is not an absolute URL `fetch` can send to. */
 export function placeOf(baseUrl: string): Place | null {
   let url: URL;
   try {
@@ -73,13 +97,15 @@ export function placeOf(baseUrl: string): Place | null {
   } catch {
     return null;
   }
-  return { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: url.search };
+  if (!sendable(url)) return null;
+  return { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: queryOf(url) };
 }
 
 /** A request as it leaves through `fetch`, before anything is sent. */
 export interface Outgoing {
-  /** The URL without its query. */
+  /** Scheme, host, and path as sent: the URL without its query or fragment. */
   path: string;
+  /** As in `Place`: "" for no query, "?" for an empty one. */
   query: string;
   method: string;
   context: RequestContext;
@@ -89,15 +115,20 @@ export interface Outgoing {
   body: string | null;
 }
 
-/** Reads a request as it leaves. `init` overrides a `Request` input's headers and body, as `fetch` does. */
+/**
+ * Reads a request as it leaves. `init` overrides a `Request` input's headers and body, as `fetch` does. Headers
+ * are read through `Headers`, as `fetch` sends them: names case-insensitive, values trimmed, repeated lines joined
+ * into one. Throws, as `fetch` would, for a URL it cannot send.
+ */
 export function outgoingOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): Outgoing {
   const request = input instanceof Request ? input : null;
   const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  if (!sendable(url)) throw new TypeError("a URL with credentials in it is not sent");
   const headers = new Headers(init?.headers ?? request?.headers);
   const body = init !== undefined && "body" in init ? init.body : request?.body;
   return {
     path: `${url.origin}${url.pathname}`,
-    query: url.search,
+    query: queryOf(url),
     method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
     context: contextOf(headers),
     header: headers.get("route-policy"),

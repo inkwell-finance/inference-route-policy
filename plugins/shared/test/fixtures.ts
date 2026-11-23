@@ -40,6 +40,8 @@ export interface Recorded {
   method: string;
   path: string;
   headers: IncomingHttpHeaders;
+  /** The header lines as received, name and value alternating, so a test sees how many lines there were. */
+  rawHeaders: string[];
   body: string;
 }
 
@@ -82,7 +84,7 @@ export async function fakeGateway(): Promise<FakeGateway> {
     let body = "";
     for await (const chunk of request) body += String(chunk);
     const path = request.url ?? "";
-    requests.push({ method: request.method ?? "", path, headers: request.headers, body });
+    requests.push({ method: request.method ?? "", path, headers: request.headers, rawHeaders: request.rawHeaders, body });
     const models = replies.models;
     const inference = replies.inference;
     const recorded = requests[requests.length - 1];

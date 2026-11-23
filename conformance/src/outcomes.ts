@@ -22,12 +22,11 @@ export interface ResultContext {
 export type AuditId = "G1" | "G2" | "G3" | "G6" | "G7" | "G10" | "G13" | "G15" | "G17" | "G19" | "G21" | "G24" | "G26" | "G29" | "G34";
 export interface ResultAudit {
   failures: Map<AuditId, string>;
-  sawPolicyRelay: boolean;
+  sawCatalogRelay: boolean;
   sawAttestationRelay: boolean;
   sawPolicyResult: boolean;
   sawRefusal: boolean;
-  comparedErrorShape: boolean;
-  unpairedErrorShape: boolean;
+  shapeControlsNeeded: Map<Probe["credential"], string>;
 }
 
 const precedence: Readonly<Record<RefusalReason, number>> = { unsupported: 0, unsatisfiable: 1, unavailable: 2 };
@@ -40,38 +39,64 @@ export function applied(reply: Observation): string | null {
   return parsed.ok ? parsed.value : null;
 }
 
-function sameJsonShape(left: unknown, right: unknown): boolean {
-  if (left === null || right === null) return left === right;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right)) return false;
-    const a: unknown[] = left;
-    const b: unknown[] = right;
-    // Lists can differ in length and order, but cannot introduce a new element shape.
-    return a.length === 0 || b.length === 0 || (
-      a.every((x) => b.some((y) => sameJsonShape(x, y))) && b.every((y) => a.some((x) => sameJsonShape(x, y)))
-    );
+interface Shape {
+  contradiction?: string;
+  unseen?: string;
+}
+
+function jsonType(value: unknown): string {
+  return value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+}
+
+function compareJsonShape(value: unknown, controls: readonly unknown[], path: string): Shape {
+  if (controls.length === 0) return { unseen: path };
+  const type = jsonType(value);
+  const similar = controls.filter((sample) => jsonType(sample) === type);
+  if (similar.length === 0) return { contradiction: `${path} has type ${type}, which no control shows` };
+  let unseen: string | undefined;
+  if (Array.isArray(value)) {
+    const items: unknown[] = similar.flatMap((sample) => Array.isArray(sample) ? sample : []);
+    for (const item of value) {
+      const result = compareJsonShape(item, items, `${path}[]`);
+      if (result.contradiction !== undefined) return result;
+      unseen ??= result.unseen;
+    }
+  } else if (value !== null && typeof value === "object") {
+    const objects = similar.filter((sample) => sample !== null && typeof sample === "object");
+    for (const key of Object.keys(objects[0]!)) {
+      if (!Object.hasOwn(value, key) && objects.every((sample) => Object.hasOwn(sample, key))) {
+        return { contradiction: `${path}.${key} is missing but present in every control at ${path}` };
+      }
+    }
+    const fields: [string, unknown][] = Object.entries(value);
+    for (const [key, field] of fields) {
+      const members: unknown[] = objects.filter((sample) => Object.hasOwn(sample, key)).map((sample) => Reflect.get(sample, key));
+      const result = compareJsonShape(field, members, `${path}.${key}`);
+      if (result.contradiction !== undefined) return result;
+      unseen ??= result.unseen;
+    }
   }
-  if (typeof left !== "object" || typeof right !== "object") return typeof left === typeof right;
-  const keys = Object.keys(left);
-  return keys.length === Object.keys(right).length && keys.every((key) => {
-    if (!Object.hasOwn(right, key)) return false;
-    const a: unknown = Reflect.get(left, key);
-    const b: unknown = Reflect.get(right, key);
-    return sameJsonShape(a, b);
-  });
+  return unseen === undefined ? {} : { unseen };
 }
 
 function mediaType(reply: Observation): string | undefined {
   return reply.contentType?.split(";", 1)[0]?.trim().toLowerCase();
 }
 
-function sameErrorShape(ordinary: Observation, refusal: Observation): boolean {
-  if (ordinary.body !== undefined || refusal.body !== undefined) {
-    return ordinary.body !== undefined && refusal.body !== undefined && sameJsonShape(ordinary.body, refusal.body);
+function compareErrorShape(reply: Observation, controls: readonly Observation[]): Shape {
+  if (controls.length === 0) return { unseen: "an ordinary error body under the same credential" };
+  const media = mediaType(reply);
+  const sameMedia = controls.filter((sample) => mediaType(sample) === media);
+  if (sameMedia.length === 0) return { contradiction: `media type ${media ?? "(none)"} was not used by any ordinary error control` };
+  const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
+  if (reply.body !== undefined) {
+    return json.length === 0 ? { contradiction: "JSON was not used by any ordinary error control with the same media type" }
+      : compareJsonShape(reply.body, json, "$");
   }
-  const media = mediaType(ordinary);
-  // Non-JSON endpoints need not use an envelope; compare the observable representation.
-  return ordinary.hasBody && refusal.hasBody && media === mediaType(refusal) && media !== "application/json" && !media?.endsWith("+json");
+  if (media === "application/json" || media?.endsWith("+json") || json.length === sameMedia.length) {
+    return { contradiction: "expected a JSON error body" };
+  }
+  return {};
 }
 
 function sameCredential(a: Probe, b: Probe): boolean {
@@ -80,8 +105,8 @@ function sameCredential(a: Probe, b: Probe): boolean {
 
 export function auditResults(exchanges: readonly Exchange[], contextFor: (probe: Probe) => ResultContext): ResultAudit {
   const audit: ResultAudit = {
-    failures: new Map(), sawPolicyRelay: false, sawAttestationRelay: false, sawPolicyResult: false,
-    sawRefusal: false, comparedErrorShape: false, unpairedErrorShape: false,
+    failures: new Map(), sawCatalogRelay: false, sawAttestationRelay: false, sawPolicyResult: false,
+    sawRefusal: false, shapeControlsNeeded: new Map(),
   };
   const ordinary = exchanges.filter(({ ordinaryControl, reply }) => ordinaryControl && reply.hasBody && noResult(reply));
   for (const { probe, reply, missingRefusal } of exchanges) {
@@ -131,15 +156,13 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
       }
       if (!reply.hasBody) fail("G34", "a refusal has a nonempty error body");
       const references = ordinary.filter((entry) => sameCredential(entry.probe, probe));
-      const sameStatus = references.filter((entry) => entry.reply.status === reply.status);
-      const examples = sameStatus.length === 0 ? references : sameStatus;
-      if (examples.length === 0) audit.unpairedErrorShape = true;
-      else {
-        audit.comparedErrorShape = true;
-        if (!examples.some((entry) => sameErrorShape(entry.reply, reply))) {
-          fail("G34", `the same error body structure as an ordinary error on this endpoint: ${examples.map((entry) => entry.reply.received).join("; ")}`);
-        }
+      const shape = compareErrorShape(reply, references.map(({ reply }) => reply));
+      if (shape.contradiction !== undefined && reply.hasBody) {
+        audit.shapeControlsNeeded.set(probe.credential, shape.contradiction);
+        fail("G34", `the same error body structure as an ordinary error on this endpoint: ${shape.contradiction}`);
       }
+      if (shape.unseen !== undefined && reply.hasBody) audit.shapeControlsNeeded.set(probe.credential,
+        shape.unseen.startsWith("$") ? `an ordinary error control showing refusal member ${shape.unseen}` : shape.unseen);
       continue;
     }
 
@@ -151,7 +174,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
       if (unknownProvider && expectedRefusal.reason === "unsatisfiable") fail("G24", "an unknown provider id does not make an excluded route qualify");
     }
     if (!relay || carriesPolicy !== true) continue;
-    audit.sawPolicyRelay = true;
+    if (routes !== undefined) audit.sawCatalogRelay = true;
     audit.sawPolicyResult = true;
     if (provider === null || (routes !== undefined && !routes.has(provider))) fail("G15", "one valid Route-Applied naming a published provider for this model");
     const route = provider === null ? undefined : routes?.get(provider);
@@ -167,7 +190,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
       if (combined.attest.length === 0) {
         if (reply.evidence.length !== 0) fail("G17", "no Route-Evidence when the combined policy does not require attest");
       } else {
-        audit.sawAttestationRelay = true;
+        if (route != null) audit.sawAttestationRelay = true;
         if (reply.evidence.length !== 1 || (routes !== undefined && reply.evidence[0] !== route?.evidence)) {
           fail("G17", "one Route-Evidence exactly matching the applied route's published URI when attest is required");
         }

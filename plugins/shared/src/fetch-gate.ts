@@ -62,8 +62,15 @@ function isRegistry(value: unknown): value is Registry {
   return typeof value === "object" && value !== null && "releases" in value && Array.isArray(value.releases) && "watchers" in value && value.watchers instanceof Set;
 }
 
+/**
+ * Whether a path is the base URL's path with one endpoint path appended: what follows the base is a "/" and a
+ * nonempty path that does not itself start with "/". A request to "{base}//x" went to the base "{base}/", not the
+ * one whose metadata was read.
+ */
+const under = (base: string, path: string): boolean => path.startsWith(`${base}/`) && path.length > base.length + 1 && path[base.length + 1] !== "/";
+
 const matches = (release: Release, outgoing: Outgoing): boolean =>
-  outgoing.path.startsWith(`${release.base}/`) &&
+  under(release.base, outgoing.path) &&
   outgoing.query === release.query &&
   outgoing.body === release.body &&
   outgoing.header === release.header &&

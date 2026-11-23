@@ -34,6 +34,8 @@ export class FakeHarness {
   wireKey: string | null = "demo-key";
   /** Headers the transport adds on its own, after the configured ones would be: a transport the plugin cannot see into. */
   extraWireHeaders: Record<string, string> = {};
+  /** The URL the transport sends to; by default the model's base URL with the endpoint path appended. */
+  wireUrl: string | null = null;
   /** Replaces `ctx.model`, to hand the plugin a model the harness would never describe that way. */
   contextModel: unknown = undefined;
   readonly headerHook: boolean;
@@ -113,7 +115,7 @@ export class FakeHarness {
     for (const [name, value] of Object.entries(headers)) if (value !== null) wire.set(name, value);
     let response: Response;
     try {
-      response = await fetch(`${this.model.baseUrl}/chat/completions`, { method: "POST", headers: wire, body });
+      response = await fetch(this.wireUrl ?? `${this.model.baseUrl}/chat/completions`, { method: "POST", headers: wire, body });
     } catch (error) {
       // The fetch gate stopped it: nothing was sent.
       return { sent: false, error: error instanceof Error ? error.message : String(error), status: null };

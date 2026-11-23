@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { Decision } from "../src/decide.ts";
-import { addWatcher } from "../src/fetch-gate.ts";
+import { addWatcher, withdrawReleases } from "../src/fetch-gate.ts";
 import type { Target } from "../src/gateway-client.ts";
 import type { Report } from "../src/outcome.ts";
-import type { RequestContext } from "../src/request.ts";
+import { placeOf, type RequestContext } from "../src/request.ts";
 import { RouteClient, type Prepared } from "../src/route-client.ts";
 import { fakeGateway, type FakeGateway } from "./fixtures.ts";
 
@@ -195,6 +195,36 @@ test("C1, C14: a query string in the base URL is part of where the request goes:
   const body = JSON.stringify({ model: "demo-model", messages: [] });
   // Everything as released but the query.
   await assert.rejects(fetch(`${gateway.base}/chat/completions?tenant=west`, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "only=aurora" }, body }), /not one the plugin released/);
+});
+
+test("C1, C14: no query, an empty query, and a query are three base URLs: each is read and sent with exactly its own request target, and a request to another of them is stopped", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  const given: [string, string][] = [[gateway.base, ""], [`${gateway.base}?`, "?"], [`${gateway.base}?t=1`, "?t=1"]];
+  const sends: (() => Promise<Response>)[] = [];
+  for (const [base, query] of given) {
+    const place = placeOf(base);
+    assert.deepEqual(place, { base: gateway.base, query }, base);
+    sends.push(release(c, await decide(c, { base: gateway.base, query, context: bearer("k") })));
+  }
+  for (const send of sends) await sendText(send);
+  const path = new URL(gateway.base).pathname;
+  assert.deepEqual(
+    gateway.requests.map((r) => `${r.method} ${r.path}`),
+    ["", "?", "?t=1"].flatMap((q) => [`GET ${path}/route-policy${q}`, `GET ${path}/models${q}`]).concat(["", "?", "?t=1"].map((q) => `POST ${path}/chat/completions${q}`)),
+  );
+  // Released for one of them, sent to another: stopped, whichever way round.
+  const body = JSON.stringify({ model: "demo-model", messages: [] });
+  const headers = { authorization: "Bearer k", "route-policy": "zdr" };
+  for (const [releasedFor, sentTo] of [["?", ""], ["", "?"], ["?", "?t=1"]] as const) {
+    const prepared = await decide(c, { base: gateway.base, query: releasedFor, context: bearer("k") });
+    assert.ok(prepared.decision.action === "send");
+    c.release({ ...prepared, decision: prepared.decision }, "zdr", body);
+    await assert.rejects(fetch(`${gateway.base}/chat/completions${sentTo}`, { method: "POST", headers, body }), /not one the plugin released/, `released for "${releasedFor}", sent to "${sentTo}"`);
+    // The release unused, it is withdrawn, as at the end of a session, so the next pair starts from none.
+    withdrawReleases(c);
+  }
+  assert.equal(gateway.inference().length, 3);
 });
 
 test("C1, C14: a request leaving with another context than the one it was checked for is stopped at fetch, and the user is told which headers it carried", async () => {

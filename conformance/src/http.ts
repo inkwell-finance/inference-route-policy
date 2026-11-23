@@ -28,10 +28,25 @@ export interface Observation {
 
 const policyHeader = (index: number, mixedFirst = false): string => (index % 2 === 0) !== mixedFirst ? "Route-Policy" : "rOuTe-PoLiCy";
 
-export async function request(base: URL, probe: Probe, timeoutMs: number): Promise<Observation> {
-  const target = new URL(base);
-  target.pathname = `${base.pathname.replace(/\/+$/, "")}/${probe.path}`;
-  const headers = ["host", target.host, "accept-encoding", "identity"];
+export function parseBase(raw: string) {
+  const url = new URL(raw);
+  const parts = /^https?:\/\/([^/?#\\]+)(\/[^?#\\]*)?(\?[^#]*)?$/i.exec(raw);
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || raw.includes("#") || url.username || url.password || parts?.[1]?.includes("@")) {
+    throw new TypeError("base must be an HTTP(S) API base URL without a fragment or credentials");
+  }
+  const pathname = parts?.[2] ?? "/";
+  const query = parts?.[3] ?? "";
+  // Node builds a request target from URL.search when handed a URL, dropping
+  // a bare '?'. Keep it explicitly, and reject inputs that need rewriting.
+  if (!parts || /[^\x21-\x7e]/.test(raw)) {
+    throw new TypeError("cannot reproduce the base URL's request target exactly; supply an escaped HTTP(S) URL");
+  }
+  return { url, pathname: pathname.replace(/\/+$/, ""), query };
+}
+
+export async function request(base: ReturnType<typeof parseBase>, probe: Probe, timeoutMs: number): Promise<Observation> {
+  const { url, pathname, query } = base;
+  const headers = ["host", url.host, "accept-encoding", "identity"];
   if (probe.credential !== undefined) {
     const { key, header } = probe.credential;
     headers.push(header, header === "authorization" ? `Bearer ${key}` : key);
@@ -42,8 +57,8 @@ export async function request(base: URL, probe: Probe, timeoutMs: number): Promi
   for (const [i, value] of (probe.policies ?? []).entries()) headers.push(policyHeader(i, probe.mixedCasePolicy), value);
 
   return new Promise((resolve, reject) => {
-    const req = (target.protocol === "https:" ? https : http)(target, {
-      method: post ? "POST" : "GET", headers, signal: AbortSignal.timeout(timeoutMs),
+    const req = (url.protocol === "https:" ? https : http)(url, {
+      method: post ? "POST" : "GET", path: `${pathname}/${probe.path}${query}`, headers, signal: AbortSignal.timeout(timeoutMs),
     }, (reply) => {
       const buckets = new Map<string, string[]>();
       for (let i = 0; i < reply.rawHeaders.length; i += 2) {

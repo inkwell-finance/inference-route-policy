@@ -984,3 +984,95 @@ test("G15 G20: a single selected endpoint may commit a valid response slowly", a
   assert.equal(report.passed, 23);
   assert.equal(report.failed + report.skipped, 0);
 });
+
+for (const query of ["", "?", "?tenant=east", "?a=first&a=second", "?tag=a%2bb&tag=a+b&flag=%3F&v='raw'"]) {
+  test(`G20 G23 G9: raw request targets retain ${JSON.stringify(query) || "no query"}`, async (t) => {
+    const upstream = await baseAt(t, serve(good, 0), "");
+    const paths = ["route-policy", "models", ...INFERENCE_ENDPOINTS].map((endpoint) => `/v1/${endpoint}${query}`);
+    const actual = new Set<string | undefined>();
+    const proxy = createServer((incoming, outgoing) => {
+      actual.add(incoming.url);
+      if (incoming.url === undefined || !paths.includes(incoming.url)) {
+        outgoing.writeHead(404).end();
+        return;
+      }
+      const relay = relayRequest(new URL(incoming.url, upstream), { method: incoming.method, headers: incoming.rawHeaders }, (reply) => {
+        outgoing.writeHead(reply.statusCode!, reply.rawHeaders);
+        reply.pipe(outgoing);
+        outgoing.on("close", () => reply.destroy());
+      });
+      relay.on("error", () => outgoing.destroy());
+      incoming.pipe(relay);
+    }).listen(0, "127.0.0.1");
+    const report = await runConformance({ base: await baseAt(t, proxy, `/v1${query}`), key, policyKey, endpoints: INFERENCE_ENDPOINTS });
+    assert.deepEqual(actual, new Set(paths));
+    assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+    assert.equal(report.passed, 63);
+  });
+}
+
+test("G20 G23: an unescaped base request target is rejected before any probe", async (t) => {
+  let count = 0;
+  const base = await baseAt(t, serve((request, transport) => { count++; return good(request, transport); }, 0));
+  for (const invalid of [`${base}?tenant=two words`, `${base}/naïve`, `${base}\\tenant`]) {
+    await assert.rejects(runConformance({ base: invalid }), /cannot reproduce the base URL's request target exactly/);
+  }
+  assert.equal(count, 0);
+});
+
+for (const { title, policy, lists, verdict, detail } of [
+  { title: "numeric policy is invalid even with malformed keys", policy: 17, lists: { keys: "zdr" }, verdict: "FAIL", detail: /key_policy is a string/ },
+  { title: "null policy is invalid even with a malformed sort list", policy: null, lists: { sort: null }, verdict: "FAIL", detail: /key_policy is a string/ },
+  { title: "malformed policy grammar fails even with malformed attest", policy: "zdr++notrain", lists: { attest: ["bad value"] }, verdict: "FAIL", detail: /key_policy fits the policy grammar/ },
+  { title: "valid grammar is inconclusive when support cannot be read", policy: "later=valid", lists: { keys: "zdr" }, verdict: "SKIP", detail: /valid advertised lists to check key_policy: keys/ },
+  { title: "valid later-revision policy can be checked under its advertised support", policy: "later=valid", lists: { keys: ["later"] }, verdict: "PASS", detail: /valid under its own lists/ },
+] as const) test(`G22: ${title}`, async (t) => {
+  const report = await run(t, fixture(detectionResponse({ route_policy: "1", ...lists, key_policy: policy }, { credentialed: true })));
+  const check = report.checks.find(({ id }) => id === "G22");
+  assert.equal(check?.status, verdict);
+  assert.match(check.detail, detail);
+});
+
+test("G22: a non-object detection reply cannot establish absence of a key policy", async (t) => {
+  const report = await run(t, fixture(detectionResponse(null)));
+  assert.equal(report.checks.find(({ id }) => id === "G20")?.status, "FAIL");
+  const check = report.checks.find(({ id }) => id === "G22");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /an inspectable detection object/);
+});
+
+for (const mode of ["optional-observed", "optional-unseen", "known-bad-type"] as const) {
+  test(`G34: problem JSON distinguishes ${mode} from a missing mandatory member`, async (t) => {
+    const additionalControls = new Set<string | null>();
+    const report = await run(t, async (request, transport) => {
+      const raw = request.method === "POST" ? await request.clone().text() : undefined;
+      const reply = await good(request, transport);
+      if (raw === undefined || reply.status < 400) return reply;
+      const refused = reply.headers.has(refusal);
+      if (raw === '{"model":null}') additionalControls.add(request.headers.get("authorization"));
+      const showOptional = refused ? request.headers.get("route-policy") !== "bits=64"
+        : mode !== "optional-unseen" && raw === '{"model":null}';
+      const problem = { type: "about:blank", title: "Invalid request",
+        ...(showOptional ? { errors: [{ field: mode === "known-bad-type" && refused ? 4 : "model" }] } : {}),
+      };
+      return change(reply, { body: JSON.stringify(problem), replace: { "content-type": "application/problem+json" } });
+    });
+    assert.deepEqual(additionalControls, new Set([`Bearer ${key}`, `Bearer ${policyKey}`]));
+    const check = report.checks.find(({ id }) => id === "G34");
+    const expected = mode === "optional-observed" ? "PASS" : mode === "optional-unseen" ? "SKIP" : "FAIL";
+    assert.equal(check?.status, expected, JSON.stringify(report.checks.filter(({ status }) => status !== "PASS")));
+    if (mode === "optional-unseen") assert.match(check.detail, /ordinary error control showing refusal member \$\.errors/);
+    if (mode === "known-bad-type") assert.match(check.detail, /errors\[\]\.field has type number/);
+    if (mode !== "known-bad-type") assert.equal(report.failed, 0);
+  });
+}
+
+test("G8 G9 G11: structural policy errors alone cannot verify an accepted carrier", async (t) => {
+  const target = createGateway({
+    models: { [model]: routes }, keys: { [key]: {}, [policyKey]: {} }, accept: { keys: [] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, target);
+  assert.equal(report.failed, 0);
+  for (const id of ["G8", "G9", "G11"]) assert.equal(report.checks.find((entry) => entry.id === id)?.status, "SKIP");
+});
