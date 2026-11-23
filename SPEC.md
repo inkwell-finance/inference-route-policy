@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 9.
+Draft 10.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -58,7 +58,9 @@ prompts, tool definitions, outputs. Token counts, timings, digests, and
 a policy carried in the `model` field are not content.
 
 Wherever a JSON object defined here repeats a member name, the last
-occurrence is the member.
+occurrence is the member. The same holds for the `model` member of an
+inference request's body: a gateway that accepts a body repeating it
+reads the last.
 
 ## Syntax
 
@@ -255,9 +257,10 @@ port     := an integer from 1 to 65535, no leading zero
 rest     := [A-Za-z0-9._~/?=&-]*
 ```
 
-This is a narrow subset of `https` URIs, chosen so that a reader can
-check one exactly and compare two as strings. Two evidence URIs are the
-same only when they are the same string.
+The last label of the host is not all digits: a host is a name, not an
+address. This is a narrow subset of `https` URIs, chosen so that a
+reader can check one exactly and compare two as strings. Two evidence
+URIs are the same only when they are the same string.
 
 A route meets a policy when all of these hold:
 
@@ -301,7 +304,8 @@ informational (1xx) response is not the final response. When a route
 fails, the gateway MAY try another qualifying route; when it does, it
 takes the next in the order the policy's preferences give. Once it has
 committed its final response it MUST NOT move the request to another
-route.
+route. How many qualifying routes a gateway tries is its choice,
+including none when it already knows that none can serve.
 
 Every request ends in exactly one of these outcomes. They are listed in
 the order a gateway decides them:
@@ -311,7 +315,7 @@ the order a gateway decides them:
 | **Own error.** The gateway answers with an error it would give the same request with no policy: bad credentials, an unreadable body, an unknown model id, a rate limit. | As without this protocol | MUST NOT | MUST NOT | MUST NOT |
 | **No policy** reached the request, by any carrier. | As without this protocol | MAY | MUST NOT | MUST NOT |
 | **Refused before routing.** A policy reached it and is `unsupported`, or no route meets it. | 400 | MUST NOT | MUST: `unsupported` or `unsatisfiable` | MUST NOT |
-| **Unavailable.** A policy reached it, routes qualify, and every one tried failed. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
+| **Unavailable.** A policy reached it, routes qualify, and the gateway relays none of their responses: every one it tried failed, or it tried none. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
 | **Relayed.** A policy reached it and a qualifying route's response is relayed. | The route's, with the route's body | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
 
 An own error comes first: a gateway does not check a policy on a
@@ -364,7 +368,7 @@ Route-Refused: reason=unsupported+key=bits
 | --------------- | ------ | ------- |
 | `unsupported`   | 400 | The request has more than one `Route-Policy` line, or a policy that reached it failed the [order of checks](#order-of-checks). `key` is present exactly when that order names one. |
 | `unsatisfiable` | 400 | No route of this model meets the combined policy. Retrying does not help. `key` is never present. |
-| `unavailable`   | 503 | Routes meet the combined policy, and every one the gateway tried failed. The gateway MUST NOT fall back to one that does not meet it. `key` is never present. |
+| `unavailable`   | 503 | Routes meet the combined policy, and the gateway relays none of their responses: every one it tried failed, or it tried none. The gateway MUST NOT fall back to one that does not meet it. `key` is never present. |
 
 A request that could be refused for more than one reason is refused for
 the first in the order above.
@@ -485,6 +489,8 @@ any of these holds:
 
 - the policies it sent combine to one that no route can meet, because
   a `region` or `only` intersection is empty;
+- the provider `Route-Applied` names is not in the `only` it sent, or
+  is in the `ignore` it sent. This needs no model list;
 - it does not have exactly one `Route-Applied` value that fits the
   `applied` grammar. A joined repetition does not fit, so a client that
   sees only joined values applies the same test;

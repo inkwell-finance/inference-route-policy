@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { COUNTRIES } from "../src/countries.ts";
 import {
+  REFUSAL_STATUS,
   baselineSupport,
   clearedToSend,
   combinePolicies,
@@ -1138,7 +1139,7 @@ test("S19: a repeated member name reads as its last occurrence, in the model lis
   assert.equal(detection.value.support.sort.size, 0);
 });
 
-test("G35: explicit order beats rank for the providers it names, and a refusal beats everything", () => {
+test("G35: explicit order beats rank for the providers it names", () => {
   const routes = [
     { provider: "a", price: 3 },
     { provider: "b", price: 1 },
@@ -1191,4 +1192,57 @@ test("G23, C4: a model list publishes routes for a model only when it has the sh
     assert.equal(readOutcome(response, policy("zdr"), publishedRoutes(list, "m")).outcome, "not-honored", name);
   }
   assert.equal(readOutcome(response, policy("zdr"), publishedRoutes({ data: [{ id: "m", routes: rows }] }, "m")).outcome, "honored");
+});
+
+test("G1, G3, G5: each refusal reason has its status", () => {
+  assert.deepEqual({ ...REFUSAL_STATUS }, { unsupported: 400, unsatisfiable: 400, unavailable: 503 });
+  assert.ok(Object.isFrozen(REFUSAL_STATUS));
+});
+
+test("S3, S13: a repeated key in facts is malformed and named, whether or not the reader knows the key", () => {
+  const cases: [facts: string, key: string][] = [
+    ["extended=2+extended=4+zdr", "extended"],
+    ["zdr+extended+extended", "extended"],
+    ["zdr+zdr", "zdr"],
+    ["attest=weights+attest=prompt", "attest"],
+  ];
+  for (const [text, key] of cases) {
+    const read = parseFacts(text);
+    assert.ok(!read.ok, text);
+    assert.equal(read.key, key, text);
+    assert.equal(parsePublishedFacts(text).ok, false, text);
+  }
+  // A repeated item in a key the reader does not know is malformed too.
+  assert.equal(parseFacts("extended=a,a").ok, false);
+});
+
+test("C10: two policies that are each writable can combine past 512 bytes, and then there is nothing to send", () => {
+  const list = (prefix: string): string => Array.from({ length: 15 }, (_, i) => `${prefix}${String(i).padStart(2, "0")}`.padEnd(32, "x")).join(",");
+  const key = policy(`only=${list("a")}`);
+  const suffix = policy(`ignore=${list("b")}`);
+  for (const each of [key, suffix]) assert.equal(formatPolicy(each).ok, true);
+  const combined = combinePolicies({ key, suffix });
+  // Every list is within its limit; only the whole string is too long.
+  assert.equal(combined.only?.length, 15);
+  assert.equal(combined.ignore.length, 15);
+  const formatted = formatPolicy(combined);
+  assert.ok(!formatted.ok);
+  assert.equal(formatted.key, null);
+});
+
+test("C4: an empty model id names no model, so no list publishes routes for it", () => {
+  const list = { data: [{ id: "", routes: [{ provider: "p", facts: "zdr" }] }] };
+  for (const requested of ["", "+zdr", "+"]) {
+    assert.equal(publishedRoutes(list, requested).size, 0, requested);
+    assert.equal(readOutcome({ applied: ["provider=p"], refused: [], evidence: [] }, policy("zdr"), publishedRoutes(list, requested)).outcome, "not-honored", requested);
+  }
+});
+
+test("S18: the last label of an evidence URI's host is not all digits", () => {
+  for (const host of ["proof.example", "1.example", "123.a1", "a.b.c1", "x1", "1x", "a-1", "xn--1ca"]) assert.equal(isEvidenceUri(`https://${host}/report`), true, host);
+  for (const host of ["proof.123", "127.0.0.1", "1", "123", "a.b.0", "192.168.1.1"]) {
+    assert.equal(isEvidenceUri(`https://${host}/report`), false, host);
+    assert.equal(isEvidenceUri(`https://${host}`), false, host);
+    assert.equal(isEvidenceUri(`https://${host}:8443/report`), false, host);
+  }
 });

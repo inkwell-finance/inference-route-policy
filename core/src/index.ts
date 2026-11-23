@@ -28,7 +28,8 @@ const ITEM = /^[a-z0-9][a-z0-9_.-]{0,31}$/;
 const BITS = /^[1-9][0-9]?$/;
 const REFUSED = new RegExp(`^reason=(unsupported|unsatisfiable|unavailable)(?:\\+key=(${KEY_SOURCE}))?$`);
 const LABEL = "(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,61}[a-z0-9])";
-const EVIDENCE = new RegExp(`^https://${LABEL}(?:\\.${LABEL})*(?::([1-9][0-9]{0,4}))?(?:/[A-Za-z0-9._~/?=&-]*)?$`);
+// The lookahead keeps the host's last label from being all digits: a host is a name, not an address.
+const EVIDENCE = new RegExp(`^https://(?:${LABEL}\\.)*(?![0-9]+(?:[:/]|$))${LABEL}(?::([1-9][0-9]{0,4}))?(?:/[A-Za-z0-9._~/?=&-]*)?$`);
 
 /** A flag (`true`) or a list, as written. */
 type Value = true | readonly string[];
@@ -406,9 +407,10 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
 export const isProviderId = (id: unknown): id is string => typeof id === "string" && ITEM.test(id);
 
 /**
- * Whether a value is an evidence URI (S18), by the spec's own grammar: `https://`, a lowercase host name, an
- * optional port from 1 to 65535, and an optional path and query from a fixed set of characters, in at most 512
- * bytes. The form is narrow so that this check is exact and two evidence URIs can be compared as strings.
+ * Whether a value is an evidence URI (S18), by the spec's own grammar: `https://`, a lowercase host name whose
+ * last label is not all digits, an optional port from 1 to 65535, and an optional path and query from a fixed set
+ * of characters, in at most 512 bytes. The form is narrow so that this check is exact and two evidence URIs can be
+ * compared as strings.
  */
 export function isEvidenceUri(uri: unknown): uri is string {
   if (typeof uri !== "string" || uri.length > LIMITS.policyBytes) return false;
@@ -609,6 +611,8 @@ export function publishedRoutes(modelList: unknown, model: string): Map<string, 
   const data = ownMember(modelList, "data");
   if (!Array.isArray(data)) return byProvider;
   const { id } = splitModel(model);
+  // An empty id names no model, so nothing is published for it, whatever a list may hold under that id.
+  if (id === "") return byProvider;
   const models: unknown[] = Array.from(data).filter((entry) => ownMember(entry, "id") === id);
   const routes = models.length === 1 ? ownMember(models[0], "routes") : undefined;
   if (!Array.isArray(routes)) return byProvider;
