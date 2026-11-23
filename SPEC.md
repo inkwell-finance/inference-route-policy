@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 5.
+Draft 6.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -214,7 +214,8 @@ model list, the requirements that route meets, in the same grammar:
 ```
 
 `routes` is a member of each model object in the response to
-`GET {base}/models`.
+`GET {base}/models`. A provider id appears at most once among a model's
+routes.
 
 A gateway MUST publish facts that:
 
@@ -229,10 +230,11 @@ A gateway MUST publish facts that:
 A fact is a property of the route. Which facts a gateway publishes does
 not depend on which keys or values it accepts in requests.
 
-A route whose facts include `attest` MUST also carry `evidence`: the
-absolute URI of the provider's own evidence for that route, with no
-comma and no whitespace in it; a comma is percent-encoded (see
-[Result](#result)).
+A route whose facts include `attest` MUST also carry `evidence`: the URI
+of the provider's own evidence for that route (see [Result](#result)).
+An evidence URI is an `https` URI as RFC 3986 defines one, with a host,
+in which a comma is percent-encoded: it contains no comma, no
+whitespace, and no other character RFC 3986 does not allow in a URI.
 
 A route meets a policy when all of these hold:
 
@@ -273,7 +275,8 @@ gateway treats as retryable. Which conditions count is the gateway's
 choice. The final response is committed with its status line in
 HTTP/1.1 and with its header block in HTTP/2 and HTTP/3; an
 informational (1xx) response is not the final response. When a route
-fails, the gateway MAY try another qualifying route. Once it has
+fails, the gateway MAY try another qualifying route; when it does, it
+takes the next in the order the policy's preferences give. Once it has
 committed its final response it MUST NOT move the request to another
 route.
 
@@ -312,8 +315,8 @@ where the provider serves its own attestation evidence covering this
 response. The document's format and how to verify it are defined by the
 provider's attestation scheme, not here. The gateway MUST NOT put a
 verdict or summary of its own at that URI or in the header; it points
-at the provider's evidence and nothing else. Because the URI has no
-comma and no whitespace, two joined lines never read as one.
+at the provider's evidence and nothing else. Because an evidence URI
+has no comma and no whitespace, two joined lines never read as one.
 
 A gateway MUST NOT pass a `Route-Applied`, `Route-Refused`, or
 `Route-Evidence` header it received from a provider through to the
@@ -389,7 +392,8 @@ any `attest` or `sort` value it did not list.
 
 A reply is **valid** when it is a JSON object whose own members satisfy
 every rule above, where `key_policy` is checked against the reply's
-lists exactly as given. A client MUST treat anything else, including a
+lists exactly as given. Where the object repeats a member name, the
+last occurrence is the member. A client MUST treat anything else, including a
 reply it cannot fetch, as no detection. Within a valid reply a client
 MUST ignore members it does not know, keys this revision does not
 define, and `attest` and `sort` values this revision does not define.
@@ -457,18 +461,27 @@ any of these holds:
   `applied` grammar. A joined repetition does not fit, so a client that
   sees only joined values applies the same test;
 - the policy it sent has `attest`, and the response does not have
-  exactly one `Route-Evidence` value that is an absolute URI with no
-  comma and no whitespace.
+  exactly one `Route-Evidence` value that is an evidence URI as
+  [Facts](#facts) defines one.
 
 A client MUST NOT report a policy that was not honored as applied, to
-its user or to code that asks. It SHOULD also check that the provider
-named, with the facts the gateway publishes for that route of the
-model, meets the requirements it sent, and treat a provider that is not
-among the model's published routes, invalid facts, or a mismatch as not
-honored. Honored means the gateway named a route and, for `attest`,
-said where its evidence is. It does not mean anyone verified that
-evidence, and without the check above it does not mean the route's
-published facts were compared with the policy.
+its user or to code that asks.
+
+A client SHOULD also check the provider named against the model list
+it held when it sent the request, and treat the policy as not honored
+when any of these holds:
+
+- the provider is not among the routes published for the model, or
+  appears there more than once;
+- the facts published for that route are invalid, or with the provider
+  id do not meet the requirements it sent;
+- the policy it sent has `attest`, and `Route-Evidence` is not the
+  `evidence` URI published for that route.
+
+Honored means the gateway named a route and, for `attest`, said where
+its evidence is. It does not mean anyone verified that evidence, and
+without the check above it does not mean the route's published facts
+were compared with the policy.
 
 **Claims.** A client SHOULD NOT present a fact as verified unless it
 verified the evidence for it itself.
@@ -502,8 +515,10 @@ result as **unconfirmed**: it MUST NOT report the policy as applied.
 - **Result headers come from the gateway.** A provider that returns
   `Route-Applied` cannot speak for the gateway, because the gateway
   drops it.
-- `Route-Applied` carries a provider id and `Route-Refused` a key from
-  this document: nothing from the content and nothing secret.
+- `Route-Applied` carries a provider id, and `Route-Refused` a reason
+  and at most one key, which may be one the client sent: up to 16
+  characters of `a-z` and `0-9`. Neither carries anything from the
+  content.
 
 ## Limits
 

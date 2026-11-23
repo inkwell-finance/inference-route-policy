@@ -340,7 +340,10 @@ export function parsePublishedFacts(text: string): Result<Facts> {
   return unknownKey === undefined ? parsed : fail(unknownKey, "is not a fact a gateway may publish");
 }
 
-/** Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. */
+/**
+ * Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met, and neither is a `region`
+ * fact that lists no country: it publishes nowhere the content is processed, which proves nothing.
+ */
 export function meets(route: { provider: string; facts: Facts }, policy: Policy): boolean {
   const { provider, facts } = route;
   if (policy.zdr && !facts.zdr) return false;
@@ -348,7 +351,7 @@ export function meets(route: { provider: string; facts: Facts }, policy: Policy)
   if (policy.bits !== null && (facts.bits === null || facts.bits < policy.bits)) return false;
   if (policy.region !== null) {
     const allowed = policy.region;
-    if (facts.region === null || !facts.region.every((country) => allowed.includes(country))) return false;
+    if (facts.region === null || facts.region.length === 0 || !facts.region.every((country) => allowed.includes(country))) return false;
   }
   if (!policy.attest.every((item) => facts.attest.includes(item))) return false;
   if (policy.only !== null && !policy.only.includes(provider)) return false;
@@ -373,8 +376,18 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
 /** Whether a value can be a provider id on the wire (S17). Anything that is not a string is not one. */
 export const isProviderId = (id: unknown): id is string => typeof id === "string" && ITEM.test(id);
 
-/** Whether a value is an absolute URI with no comma and no whitespace: an `evidence` URI or a `Route-Evidence` value (S18). */
-export const isEvidenceUri = (uri: unknown): uri is string => typeof uri === "string" && /^[A-Za-z][A-Za-z0-9+.-]*:[^\s,]+$/.test(uri);
+/**
+ * Whether a value is an evidence URI (S18): an `https` URI per RFC 3986 with a host and no comma. The authority and
+ * the rest are held to the characters RFC 3986 allows in each (brackets only in the authority, one `#` at most,
+ * `%` only before two hex digits), and the URL parser then judges what a character class cannot, such as an
+ * unclosed IP literal or a bad port.
+ */
+export function isEvidenceUri(uri: unknown): uri is string {
+  if (typeof uri !== "string") return false;
+  const parts = /^https:\/\/([A-Za-z0-9\-._~:@!$&'()*+;=%[\]]+)([/?#][A-Za-z0-9\-._~:/?#@!$&'()*+;=%]*)?$/.exec(uri);
+  if (parts === null || /%(?![0-9A-Fa-f]{2})/.test(uri) || uri.split("#").length > 2) return false;
+  return URL.canParse(uri) && new URL(uri).hostname !== "";
+}
 
 /**
  * The `Route-Applied` value for the route whose response is relayed (S14). Throws on a provider id that is not an
@@ -494,8 +507,8 @@ export function formatDetection(support: Support, keyPolicy: string | null = nul
     ["sort", support.sort, BASELINE_SORT],
   ];
   for (const [name, listed, definedHere] of lists) {
-    const unknown = [...listed].find((entry) => !definedHere.includes(entry));
-    if (unknown !== undefined) throw new RangeError(`"${String(unknown)}" in ${name} is not defined by this revision`);
+    const unknown = [...listed].filter((entry) => !definedHere.includes(entry));
+    if (unknown.length > 0) throw new RangeError(`${name} holds what this revision does not define: ${unknown.map(String).join(", ")}`);
   }
   if (keyPolicy !== null) {
     const bound = parsePolicy(keyPolicy, support);
@@ -533,15 +546,46 @@ export type Outcome =
   | { outcome: "honored"; provider: string; evidence: string | null; checked: boolean }
   | { outcome: "not-honored"; why: string };
 
+/** One route of a model as the gateway's model list publishes it, read by a client. */
+export interface PublishedRoute {
+  facts: Facts;
+  /** The route's `evidence` URI, or null when it publishes none that is valid. */
+  evidence: string | null;
+}
+
+/**
+ * Reads the `routes` member of one model from a gateway's model list (SPEC.md, Facts), by provider id. A provider
+ * maps to null when it is published but cannot be relied on: it appears more than once, or its facts are invalid.
+ * Entries with no usable provider id are skipped, since no `Route-Applied` can name them. Returns null when the
+ * model has no `routes` list at all.
+ */
+export function parseRoutes(routes: unknown): Map<string, PublishedRoute | null> | null {
+  if (!Array.isArray(routes)) return null;
+  const byProvider = new Map<string, PublishedRoute | null>();
+  const entries: unknown[] = Array.from(routes);
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const member = (name: string): unknown => (Object.hasOwn(entry, name) ? Reflect.get(entry, name) : undefined);
+    const provider = member("provider");
+    if (!isProviderId(provider)) continue;
+    const factsText = member("facts");
+    const facts = typeof factsText === "string" ? parseFacts(factsText) : null;
+    const evidence = member("evidence");
+    const usable = !byProvider.has(provider) && facts !== null && facts.ok;
+    byProvider.set(provider, usable ? { facts: facts.value, evidence: isEvidenceUri(evidence) ? evidence : null } : null);
+  }
+  return byProvider;
+}
+
 /**
  * What a response says about the policy a client sent with a requirement (C3, C4, C5). Any `Route-Refused` is a
  * refusal, parsed or not, whatever else is there. Otherwise the policy is honored only by exactly one valid
- * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the published
- * facts string of each route of the model by provider id, from the gateway's model list, or null when the client
- * has none: with it, the named provider must be published there with valid facts that meet `sent`; without it,
- * only the provider-id requirements can be checked.
+ * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the model's
+ * published routes as the client held them when it sent the request, or null when it held none: with them, the
+ * named provider must be published exactly once, with valid facts that meet `sent`, and with the `evidence` URI
+ * the response gave; without them, only the provider-id requirements can be checked.
  */
-export function readOutcome(headers: ResultHeaders, sent: Policy, routes: ReadonlyMap<string, string> | null): Outcome {
+export function readOutcome(headers: ResultHeaders, sent: Policy, routes: ReadonlyMap<string, PublishedRoute | null> | null): Outcome {
   if (headers.refused.length > 0) {
     const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
     return parsed?.ok ? { outcome: "refused", ...parsed.value } : { outcome: "refused", reason: null, key: null };
@@ -565,7 +609,8 @@ export function readOutcome(headers: ResultHeaders, sent: Policy, routes: Readon
   }
   const published = routes.get(provider);
   if (published === undefined) return notHonored(`provider "${provider}" is not among the model's published routes`);
-  const facts = parseFacts(published);
-  if (!facts.ok) return notHonored(`the facts published for "${provider}" are not valid: ${facts.detail}`);
-  return meets({ provider, facts: facts.value }, sent) ? { outcome: "honored", provider, evidence, checked: true } : notHonored(`route "${provider}" does not meet the policy sent`);
+  if (published === null) return notHonored(`provider "${provider}" is published more than once or with invalid facts`);
+  if (!meets({ provider, facts: published.facts }, sent)) return notHonored(`route "${provider}" does not meet the policy sent`);
+  if (evidence !== null && evidence !== published.evidence) return notHonored(`Route-Evidence is not the evidence published for "${provider}"`);
+  return { outcome: "honored", provider, evidence, checked: true };
 }
