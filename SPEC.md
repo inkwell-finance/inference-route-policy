@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 14.
+Draft 15.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -434,7 +434,10 @@ the client can see: its status is `200`; its body is a JSON object;
 present, are lists whose entries fit the grammar named above; and
 `key_policy`, where present, answers a request that carried credentials
 and passes the order of checks under the reply's lists exactly as
-given. Whether the reply tells the truth, for instance by omitting a
+given. A client counts a request as carrying credentials when it has a
+header the client knows to carry one, such as `Authorization`, an
+API-key header, or `Cookie`; a header it cannot tell about counts as
+none. Whether the reply tells the truth, for instance by omitting a
 policy that is bound to the key, is the gateway's obligation and no
 part of validity. A client MUST treat anything else, including a
 reply it cannot fetch, as no detection. Within a valid reply a client

@@ -11,7 +11,7 @@
  */
 
 import { splitModel } from "../../../core/src/index.ts";
-import type { Decision } from "./decide.ts";
+import { carriedPolicy, type Decision } from "./decide.ts";
 import { addWatcher, withdrawReleases } from "./fetch-gate.ts";
 import type { Target } from "./gateway-client.ts";
 import { heldFromEntry, heldFromEnv, holdPolicy, type Held, type HeldEntry } from "./held.ts";
@@ -19,6 +19,12 @@ import { OPENROUTER_PROVIDER_APIS } from "./openrouter.ts";
 import { describeReport, isQuiet, type Report } from "./outcome.ts";
 import { contextKey, contextOf, placeOf } from "./request.ts";
 import { RouteClient, type Prepared } from "./route-client.ts";
+
+/**
+ * APIs that name the model in the URL, not the body; their requests may leave without a body `model`. The plugin
+ * cannot see that URL before fetch, so such a request can carry a policy only on the header.
+ */
+const MODEL_IN_URL_APIS: readonly string[] = ["google-generative-ai", "google-vertex", "google-gemini-cli", "bedrock-converse-stream"];
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -218,16 +224,28 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   };
 
   /**
-   * The payload to hand back to the harness for a decision, and a blocked one for anything that cannot be sent.
-   * What is returned is a plain parse of the payload's serialization, checked to still carry what the decision
-   * relies on (the model as decided, OpenRouter's fields), and released by exactly those bytes: the fetch gate
-   * lets out that body with that header and authentication context, and nothing else.
+   * The payload to hand back to the harness for a decision: a blocked one unless every line below holds, and
+   * then a plain parse of the payload's serialization, released by exactly those bytes.
+   *
+   * What must hold before a request with a policy is released:
+   *   (a) Detection is valid for this base URL, query, and context, read with `credentialed` true only when a
+   *       header known to carry a credential is present: `fetchDetection` with `target` (gateway-client.ts) and
+   *       `credentialed` (request.ts); the cache is keyed by all three (`#key`, route-client.ts); and the reply
+   *       has not been discarded since (`client.isCurrent` below, and again at the gate).
+   *   (b) Every key and value of every policy the request carries is listed in that reply: `clearedToSend` over
+   *       the policies read off the wire carriers (decide.ts), and C16 against the list held for the same key.
+   *   (c) Every policy the decision counted is on a carrier of this request as serialized: the model suffix in
+   *       the body's `model` and the header as decided (`carriedPolicy` below); an API that names its model in
+   *       the body must have one; OpenRouter's fields are in the body as translated.
+   *   (d) The bytes released are the bytes checked: `copy` is what was checked, `JSON.stringify(copy)` is what
+   *       is released, and the fetch gate lets out only that body, with that header, context, and URL.
    */
   const apply = ({ request, prepared }: Guarded, payload: unknown): unknown => {
     try {
       const { decision } = prepared;
       if (decision.action === "block") return refuse(decision.reason);
       if (request === null) return refuse("the plugin does not know where the request goes");
+      // (a) The detection reply the decision used is still the one held.
       if (!client.isCurrent(prepared)) return refuse("the detection reply this request was checked against was discarded since; it is not sent");
       if (!isObject(payload)) return refuse("the request's payload is not a JSON object the plugin can read");
       let next: Record<string, unknown> = { ...payload };
@@ -241,15 +259,26 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (typeof payload["model"] !== "string") return refuse("the request has no model field to carry the policy");
         next = { ...next, model: decision.model };
       }
-      // Judged as serialized: a payload's own `toJSON`, or a getter, could drop or change what was set above.
+      // (d) Judged as serialized: a payload's own `toJSON`, or a getter, could drop or change what was set above.
       const copy: unknown = JSON.parse(JSON.stringify(next));
       const carried = member(copy, "model");
-      const expected = decision.action === "translate" || typeof payload["model"] === "string" ? decision.model : undefined;
-      if (carried !== expected) return refuse("the request's model, as serialized, is not the one the policy was decided for");
       if (decision.action === "translate") {
+        // (c) for a translated request: the model as translated, and every field of OpenRouter's as translated.
+        if (carried !== decision.model) return refuse("the request's model, as serialized, is not the one the policy was decided for");
         const provider = member(copy, "provider");
         for (const [field, value] of Object.entries(decision.provider)) {
           if (JSON.stringify(member(provider, field)) !== JSON.stringify(value)) return refuse(`the request, as serialized, does not carry OpenRouter's provider.${field} as translated`);
+        }
+      } else {
+        // (c) An API that names its model in the body must send one: the model is the suffix's only carrier.
+        if (decision.sent !== null && typeof carried !== "string" && !MODEL_IN_URL_APIS.includes(request.api ?? "")) {
+          return refuse(`the request has no model in its body, which the ${request.api ?? "unnamed"} API needs to carry the model and its suffix`);
+        }
+        if (carried !== undefined && carried !== decision.model) return refuse("the request's model, as serialized, is not the one the policy was decided for");
+        // (c) What the serialized request carries is every policy the decision counted: nothing lost, nothing added.
+        const onWire = carriedPolicy(typeof carried === "string" ? carried : null, decision.header);
+        if (!onWire.ok || JSON.stringify(onWire.value) !== JSON.stringify(decision.sent)) {
+          return refuse("the request, as serialized, does not carry every policy that was decided for it (a typed suffix can travel only in a body's model)");
         }
       }
       client.release({ ...prepared, decision }, decision.action === "send" ? decision.header : null, JSON.stringify(copy));

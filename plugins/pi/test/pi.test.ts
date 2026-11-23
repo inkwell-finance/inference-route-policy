@@ -163,6 +163,23 @@ test("C1, C14: pi: a Google API request carries its key in x-goog-api-key, which
   assert.ok(gateway.requests.filter((r) => r.method === "GET").every((r) => r.headers["x-goog-api-key"] === "demo-key" && r.headers.authorization === undefined));
 });
 
+test("C10: pi: each API that names its model in the URL may send a body without a model, its policy on the header alone", async () => {
+  for (const api of ["google-generative-ai", "google-vertex", "google-gemini-cli", "bedrock-converse-stream"]) {
+    gateway.requests.length = 0;
+    const harness = await pi("zdr");
+    harness.model.api = api;
+    assert.ok((await harness.request({ contents: [] })).sent, api);
+    assert.equal(gateway.inference()[0]?.headers["route-policy"], "zdr", api);
+  }
+});
+
+test("C10: pi: a request to an API that names its model in the body is blocked when its payload has none, even with the policy on the header", async () => {
+  const harness = await pi("zdr");
+  harness.model.api = "openai-responses";
+  assert.match((await harness.request({ input: "fixture" })).error ?? "", /has no model in its body, which the openai-responses API needs/);
+  assert.equal(gateway.inference().length, 0);
+});
+
 test("C10: pi: the held policy survives a session resume", async () => {
   const first = await pi("notrain");
   const resumed = new FakeHarness(gateway.base, { headerHook: true });

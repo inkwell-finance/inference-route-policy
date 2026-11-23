@@ -44,10 +44,10 @@ export class RouteClient {
   readonly #options: RouteClientOptions;
   // In-flight and settled reads, by base URL and credential. A settled failure is not kept.
   readonly #detections = new Map<string, Promise<DetectionResult>>();
-  readonly #lists = new Map<string, Promise<unknown>>();
+  readonly #lists = new Map<string, Promise<{ list: unknown } | null>>();
   // What is held now, for a request that may use what is held but would not fetch anything itself.
   readonly #heldDetections = new Map<string, Detection>();
-  readonly #heldLists = new Map<string, unknown>();
+  readonly #heldLists = new Map<string, { list: unknown }>();
   readonly #generations = new Map<string, number>();
   /** Withdrawals of this client's releases, oldest first; a used release is already gone and withdraws nothing. */
   readonly #withdrawals: (() => void)[] = [];
@@ -87,7 +87,7 @@ export class RouteClient {
     return pending;
   }
 
-  #modelList(target: Target): Promise<unknown> {
+  #modelList(target: Target): Promise<{ list: unknown } | null> {
     const key = this.#key(target);
     let pending = this.#lists.get(key);
     if (pending === undefined) {
@@ -130,7 +130,7 @@ export class RouteClient {
     this.#bases.add(base);
     let detection: Detection | null = this.#heldDetections.get(key) ?? null;
     let noDetection = "not fetched";
-    let modelList: { list: unknown } | null = this.#heldLists.has(key) ? { list: this.#heldLists.get(key) } : null;
+    let modelList: { list: unknown } | null = this.#heldLists.get(key) ?? null;
     if (anyPolicy(layers.value)) {
       const result = await this.#detection(target);
       detection = result.ok ? result.detection : null;
@@ -138,8 +138,7 @@ export class RouteClient {
       const bound = detection?.keyPolicy == null ? null : parsePolicy(detection.keyPolicy, detection.support);
       const requirement = anyRequirement(layers.value) || (bound?.ok === true && hasRequirements(bound.value));
       if (detection !== null && requirement && !isOpenRouter(base)) {
-        const list = await this.#modelList(target);
-        modelList = list === null ? null : { list };
+        modelList = await this.#modelList(target);
       }
     }
     return prepared(decide(layers.value, this.#options.carriers, { base, detection, noDetection, modelList }));

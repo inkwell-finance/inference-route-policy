@@ -31,10 +31,12 @@ function client(policy = "zdr", timeoutMs = 2000): { client: RouteClient; report
 
 const bearer = (key: string): RequestContext => [["authorization", `Bearer ${key}`]];
 const target = (key: string | null = "k", base = gateway.base): Target => ({ base, query: "", context: key === null ? [] : bearer(key) });
+/** A target with every part of its key set, so a cache that drops any one of them is seen to. */
+const placed = (key = "k", base = gateway.base): Target => ({ base, query: "?tenant=east", context: bearer(key) });
 
 // Counted by credential: a request an earlier test abandoned on a timeout can still land after `reset`.
 const reads = (path: string, credentials: readonly string[]): number =>
-  gateway.requests.filter((r) => r.path.endsWith(path) && credentials.some((k) => r.headers.authorization === `Bearer ${k}`)).length;
+  gateway.requests.filter((r) => r.path.includes(path) && credentials.some((k) => r.headers.authorization === `Bearer ${k}`)).length;
 const detectionRequests = (...credentials: string[]): number => reads("/route-policy", credentials.length > 0 ? credentials : ["k"]);
 const listRequests = (...credentials: string[]): number => reads("/models", credentials.length > 0 ? credentials : ["k"]);
 
@@ -103,12 +105,27 @@ test("C6, C14: another origin's valid reply, reached by a redirect, never author
   assert.equal(elsewhere.requests.length, 0);
 });
 
-test("C6: a key_policy in the reply to a request without credentials makes the reply invalid", async () => {
-  reset();
-  gateway.replies.detection = { status: 200, body: { route_policy: "1", key_policy: "zdr" } };
-  blockedFor((await decide(client().client, target(null))).decision, /key_policy is present in a reply to a request without credentials/);
-  assert.equal(gateway.requests.at(-1)?.headers.authorization, undefined, "the request carried no credentials");
-  assert.equal((await decide(client().client, target())).decision.action, "send");
+test("C6: a key_policy in the reply to a request without credentials makes the reply invalid; only a header that carries a credential makes one credentialed", async () => {
+  const at = (context: RequestContext): Target => ({ base: gateway.base, query: "", context });
+  const anonymous: [string, RequestContext][] = [
+    ["no headers", []],
+    ["a trace header alone", [["traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"]]],
+    ["an unknown header alone", [["x-tenant-token", "t"]]],
+    ["an empty authorization", [["authorization", ""]]],
+  ];
+  for (const [name, context] of anonymous) {
+    reset();
+    gateway.replies.detection = { status: 200, body: { route_policy: "1", key_policy: "zdr" } };
+    blockedFor((await decide(client().client, at(context))).decision, /key_policy is present in a reply to a request without credentials/);
+    assert.equal(gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length, 1, `${name}: detection was read`);
+  }
+  for (const name of ["authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie", "proxy-authorization"]) {
+    reset();
+    gateway.replies.detection = { status: 200, body: { route_policy: "1", key_policy: "zdr" } };
+    const { decision } = await decide(client().client, at([[name, "secret"]]));
+    assert.equal(decision.action, "send", `${name} alone carries a credential`);
+    assert.equal(gateway.requests.find((r) => r.path.endsWith("/route-policy"))?.headers[name], "secret", `detection read with ${name}`);
+  }
 });
 
 test("C6: a detection fetch that cannot complete in time, or cannot connect, is no detection", async () => {
@@ -148,20 +165,29 @@ test("C1, C14: detection and the model list are read with the whole context, and
   }
 });
 
-test("C1, C14: a query string in the base URL is part of where the request goes: read with it, and required on the request", async () => {
+test("C1, C14: a query string in the base URL is part of where the request goes: read with it, its own catalog and decision, and required on the request", async () => {
   reset();
-  const { client: c } = client("zdr");
+  const { client: c } = client("only=aurora");
+  // Two tenants behind one base URL, told apart by the query: each has its own catalog.
+  gateway.replies.models = (_headers, path) => ({
+    status: 200,
+    body: { data: [{ id: "demo-model", routes: [{ provider: path.includes("tenant=east") ? "aurora" : "cobalt", facts: "" }] }] },
+  });
   const t: Target = { base: gateway.base, query: "?tenant=east", context: bearer("k") };
   const send = release(c, await decide(c, t));
-  assert.ok(gateway.requests.some((r) => r.path.endsWith("/route-policy?tenant=east")) && gateway.requests.some((r) => r.path.endsWith("/models?tenant=east")));
-  // The same base URL without the query is another place: what was read with the query does not serve it.
-  await decide(c, { ...t, query: "" });
-  assert.equal(gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length, 1, "read again without the query");
+  blockedFor((await decide(c, { ...t, query: "?tenant=west" })).decision, /no route the model list publishes/);
+  blockedFor((await decide(c, { ...t, query: "" })).decision, /no route the model list publishes/);
+  assert.equal((await decide(c, t)).decision.action, "send", "east's catalog is still east's");
+  for (const path of ["/route-policy", "/models"]) {
+    const gets = gateway.requests.filter((r) => r.path.includes(path)).map((r) => r.path.slice(r.path.indexOf(path)));
+    assert.deepEqual(gets, [`${path}?tenant=east`, `${path}?tenant=west`, path], `${path} read once for each place, with its query`);
+  }
   await sendText(send);
   assert.ok(gateway.inference()[0]?.path.endsWith("/chat/completions?tenant=east"));
   release(c, await decide(c, t));
   const body = JSON.stringify({ model: "demo-model", messages: [] });
-  await assert.rejects(fetch(`${gateway.base}/chat/completions?tenant=west`, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body }), /not one the plugin released/);
+  // Everything as released but the query.
+  await assert.rejects(fetch(`${gateway.base}/chat/completions?tenant=west`, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "only=aurora" }, body }), /not one the plugin released/);
 });
 
 test("C1, C14: a request leaving with another context than the one it was checked for is stopped at fetch, and the user is told which headers it carried", async () => {
@@ -173,6 +199,8 @@ test("C1, C14: a request leaving with another context than the one it was checke
   for (const headers of [
     { authorization: "Bearer demo-key-zdr", "route-policy": "zdr" },
     { authorization: "Bearer demo-key", "x-api-key": "demo-key-zdr", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", "api-key": "demo-key-zdr", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", "x-goog-api-key": "demo-key-zdr", "route-policy": "zdr" },
     { authorization: "Bearer demo-key", cookie: "session=1", "route-policy": "zdr" },
     { authorization: "Bearer demo-key", "proxy-authorization": "Basic eA==", "route-policy": "zdr" },
     { authorization: "Bearer demo-key", "x-tenant-token": "t", "route-policy": "zdr" },
@@ -189,15 +217,15 @@ test("C1, C14: a request leaving with another context than the one it was checke
 test("C14: a not-honored result discards the detection reply of its own credential, and only that one", async () => {
   reset();
   const { client: c, reports } = client("zdr");
-  const sendOne = release(c, await decide(c, target("k1")));
-  const sendTwo = release(c, await decide(c, target("k2")));
+  const sendOne = release(c, await decide(c, placed("k1")));
+  const sendTwo = release(c, await decide(c, placed("k2")));
   gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
   await sendText(sendTwo);
   gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
   await sendText(sendOne);
   assert.deepEqual(reports.map((r) => r.kind), ["not-honored", "honored"]);
-  await decide(c, target("k1"));
-  await decide(c, target("k2"));
+  await decide(c, placed("k1"));
+  await decide(c, placed("k2"));
   assert.deepEqual([detectionRequests("k1"), detectionRequests("k2")], [1, 2], "k2's reply was discarded and fetched again; k1's was kept");
 });
 
@@ -230,10 +258,10 @@ test("C14: a discard that lands while a decision is still reading the gateway ma
   reset();
   gateway.replies.models = { status: 500 };
   const { client: c } = client("zdr");
-  const sendA = release(c, await decide(c, target()));
+  const sendA = release(c, await decide(c, placed()));
   // B's decision waits on a slow model list; meanwhile A comes back with no Route-Applied, which is not honored.
   gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr" }] }] }, delayMs: 300 };
-  const deciding = decide(c, target());
+  const deciding = decide(c, placed());
   gateway.replies.inference = { status: 200, body: {} };
   await sendText(sendA);
   const prepared = await deciding;
@@ -292,6 +320,32 @@ test("C5, C8: a redirect never outranks a refusal, and a translated request answ
   assert.equal(elsewhere.requests.length, 0);
 });
 
+test("C4, C16: any JSON value a model list reply holds is read as a list, null as {} does; only a reply that is no JSON is no list", async () => {
+  for (const [name, body, blocked] of [
+    ["null", null, true],
+    ["{}", {}, true],
+    ["a number", 7, true],
+    ["no JSON at all", undefined, false],
+  ] as const) {
+    reset();
+    gateway.replies.models = { status: 200, body };
+    const { decision } = await decide(client("only=aurora").client, target());
+    if (blocked) blockedFor(decision, /no route the model list publishes/);
+    else assert.ok(decision.action === "send" && decision.routes === null, `${name}: no list is held, so the gateway decides`);
+  }
+});
+
+test("C4, C14: each base URL has its own model list, and the decision follows the list of the base URL it goes to", async () => {
+  reset();
+  elsewhere.requests.length = 0;
+  elsewhere.replies.detection = { status: 200, body: { route_policy: "1" } };
+  elsewhere.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "cobalt", facts: "" }] }] } };
+  const { client: c } = client("only=aurora");
+  assert.equal((await decide(c, target())).decision.action, "send", "aurora is in this base URL's list");
+  blockedFor((await decide(c, target("k", elsewhere.base))).decision, /no route the model list publishes/);
+  assert.equal(elsewhere.requests.filter((r) => r.path.endsWith("/models")).length, 1, "the other base URL's list was read");
+});
+
 test("C14: failed reads are not kept, so the next request tries again", async () => {
   reset();
   gateway.replies.detection = { status: 503 };
@@ -319,13 +373,13 @@ test("C16: with a bound key policy, the list held for this base URL and credenti
   reset();
   gateway.replies.detection = { status: 200, body: { route_policy: "1", key_policy: "only=missing" } };
   const { client: c } = client("zdr");
-  blockedFor((await decide(c, target())).decision, /meets the policy combined with the key's own/);
+  blockedFor((await decide(c, placed())).decision, /meets the policy combined with the key's own/);
   c.set("sort=price");
-  blockedFor((await decide(c, target())).decision, /meets the policy combined with the key's own/);
+  blockedFor((await decide(c, placed())).decision, /meets the policy combined with the key's own/);
   c.held = { kind: "none" };
-  blockedFor((await decide(c, target())).decision, /meets the key's own policy/);
+  blockedFor((await decide(c, placed())).decision, /meets the key's own policy/);
   assert.equal(listRequests(), 1, "the held list was used, not fetched again");
-  assert.equal((await decide(c, target("k2"))).decision.action, "send", "another credential holds nothing here");
+  assert.equal((await decide(c, placed("k2"))).decision.action, "send", "another credential holds nothing here");
 });
 
 test("C8: the response to a translated request is reported unconfirmed, with or without route headers, and a refusal as a refusal", async () => {

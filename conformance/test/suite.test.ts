@@ -389,6 +389,49 @@ test("G25: a model not published in the catalog can still resolve", async (t) =>
   assert.match(verdict.detail, /unknown-model subcase: no-policy control did not establish an ordinary error \(HTTP 200\)/);
 });
 
+test("G25: an unpublished model can relay a headerless 422 without causing a false own-error finding", async (t) => {
+  const controls: (string | null)[] = [];
+  const report = await run(t, fixture(async ({ id, next, request, transport, header, body }) => {
+    if (!id.startsWith("route-conformance-unknown-")) return next();
+    controls.push(header);
+    const reply = await good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model }) }), transport);
+    return reply.headers.has(refusal) ? reply : change(reply, { status: 422, body: "provider could not process the input" });
+  }));
+  assert.deepEqual(controls, [null, "zdr"]);
+  assert.equal(report.failed, 0);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, /accepted-policy control reached routing for the unpublished model \(HTTP 422\)/);
+});
+
+for (const status of [400, 422]) test(`G25: a reference gateway accepting any key may relay a headerless provider ${status}`, async (t) => {
+  const credentialControls: { header: string | null; status: number; applied: string | null; providerCalls: number }[] = [];
+  let providerCalls = 0;
+  const target = createGateway({
+    models: { [model]: routes },
+    fetch: () => {
+      providerCalls++;
+      return Response.json({ providerError: "rejected by the provider" }, { status });
+    },
+  });
+  const report = await run(t, async (request, transport) => {
+    const before = providerCalls;
+    const reply = await target(request, transport);
+    if (request.headers.get("authorization")?.startsWith("Bearer route-conformance-invalid-")) {
+      credentialControls.push({ header: request.headers.get("route-policy"), status: reply.status, applied: reply.headers.get(applied), providerCalls: providerCalls - before });
+    }
+    return reply;
+  });
+  assert.deepEqual(credentialControls, [
+    { header: null, status, applied: null, providerCalls: 1 },
+    { header: null, status: 400, applied: null, providerCalls: 0 },
+  ]);
+  assert.equal(report.failed, 0);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, new RegExp(`headerless HTTP ${status} did not distinguish credential rejection from a provider relay`));
+});
+
 for (const sample of [
   { label: "unknown model", status: 422 },
   { label: "unrecognized credential", status: 418 },
@@ -405,7 +448,7 @@ for (const sample of [
         ? Response.json(body, { status: 400, headers: { [refusal]: formatRefused("unsupported", "bits") } })
         : Response.json(body, { status: sample.status });
     }));
-    assert.deepEqual(requests, [null, "bits=0"]);
+    assert.deepEqual(requests, sample.label === "unknown model" ? [null, "zdr", "bits=0"] : [null, null, "bits=0"]);
     const verdict = report.checks.find(({ id }) => id === "G25");
     assert.equal(verdict?.status, defect ? "FAIL" : "PASS");
     if (defect) assert.match(verdict.detail, /reason=unsupported/);
@@ -479,9 +522,11 @@ test("G25 G1 G6 G10 G13: ordinary HTTP 429 blocks policy probes without any conf
     for (const id of ["G1", "G6", "G10", "G13"]) {
       const verdict = report.checks.find((c) => c.endpoint === endpoint && c.id === id);
       assert.equal(verdict?.status, "SKIP");
-      assert.match(verdict.detail, /gateway answered its own error 429 to the (no-policy control|control without explicit policy)/);
+      assert.match(verdict.detail, /(no-policy control|control without explicit policy).* returned headerless HTTP 429; cannot distinguish an own error from a relay/);
     }
-    assert.equal(report.checks.find((c) => c.endpoint === endpoint && c.id === "G25")?.status, "PASS");
+    const verdict = report.checks.find((c) => c.endpoint === endpoint && c.id === "G25");
+    assert.equal(verdict?.status, "SKIP");
+    assert.match(verdict.detail, /bad-credentials subcase: headerless HTTP 429 did not distinguish credential rejection/);
   }
   const i = usableInputs.findIndex(({ suffix }) => suffix !== null);
   assert.ok(i >= 0, "a suffix probe was sent");

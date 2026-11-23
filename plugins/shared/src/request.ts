@@ -44,6 +44,19 @@ export function contextOf(headers: Headers): RequestContext {
   return context;
 }
 
+/**
+ * Headers known to carry a credential: the registry's key goes in one of the first four (bearer for most APIs,
+ * `x-api-key` for Messages, `x-goog-api-key` for Google, `api-key` for Azure-style gateways), and a cookie or a
+ * proxy credential can name the caller too. This list decides only whether a detection request "carried
+ * credentials" (C6): a header not on it still belongs to the context, but does not make a request credentialed.
+ * Treating an unknown header as no credential can only reject a valid reply's `key_policy`, never accept one a
+ * gateway sent to a caller it could not identify.
+ */
+const CREDENTIAL_HEADERS: readonly string[] = ["authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie", "proxy-authorization"];
+
+/** Whether a context carries a credential, as C6 means it. */
+export const credentialed = (context: RequestContext): boolean => context.some(([name, value]) => CREDENTIAL_HEADERS.includes(name) && value.trim() !== "");
+
 export const contextKey = (context: RequestContext): string => JSON.stringify(context);
 
 /** Where a request goes: the base URL without its query, and the query, which every request there carries too. */

@@ -58,6 +58,52 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().inference().length, 1);
   });
 
+  test(`C1, C6: ${name}: a request with no key and only a trace header is not credentialed, so a key_policy in the reply blocks it; an api-key header alone is a credential`, async () => {
+    gateway().replies.detection = { status: 200, body: { route_policy: "1", key_policy: "zdr" } };
+    const traced = await make("zdr");
+    traced.resolveAuth = async () => ({ ok: true });
+    traced.wireKey = null;
+    traced.model.headers = { traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" };
+    assert.match((await traced.request()).error ?? "", /key_policy is present in a reply to a request without credentials/);
+    assert.equal(gateway().inference().length, 0);
+    const keyed = await make("zdr");
+    keyed.resolveAuth = async () => ({ ok: true });
+    keyed.wireKey = null;
+    keyed.model.headers = { "api-key": "demo-key" };
+    assert.ok((await keyed.request()).sent, "an api-key header is a credential, read and released as context");
+    const gets = gateway().requests.filter((r) => r.method === "GET" && r.headers["api-key"] === "demo-key");
+    assert.deepEqual(gets.map((r) => r.path.slice(r.path.lastIndexOf("/"))), ["/route-policy", "/models"], "detection and the model list read with the api-key");
+    assert.equal(gateway().inference().length, 1);
+  });
+
+  test(`C10: ${name}: a request whose payload has no model, to an API that names its model in the body, is blocked: the typed suffix would be lost`, async () => {
+    const harness = await make("zdr");
+    // The held policy is also in the typed suffix, so the model as decided is the model as selected: nothing to rewrite.
+    harness.model = { ...harness.model, id: "demo-model+zdr+only=aurora", api: "openai-responses" };
+    const result = await harness.request({ input: "fixture" });
+    assert.match(result.error ?? "", /has no model in its body, which the openai-responses API needs/);
+    assert.equal(gateway().inference().length, 0);
+  });
+
+  test(`C10: ${name}: an API that names its model in the URL cannot carry a typed suffix in a body, so a request with one is blocked`, async () => {
+    const harness = await make(undefined);
+    harness.model = { ...harness.model, id: "demo-model+zdr", api: "google-generative-ai" };
+    harness.wireKey = "demo-key";
+    const result = await harness.request({ contents: [] });
+    assert.match(result.error ?? "", /does not carry every policy that was decided for it|no model field to carry the policy/);
+    assert.equal(gateway().inference().length, 0);
+  });
+
+  test(`C10: ${name}: a payload whose model is null, a number, an empty string, or another model is blocked, never sent without its carrier`, async () => {
+    for (const model of [null, 7, "", "other-model"]) {
+      const harness = await make("zdr");
+      const result = await harness.request({ model, messages: [] });
+      assert.equal(result.sent, false, `model ${JSON.stringify(model)}`);
+      assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: /);
+    }
+    assert.equal(gateway().inference().length, 0);
+  });
+
   test(`C5, C14: ${name}: with two sessions in one process, each response goes to the session that sent the request`, async () => {
     const first = await make("zdr");
     const second = await make("zdr");
@@ -69,6 +115,15 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     await first.request();
     assert.match(notices(first).at(-1) ?? "", /NOT honored/);
     assert.ok(!notices(second).some((text) => text.includes("NOT honored")));
+  });
+
+  test(`C10: ${name}: a payload whose own toJSON names another model, or none, is blocked: what is checked is what would be sent`, async () => {
+    const other = await make("zdr");
+    const named = await other.request({ model: "demo-model", messages: [], toJSON: () => ({ model: "other-model", messages: [] }) });
+    assert.match(named.error ?? "", /the request's model, as serialized, is not the one the policy was decided for/);
+    const none = await (await make("zdr")).request({ model: "demo-model", messages: [], toJSON: () => ({ messages: [] }) });
+    assert.match(none.error ?? "", /^Blocked by the route policy plugin, nothing was sent: .*(has no model in its body|does not carry every policy)/);
+    assert.equal(gateway().inference().length, 0);
   });
 
   test(`C9: ${name}: a payload whose own toJSON drops OpenRouter's fields is blocked, not released without them`, async () => {

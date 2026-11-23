@@ -30,8 +30,8 @@ export class FakeHarness {
   /** What `modelRegistry.getApiKeyAndHeaders` does; tests replace it to make the plugin fail. */
   resolveAuth: () => Promise<unknown> = async () => ({ ok: true, apiKey: "demo-key" });
   uiThrows = false;
-  /** The key the transport puts on the wire; a harness can send another than the registry reported. */
-  wireKey = "demo-key";
+  /** The key the transport puts on the wire, none when null; a harness can send another than the registry reported. */
+  wireKey: string | null = "demo-key";
   /** Headers the transport adds on its own, after the configured ones would be: a transport the plugin cannot see into. */
   extraWireHeaders: Record<string, string> = {};
   /** Replaces `ctx.model`, to hand the plugin a model the harness would never describe that way. */
@@ -104,7 +104,9 @@ export class FakeHarness {
     }
     // The registry's key goes where this API's transport puts it; configured headers then replace or add to it.
     const wire = new Headers({ "content-type": "application/json" });
-    if (this.model.api === "anthropic-messages") wire.set("x-api-key", this.wireKey);
+    if (this.wireKey === null) {
+      // No key: the request carries only what the configured headers add.
+    } else if (this.model.api === "anthropic-messages") wire.set("x-api-key", this.wireKey);
     else if (this.model.api === "google-generative-ai") wire.set("x-goog-api-key", this.wireKey);
     else wire.set("authorization", `Bearer ${this.wireKey}`);
     for (const [name, value] of Object.entries(this.extraWireHeaders)) wire.set(name, value);

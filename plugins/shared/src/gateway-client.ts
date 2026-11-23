@@ -5,7 +5,7 @@
  */
 
 import { parseDetection, type Detection } from "../../../core/src/index.ts";
-import type { RequestContext } from "./request.ts";
+import { credentialed, type RequestContext } from "./request.ts";
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -49,18 +49,22 @@ async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs:
 export async function fetchDetection(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<DetectionResult> {
   try {
     const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/route-policy${target.query}`, target, timeoutMs);
-    const read = parseDetection({ status, body, credentialed: target.context.length > 0 });
+    const read = parseDetection({ status, body, credentialed: credentialed(target.context) });
     return read.ok ? { ok: true, detection: read.value } : { ok: false, why: `detection reply is not valid: ${read.key === null ? "" : `${read.key} `}${read.detail}` };
   } catch (error) {
     return { ok: false, why: `detection could not be fetched: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
-/** Fetches the model list as the gateway sent it; `publishedRoutes` reads it. Null when there is no list to hold. */
-export async function fetchModelList(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<unknown> {
+/**
+ * Fetches the model list as the gateway sent it. Any JSON value in a 200 reply is a list held, `null` and `{}`
+ * included: `publishedRoutes` reads each the same way, and one that publishes no routes blocks a requirement
+ * (C16). Null only when no usable reply came: a failed fetch, another status, or a body that is not JSON.
+ */
+export async function fetchModelList(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<{ list: unknown } | null> {
   try {
     const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/models${target.query}`, target, timeoutMs);
-    return status === 200 && body !== undefined ? body : null;
+    return status === 200 && body !== undefined ? { list: body } : null;
   } catch {
     return null;
   }

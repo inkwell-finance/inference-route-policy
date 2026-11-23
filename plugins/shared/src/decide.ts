@@ -119,6 +119,21 @@ function parsed(text: string): Policy {
   return result.value;
 }
 
+/**
+ * The policy a request carries on the wire: the suffix of the `model` it sends (null when it sends none) and its
+ * `Route-Policy` header, combined as a gateway combines them, the suffix the more specific. Null when it carries
+ * none. A carrier that does not parse is reported, not dropped.
+ */
+export function carriedPolicy(model: string | null, header: string | null): Read<Policy | null> {
+  const suffix = model === null ? null : splitModel(model).policy;
+  const onSuffix = suffix === null ? null : parsePolicy(suffix);
+  const onHeader = header === null ? null : parsePolicy(header);
+  if (onSuffix !== null && !onSuffix.ok) return { ok: false, reason: `the model suffix "${suffix}" is not a valid policy` };
+  if (onHeader !== null && !onHeader.ok) return { ok: false, reason: `the Route-Policy header "${header}" is not a valid policy` };
+  if (onSuffix === null && onHeader === null) return { ok: true, value: null };
+  return { ok: true, value: layered(null, onHeader?.value ?? null, onSuffix?.value ?? null) };
+}
+
 /** The decision for one request. `carriers` says whether the harness lets the plugin set a header. */
 export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState): Decision {
   const { model, typed, configured, held } = layers;
@@ -161,7 +176,10 @@ export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState
     );
   }
 
-  const sent = carried.length === 0 ? null : layered(null, onHeader, onSuffix);
+  // What the request carries, read the one way the release check reads it again on the serialized request.
+  const onWire = carriedPolicy(wireModel, header);
+  if (!onWire.ok) return block(onWire.reason);
+  const sent = onWire.value;
   const routes = gateway.modelList === null ? null : publishedRoutes(gateway.modelList.list, wireModel);
   if (routes !== null) {
     // C16. The key's bound policy counts only when this client can interpret it (C12), and it counts whatever
