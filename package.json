@@ -10,7 +10,12 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"core/test/*.test.ts\" \"gateway/test/*.test.ts\" \"conformance/test/*.test.ts\" \"plugins/*/test/*.test.ts\""
+    "test": "node --test \"core/test/*.test.ts\" \"gateway/test/*.test.ts\" \"conformance/test/*.test.ts\" \"plugins/*/test/*.test.ts\"",
+    "demo": "node gateway/src/demo.ts",
+    "conformance": "node conformance/src/cli.ts",
+    "conformance:demo": "node conformance/src/demo.ts",
+    "e2e:omp": "node plugins/omp/e2e/run.ts",
+    "e2e:pi": "node plugins/pi/e2e/run.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

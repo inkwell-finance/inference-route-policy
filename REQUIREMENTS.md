@@ -75,7 +75,7 @@ own-error checks of G25.
 | G23 | The response to `GET {base}/models` is a JSON object whose `data` lists the model objects, each `id` at most once. Each model carries `routes`, each with `provider` (S17) and `facts` (S12), and with `evidence` (S18) when the facts include `attest`. A provider id appears at most once among a model's routes. A suffixed id listed for pickers is an alias; the model's own entry has no suffix in its `id`. | BB | Facts, Carriers |
 | G24 | An unknown provider id is not an error: in `only` it matches nothing; in `ignore` and `order` it has no effect. | BB | Keys |
 | G25 | An own error (bad credentials, an unreadable body, an unknown model id, a rate limit) is answered as without this protocol, before any policy check, with none of `Route-Applied`, `Route-Refused`, `Route-Evidence`. | BB | Result |
-| G26 | A request no policy reached is answered with the status it would have without this protocol and carries neither `Route-Refused` nor `Route-Evidence`. | BB | Result |
+| G26 | A request no policy reached carries neither `Route-Refused` nor `Route-Evidence`. | BB | Result |
 | G27 | `Route-Evidence` and the `evidence` URI point at the provider's own evidence, which covers the response relayed. The gateway puts no verdict or summary of its own in the header or at the URI. | Op | Result |
 | G28 | Each published fact holds for every party its key constrains, as the Keys section defines: everyone who receives the content for `zdr`, `notrain`, `region`; the model server for `bits`, `attest`. A gateway that publishes `zdr`, `notrain`, or `region` for any route itself meets it for every request it receives, served or refused. A published `bits` is the lowest precision among the model's weights as served, rounded down to an integer. | Op | Keys, Facts |
 | G29 | A request refusable for more than one reason is refused for the first of `unsupported`, `unsatisfiable`, `unavailable`. | BB | Refusal |
@@ -88,6 +88,7 @@ own-error checks of G25.
 | G36 | A gateway does not bind to a key a policy that fails the order of checks. | WB | Carriers |
 | G37 | The provider `Route-Applied` names is the one whose response is relayed. | WB | Result |
 | G38 | `key_policy` is present exactly when the request carries credentials whose key has a policy bound, and equals that policy. | WB | Detection |
+| G39 | A request no policy reached is answered with the status it would have without this protocol. | WB | Result |
 
 ## Client (C)
 

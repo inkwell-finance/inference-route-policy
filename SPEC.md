@@ -622,14 +622,18 @@ Each step adds to the one before.
 
 Steps 3 and 4 do not need the harness's maintainers. A plugin can do
 them wherever the harness lets one rewrite the outgoing request and
-read response headers. A plugin can also serve gateways that have not
+read response headers. A harness's response hook may skip error
+responses, which is where refusals arrive; a plugin then reads
+`Route-Refused` where the harness's HTTP client exposes it. A plugin
+can also serve gateways that have not
 adopted this protocol, by [translation](#clients).
 
 ## Relationship to existing dialects
 
 | Existing | Here |
 | -------- | ---- |
-| [OpenRouter](https://openrouter.ai/docs/features/provider-routing) `provider.only`, `ignore`, `order`, `zdr`, `sort` | `only`, `ignore`, `order`, `zdr`, `sort` |
+| [OpenRouter](https://openrouter.ai/docs/features/provider-routing) `provider.only`, `ignore`, `order`, `sort` | `only`, `ignore`, `order`, `sort` |
+| OpenRouter `provider.zdr` | Not `zdr`: it admits endpoints that keep prompts for abuse review, which `zdr` counts as retention. |
 | OpenRouter `provider.data_collection: "deny"` | `notrain`, and `zdr` where retention is meant |
 | OpenRouter `provider.quantizations` | `bits`, as a floor instead of a vocabulary |
 | OpenRouter `provider.allow_fallbacks: false` with `order` | `only` with `order` |
