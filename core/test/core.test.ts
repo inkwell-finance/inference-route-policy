@@ -17,12 +17,12 @@ import {
   meets,
   orderRoutes,
   parseApplied,
-  parseDetection,
+  parseDetection as readDetection,
   parseFacts,
   parsePolicy,
   parsePublishedFacts,
   parseRefused,
-  parseRoutes,
+  publishedRoutes,
   readOutcome,
   splitModel,
   supports,
@@ -49,6 +49,12 @@ function refusedKey(text: string, support?: Support): string | null {
   assert.ok(!parsed.ok, `"${text}" should be refused`);
   return parsed.key;
 }
+
+/** The routes a model list publishes for its one model, `m`. */
+const parseRoutes = (rows: unknown) => publishedRoutes({ data: [{ id: "m", routes: rows }] }, "m");
+
+/** A detection reply read as the answer to a request that carried credentials. */
+const parseDetection = (body: unknown) => readDetection(body, true);
 
 test("S1: a policy with every key parses to its meaning", () => {
   assert.deepEqual(policy("zdr+notrain+bits=8+region=us,de+attest=weights,prompt+only=a,b+ignore=c+sort=latency+order=b,a"), {
@@ -215,30 +221,61 @@ test("a policy and facts are only what the parser made: frozen, and a look-alike
   assert.notEqual(combined.order, made.order);
   assert.deepEqual(combined.order, made.order);
 
+  // The refusal is the library's own, by name: a TypeError from reading a field that is not there would not do.
+  const notAPolicy = { name: "TypeError", message: /^policy was not made by/ };
+  const notFacts = { name: "TypeError", message: /^facts were not made by/ };
+
   // Hand-built values that the parser would have refused, each shaped exactly like the real thing.
   const forgedPolicies: Policy[] = [{ ...made }, { ...made, bits: 65 }, { ...made, bits: Number.NaN }, { ...made, region: [] }, { ...made, only: ["a,b"] }, { ...made, sort: "custom" }];
   const forgedFacts: Facts[] = [{ ...read }, { ...read, bits: 65 }, { ...read, bits: Number.NaN }, { ...read, region: [] }, { ...read, region: ["ab"] }];
   const route = { provider: "a", facts: read };
   for (const forged of forgedPolicies) {
-    assert.throws(() => meets(route, forged), TypeError);
-    assert.throws(() => formatPolicy(forged), TypeError);
-    assert.throws(() => keysOf(forged), TypeError);
-    assert.throws(() => hasRequirements(forged), TypeError);
-    assert.throws(() => supports(baselineSupport(), forged), TypeError);
-    assert.throws(() => combinePolicies({ key: made, header: forged }), TypeError);
-    assert.throws(() => combinePolicies({ suffix: forged }), TypeError);
-    assert.throws(() => orderRoutes([route], forged, () => 0), TypeError);
-    assert.throws(() => clearedToSend(baselineSupport(), [made, forged]), TypeError);
-    assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, forged, null), TypeError);
+    assert.throws(() => meets(route, forged), notAPolicy);
+    assert.throws(() => formatPolicy(forged), notAPolicy);
+    assert.throws(() => keysOf(forged), notAPolicy);
+    assert.throws(() => hasRequirements(forged), notAPolicy);
+    assert.throws(() => supports(baselineSupport(), forged), notAPolicy);
+    assert.throws(() => combinePolicies({ key: made, header: forged }), notAPolicy);
+    assert.throws(() => combinePolicies({ suffix: forged }), notAPolicy);
+    assert.throws(() => orderRoutes([route], forged, () => 0), notAPolicy);
+    assert.throws(() => clearedToSend(baselineSupport(), [made, forged]), notAPolicy);
+    assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, forged, null), notAPolicy);
   }
   for (const forged of forgedFacts) {
-    assert.throws(() => meets({ provider: "a", facts: forged }, made), TypeError);
-    assert.throws(() => meets({ provider: "a", facts: forged }, policy("only=a")), TypeError);
+    assert.throws(() => meets({ provider: "a", facts: forged }, made), notFacts);
+    assert.throws(() => meets({ provider: "a", facts: forged }, policy("only=a")), notFacts);
     const routes = parseRoutes([{ provider: "a", facts: "zdr" }]);
     routes.set("a", { facts: forged, evidence: null });
-    assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, policy("zdr"), routes), TypeError);
+    assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, policy("zdr"), routes), notFacts);
   }
-  for (const notAValue of [null, undefined, "zdr", 5]) assert.throws(() => formatPolicy(notAValue as unknown as Policy), TypeError);
+
+  // A policy is not facts, and facts are not a policy, however alike their fields: the compiler says so, and so
+  // does the library when the compiler is not asked.
+  // @ts-expect-error a Policy is not assignable to Facts
+  const policyAsFacts: Facts = combinePolicies({ key: policy("region=it"), suffix: policy("region=jp") });
+  // @ts-expect-error Facts are not assignable to a Policy
+  const factsAsPolicy: Policy = read;
+  assert.throws(() => meets({ provider: "a", facts: policyAsFacts }, policy("region=us")), notFacts);
+  assert.throws(() => meets({ provider: "a", facts: policyAsFacts }, policy("only=a")), notFacts);
+  assert.throws(() => meets(route, factsAsPolicy), notAPolicy);
+  assert.throws(() => formatPolicy(factsAsPolicy), notAPolicy);
+  assert.throws(() => keysOf(factsAsPolicy), notAPolicy);
+  assert.throws(() => combinePolicies({ key: factsAsPolicy }), notAPolicy);
+  assert.throws(() => orderRoutes([route], factsAsPolicy, () => 0), notAPolicy);
+  assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, factsAsPolicy, null), notAPolicy);
+  const mixed = parseRoutes([{ provider: "a", facts: "zdr" }]);
+  mixed.set("a", { facts: policyAsFacts, evidence: null });
+  assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, policy("zdr"), mixed), notFacts);
+
+  // Every argument is checked, whatever its place and whatever the others would have decided.
+  const forged: Policy = { ...made };
+  for (const support of [null, baselineSupport(), { keys: new Set<string>(), attest: new Set<string>(), sort: new Set<string>() }]) {
+    assert.throws(() => clearedToSend(support, [made, forged]), notAPolicy);
+    assert.throws(() => clearedToSend(support, [forged, made]), notAPolicy);
+    assert.throws(() => clearedToSend(support, [policy("sort=price"), forged]), notAPolicy);
+    assert.throws(() => clearedToSend(support, [made, factsAsPolicy]), notAPolicy);
+  }
+  for (const notAValue of [null, undefined, "zdr", 5]) assert.throws(() => formatPolicy(notAValue as unknown as Policy), notAPolicy);
 });
 
 test("formatPolicy: a parsed policy formats to a string that parses to the same policy", () => {
@@ -952,4 +989,120 @@ test("the baseline cannot be changed by a caller", () => {
   assert.equal(parsePolicy("zdr").ok, true);
   assert.equal(baselineSupport().keys.has("zdr"), true);
   assert.equal(baselineSupport().attest.has("custom"), false);
+});
+
+test("G11, G13: a requirement that only one carrier states survives, whichever carrier it is", () => {
+  const each: [carrier: "key" | "header" | "suffix", text: string, field: keyof Policy, expected: unknown][] = [
+    ["suffix", "notrain", "notrain", true],
+    ["header", "notrain", "notrain", true],
+    ["key", "notrain", "notrain", true],
+    ["suffix", "zdr", "zdr", true],
+    ["suffix", "bits=16", "bits", 16],
+    ["header", "bits=16", "bits", 16],
+    ["suffix", "region=us", "region", ["us"]],
+    ["suffix", "only=a", "only", ["a"]],
+    ["suffix", "ignore=a", "ignore", ["a"]],
+    ["suffix", "attest=prompt", "attest", ["prompt"]],
+    ["key", "attest=prompt", "attest", ["prompt"]],
+  ];
+  for (const [carrier, text, field, expected] of each) {
+    // The other two carriers state something else, so the requirement comes from this one alone.
+    const others = { key: policy("sort=price"), header: policy("order=x"), suffix: policy("sort=latency") };
+    const combined = combinePolicies({ ...others, [carrier]: policy(text) });
+    assert.deepEqual(combined[field], expected, `${carrier}: ${text}`);
+  }
+  const both = combinePolicies({ header: policy("zdr"), suffix: policy("notrain") });
+  assert.equal(both.zdr, true);
+  assert.equal(both.notrain, true);
+  assert.equal(meets({ provider: "a", facts: facts("zdr") }, both), false);
+  assert.equal(meets({ provider: "a", facts: facts("zdr+notrain") }, both), true);
+});
+
+test("G6: every country a route processes in must be allowed, however many it lists", () => {
+  const route = (text: string) => ({ provider: "a", facts: facts(text) });
+  assert.equal(meets(route("region=it,fr"), policy("region=it,fr")), true);
+  assert.equal(meets(route("region=it,fr,de"), policy("region=it,fr")), false);
+  assert.equal(meets(route("region=de,it,fr"), policy("region=it,fr")), false);
+  assert.equal(meets(route("region=it,fr,de,es"), policy("region=it,fr,de")), false);
+  assert.equal(meets(route("region=it,fr,de,es"), policy("region=es,de,fr,it")), true);
+});
+
+test("S18: an evidence URI's port is 1 to 65535 with no leading zero", () => {
+  for (const port of ["1", "443", "8443", "44300", "65535"]) assert.equal(isEvidenceUri(`https://basalt.example:${port}/a`), true, port);
+  for (const port of ["0", "00", "0443", "65536", "99999", "100000", "-1", ""]) assert.equal(isEvidenceUri(`https://basalt.example:${port}/a`), false, port);
+});
+
+test("C3: evidence is needed for any attest requirement, one item or two, and for none without one", () => {
+  const uri = "https://basalt.example/attestation";
+  const routes = parseRoutes([{ provider: "basalt", facts: "attest=weights,prompt", evidence: uri }]);
+  const response = (evidence: string[]) => ({ applied: ["provider=basalt"], refused: [], evidence });
+  for (const text of ["attest=prompt", "attest=weights", "attest=weights,prompt", "zdr+attest=prompt"]) {
+    const sent = policy(text);
+    assert.equal(readOutcome(response([]), sent, null).outcome, "not-honored", text);
+    assert.equal(readOutcome(response([]), sent, routes).outcome, "not-honored", text);
+  }
+  assert.equal(readOutcome(response([uri]), policy("attest=prompt"), routes).outcome, "honored");
+  assert.equal(readOutcome(response([uri]), policy("attest=weights"), null).outcome, "honored");
+  assert.equal(readOutcome(response([]), policy("only=basalt"), routes).outcome, "honored");
+});
+
+test("C3: policies that combine to one no route can meet are never honored, with or without a model list", () => {
+  const routes = parseRoutes([{ provider: "p", facts: "zdr+region=it,jp" }]);
+  const response = { applied: ["provider=p"], refused: [], evidence: [] };
+  const region = combinePolicies({ header: policy("region=it"), suffix: policy("region=jp") });
+  const only = combinePolicies({ header: policy("only=p"), suffix: policy("only=q") });
+  for (const sent of [region, only]) {
+    assert.equal(readOutcome(response, sent, null).outcome, "not-honored");
+    assert.equal(readOutcome(response, sent, routes).outcome, "not-honored");
+  }
+  // Each carrier alone is honored by the same response, so it is the combination that decides.
+  assert.equal(readOutcome(response, policy("only=p"), null).outcome, "honored");
+  assert.equal(readOutcome(response, policy("region=it,jp"), routes).outcome, "honored");
+  // A refusal is still a refusal.
+  assert.equal(readOutcome({ ...response, refused: ["reason=unsatisfiable"] }, region, null).outcome, "refused");
+});
+
+test("C6, G22: a key policy in a reply to a request without credentials makes the reply no detection", () => {
+  const body = { route_policy: "1", key_policy: "zdr" };
+  const withCredentials = readDetection(body, true);
+  assert.ok(withCredentials.ok);
+  assert.equal(withCredentials.value.keyPolicy, "zdr");
+  const anonymous = readDetection(body, false);
+  assert.ok(!anonymous.ok);
+  assert.equal(anonymous.key, "key_policy");
+  // Without the member, an anonymous reply is as valid as any.
+  const plain = readDetection({ route_policy: "1" }, false);
+  assert.ok(plain.ok);
+  assert.equal(plain.value.keyPolicy, null);
+  assert.equal(clearedToSend(plain.value.support, [policy("zdr")]), true);
+});
+
+test("G23, C4: a model list publishes routes for a model only when it has the shape and names the model once", () => {
+  const rows = [{ provider: "p", facts: "zdr" }];
+  assert.deepEqual([...publishedRoutes({ data: [{ id: "m", routes: rows }, { id: "other", routes: [{ provider: "q", facts: "" }] }] }, "m").keys()], ["p"]);
+  assert.deepEqual([...publishedRoutes({ object: "list", data: [{ id: "other", routes: rows }, { id: "m", routes: rows }] }, "m").keys()], ["p"]);
+
+  const none: [list: unknown, name: string][] = [
+    [{ data: [{ id: "m", routes: rows }, { id: "m", routes: [{ provider: "p", facts: "notrain" }] }] }, "the model appears twice, with different facts"],
+    [{ data: [{ id: "m", routes: rows }, { id: "m", routes: rows }] }, "the model appears twice, identically"],
+    [{ data: [{ id: "other", routes: rows }] }, "the model is absent"],
+    [{ data: [] }, "the list is empty"],
+    [{ data: [{ id: "m" }] }, "the model has no routes member"],
+    [{ data: [{ id: "m", routes: {} }] }, "routes is not a list"],
+    [{ data: [{ id: "m", routes: "p" }] }, "routes is a string"],
+    [{ data: { id: "m", routes: rows } }, "data is not a list"],
+    [[{ id: "m", routes: rows }], "the list is a bare array"],
+    [{ models: [{ id: "m", routes: rows }] }, "the list is under another member"],
+    [Object.create({ data: [{ id: "m", routes: rows }] }), "data is inherited"],
+    [{ data: [Object.create({ id: "m", routes: rows })] }, "the model's members are inherited"],
+    [{ data: [{ id: ["m"], routes: rows }] }, "the id is not a string"],
+    [null, "null"],
+    ["text", "a string"],
+  ];
+  const response = { applied: ["provider=p"], refused: [], evidence: [] };
+  for (const [list, name] of none) {
+    assert.equal(publishedRoutes(list, "m").size, 0, name);
+    assert.equal(readOutcome(response, policy("zdr"), publishedRoutes(list, "m")).outcome, "not-honored", name);
+  }
+  assert.equal(readOutcome(response, policy("zdr"), publishedRoutes({ data: [{ id: "m", routes: rows }] }, "m")).outcome, "honored");
 });

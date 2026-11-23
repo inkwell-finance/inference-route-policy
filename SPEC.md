@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 7.
+Draft 8.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -213,10 +213,12 @@ model list, the requirements that route meets, in the same grammar:
   ] }
 ```
 
-`routes` is a member of each model object in the response to
-`GET {base}/models`. A provider id appears at most once among a model's
-routes. To a reader, a model list in which the model is absent, or its
-`routes` is not a list, publishes no routes for that model.
+The response to `GET {base}/models` is a JSON object whose `data`
+member is the list of model objects. Each has an `id`, which appears at
+most once in the list, and `routes`, among which a provider id appears
+at most once. To a reader, a model list that is not of that shape, in
+which the model is absent or appears more than once, or in which the
+model's `routes` is not a list, publishes no routes for that model.
 
 A gateway MUST publish facts that:
 
@@ -240,7 +242,7 @@ An evidence URI has this form and is at most 512 bytes:
 evidence := "https://" host (":" port)? ("/" rest)?
 host     := label ("." label)*
 label    := [a-z0-9] | [a-z0-9] [a-z0-9-]{0,61} [a-z0-9]
-port     := [0-9]{1,5}
+port     := an integer from 1 to 65535, no leading zero
 rest     := [A-Za-z0-9._~/?=&-]*
 ```
 
@@ -406,8 +408,10 @@ any `attest` or `sort` value it did not list.
 
 A reply is **valid** when it is a JSON object whose own members satisfy
 every rule above, where `key_policy` is checked against the reply's
-lists exactly as given. Where the object repeats a member name, the
-last occurrence is the member. A client MUST treat anything else, including a
+lists exactly as given, and is not valid when it carries `key_policy`
+in answer to a request that carried no credentials. Where the object
+repeats a member name, the last occurrence is the member. A client MUST
+treat anything else, including a
 reply it cannot fetch, as no detection. Within a valid reply a client
 MUST ignore members it does not know, keys this revision does not
 define, and `attest` and `sort` values this revision does not define.
@@ -471,6 +475,8 @@ For a request it sent with a requirement, a client MUST treat the
 policy as **not honored** when the response has no `Route-Refused` and
 any of these holds:
 
+- the policies it sent combine to one that no route can meet, because
+  a `region` or `only` intersection is empty;
 - it does not have exactly one `Route-Applied` value that fits the
   `applied` grammar. A joined repetition does not fit, so a client that
   sees only joined values applies the same test;
