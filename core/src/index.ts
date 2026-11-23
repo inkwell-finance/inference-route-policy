@@ -9,17 +9,16 @@ import { COUNTRIES } from "./countries.ts";
 
 export const LIMITS = Object.freeze({ policyBytes: 512, pairs: 16, items: 16 });
 
-const BASELINE_KEYS = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"] as const;
-const BASELINE_ATTEST = ["weights", "prompt"] as const;
-const BASELINE_SORT = ["price", "latency", "throughput"] as const;
+const BASELINE_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"];
+const BASELINE_ATTEST: readonly string[] = ["weights", "prompt"];
+const BASELINE_SORT: readonly string[] = ["price", "latency", "throughput"];
 
-/** Keys this revision defines whose presence restricts which routes qualify. Vendor keys do too. */
-const REQUIREMENT_KEYS = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore"] as const;
-/** Keys this revision defines that a route's facts may not carry. */
-const NOT_FACTS: Readonly<Record<string, true>> = { only: true, ignore: true, sort: true, order: true };
+/** Keys whose presence restricts which routes qualify. `sort` and `order` only order them. */
+const REQUIREMENT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore"];
+/** Keys a route's facts may never carry: the ones that are not facts, and the envelope key of `Route-Applied`. */
+const NOT_FACTS: Readonly<Record<string, true>> = { only: true, ignore: true, sort: true, order: true, provider: true };
 
-const NAME = "[a-z][a-z0-9]{0,15}";
-const KEY_SOURCE = `${NAME}(?:\\.${NAME})?`;
+const KEY_SOURCE = "[a-z][a-z0-9]{0,15}";
 const KEY = new RegExp(`^${KEY_SOURCE}$`);
 const ITEM = /^[a-z0-9][a-z0-9_.-]{0,31}$/;
 const BITS = /^[1-9][0-9]?$/;
@@ -28,7 +27,7 @@ const REFUSED = new RegExp(`^reason=(unsupported|unsatisfiable|unavailable)(?:\\
 /** A flag (`true`) or a list, as written. */
 export type Value = true | readonly string[];
 
-/** What a gateway accepts, as its detection reply states it. Vendor keys it lists are in `keys`. */
+/** What a gateway accepts, as its detection reply states it. */
 export interface Support {
   readonly keys: ReadonlySet<string>;
   readonly attest: ReadonlySet<string>;
@@ -40,18 +39,6 @@ export function baselineSupport(): Support {
   return { keys: new Set(BASELINE_KEYS), attest: new Set(BASELINE_ATTEST), sort: new Set(BASELINE_SORT) };
 }
 
-/** A gateway's definition of one vendor key (SPEC.md, Vendor keys). */
-export interface VendorRule {
-  /** Whether the gateway accepts this value for the key. */
-  accepts(value: Value): boolean;
-  /** Whether a route that publishes `fact` under the key meets `required`. Never called for a route without the key. */
-  meets(required: Value, fact: Value): boolean;
-  /** What two carriers' values combine to, or null when they cannot. Absent: the two must be identical. */
-  combine?(a: Value, b: Value): Value | null;
-}
-
-export type VendorRules = ReadonlyMap<string, VendorRule>;
-
 export interface Policy {
   zdr: boolean;
   notrain: boolean;
@@ -62,8 +49,6 @@ export interface Policy {
   ignore: readonly string[];
   sort: string | null;
   order: readonly string[] | null;
-  /** Vendor keys, which only the gateway that defines them accepts. Always requirements. */
-  vendor: ReadonlyMap<string, Value>;
 }
 
 export interface Facts {
@@ -71,8 +56,9 @@ export interface Facts {
   notrain: boolean;
   bits: number | null;
   region: readonly string[] | null;
+  /** May hold items this revision does not define, read from a gateway on a later one. They match nothing here. */
   attest: readonly string[];
-  /** Vendor keys, and well-formed keys this revision does not define. Carried, and matched only by a vendor rule. */
+  /** Well-formed keys this revision does not define, read from a gateway on a later one. Carried, never matched. */
   other: ReadonlyMap<string, Value>;
 }
 
@@ -87,11 +73,10 @@ export type Result<T> = { ok: true; value: T } | Failure;
 
 const fail = (key: string | null, detail: string): Failure => ({ ok: false, key, detail });
 
-const copy = (value: Value): Value => (value === true ? true : [...value]);
-
 /**
  * Walks a policy or facts string in the spec's order of checks (S16): the whole-string limits, then each pair as
- * written, its grammar, then a repeated key, then `check` for the key and value. Returns the first failure.
+ * written. A pair fails on its grammar, a repeated key, or `check`. Returns the first failure, which names the
+ * pair's key when that key is well formed.
  */
 function walk(text: string, check: (key: string, value: Value) => Failure | null): Failure | null {
   if (new TextEncoder().encode(text).length > LIMITS.policyBytes) return fail(null, `longer than ${LIMITS.policyBytes} bytes`);
@@ -154,28 +139,22 @@ function valueFailure(key: string, value: Value, attest: ReadonlySet<string>, so
   }
 }
 
-const defined = (values: ReadonlySet<string>, baseline: readonly string[]): ReadonlySet<string> => new Set(baseline.filter((value) => values.has(value)));
+/** The members of `listed` that this revision defines: listing a value does not define it. */
+const defined = (listed: ReadonlySet<string>, baseline: readonly string[]): ReadonlySet<string> => new Set(baseline.filter((value) => listed.has(value)));
 
 /**
  * Parses one carrier's policy against what the gateway accepts (S1 to S10, S16). The result is the whole policy or
- * the first failure in the spec's order of checks. A vendor key in `support` with no rule in `vendor` is accepted
- * with any grammatical value, which is all a client can know of it; a gateway passes the rules it defines.
+ * the first failure in the spec's order of checks.
  */
-export function parsePolicy(text: string, support: Support = baselineSupport(), vendor?: VendorRules): Result<Policy> {
+export function parsePolicy(text: string, support: Support = baselineSupport()): Result<Policy> {
   const attest = defined(support.attest, BASELINE_ATTEST);
   const sort = defined(support.sort, BASELINE_SORT);
   const pairs = new Map<string, Value>();
   const failure = walk(text, (key, value) => {
     if (!support.keys.has(key)) return fail(key, "key not accepted");
-    if (key.includes(".")) {
-      const rule = vendor?.get(key);
-      if (rule !== undefined && !rule.accepts(value)) return fail(key, "value not accepted");
-    } else {
-      const invalid = valueFailure(key, value, attest, sort);
-      if (invalid !== null) return invalid;
-    }
-    pairs.set(key, value);
-    return null;
+    const invalid = valueFailure(key, value, attest, sort);
+    if (invalid === null) pairs.set(key, value);
+    return invalid;
   });
   if (failure !== null) return failure;
   const list = (key: string): readonly string[] | null => {
@@ -194,35 +173,32 @@ export function parsePolicy(text: string, support: Support = baselineSupport(), 
       ignore: list("ignore") ?? [],
       sort: list("sort")?.[0] ?? null,
       order: list("order"),
-      vendor: new Map([...pairs].filter(([key]) => key.includes("."))),
     },
   };
 }
 
-const pair = (key: string, value: Value): string => (value === true ? key : `${key}=${value.join(",")}`);
-
-const sortedPairs = (map: ReadonlyMap<string, Value>): string[] => [...map.keys()].sort().map((key) => pair(key, map.get(key)!));
+const listPair = (key: string, items: readonly string[]): string => `${key}=${items.join(",")}`;
 
 /**
- * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when it cannot be written as one:
- * it says nothing, an intersection left `region` or `only` empty, or it is over a limit. A combined policy is a
- * decision and need not be writable (SPEC.md, Combining), so a client that must send one checks here first.
+ * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when there is no such string:
+ * the policy says nothing, an intersection left `region` or `only` empty, a list is over a limit, or a field holds
+ * a value its key does not allow. A combined policy is a decision and need not be writable (SPEC.md, Combining),
+ * so a client that must send one checks here first.
  */
 export function formatPolicy(policy: Policy): Result<string> {
   const out: string[] = [];
   if (policy.zdr) out.push("zdr");
   if (policy.notrain) out.push("notrain");
   if (policy.bits !== null) out.push(`bits=${policy.bits}`);
-  if (policy.region !== null) out.push(pair("region", policy.region));
-  if (policy.attest.length > 0) out.push(pair("attest", policy.attest));
-  if (policy.only !== null) out.push(pair("only", policy.only));
-  if (policy.ignore.length > 0) out.push(pair("ignore", policy.ignore));
+  if (policy.region !== null) out.push(listPair("region", policy.region));
+  if (policy.attest.length > 0) out.push(listPair("attest", policy.attest));
+  if (policy.only !== null) out.push(listPair("only", policy.only));
+  if (policy.ignore.length > 0) out.push(listPair("ignore", policy.ignore));
   if (policy.sort !== null) out.push(`sort=${policy.sort}`);
-  if (policy.order !== null) out.push(pair("order", policy.order));
-  out.push(...sortedPairs(policy.vendor));
+  if (policy.order !== null) out.push(listPair("order", policy.order));
   const text = out.join("+");
-  const failure = walk(text, () => null);
-  return failure === null ? { ok: true, value: text } : failure;
+  const parsed = parsePolicy(text);
+  return parsed.ok ? { ok: true, value: text } : parsed;
 }
 
 /** The keys a policy uses, for checking them against a detection reply. */
@@ -237,14 +213,12 @@ export function keysOf(policy: Policy): string[] {
   if (policy.ignore.length > 0) keys.push("ignore");
   if (policy.sort !== null) keys.push("sort");
   if (policy.order !== null) keys.push("order");
-  keys.push(...[...policy.vendor.keys()].sort());
   return keys;
 }
 
 /** Whether the policy restricts which routes qualify. One that only orders them may be sent without detection. */
 export function hasRequirements(policy: Policy): boolean {
-  const used = keysOf(policy);
-  return policy.vendor.size > 0 || REQUIREMENT_KEYS.some((key) => used.includes(key));
+  return keysOf(policy).some((key) => REQUIREMENT_KEYS.includes(key));
 }
 
 /**
@@ -260,24 +234,12 @@ export function supports(support: Support, policy: Policy): boolean {
 }
 
 /**
- * Splits a `model` field at its first `+`, without judging either half. `policy` is null when there is no `+`.
- * Gateways use `readModel`, which checks both; this is for a client that must keep a typed suffix as typed.
+ * Splits a `model` field at its first `+`, without judging either half (S11). `policy` is null when there is no
+ * `+`. The id may be empty, which names no model.
  */
 export function splitModel(model: string): { id: string; policy: string | null } {
   const plus = model.indexOf("+");
   return plus < 0 ? { id: model, policy: null } : { id: model.slice(0, plus), policy: model.slice(plus + 1) };
-}
-
-/**
- * Reads the model-suffix carrier (S11). A field with no `+` carries no policy. With one, the id must not be empty
- * (malformed, no key named) and the rest must parse.
- */
-export function readModel(model: string, support: Support = baselineSupport(), vendor?: VendorRules): Result<{ id: string; policy: Policy | null }> {
-  const { id, policy } = splitModel(model);
-  if (policy === null) return { ok: true, value: { id, policy: null } };
-  if (id === "") return fail(null, "empty model id before the suffix");
-  const parsed = parsePolicy(policy, support, vendor);
-  return parsed.ok ? { ok: true, value: { id, policy: parsed.value } } : parsed;
 }
 
 const union = (lists: readonly (readonly string[])[]): string[] => [...new Set(lists.flat())];
@@ -288,52 +250,34 @@ function intersection(lists: readonly (readonly string[] | null)[]): string[] | 
   return present.slice(1).reduce<string[]>((acc, list) => acc.filter((item) => list.includes(item)), [...present[0]!]);
 }
 
-const identical = (a: Value, b: Value): boolean => (a === true || b === true ? a === b : a.length === b.length && a.every((item, i) => item === b[i]));
-
 /**
  * Combines the policies that reached one request (SPEC.md, Combining). Requirements accumulate; the most specific
- * preference wins. An empty `region` or `only` in the result means no route can qualify. Vendor values combine by
- * the gateway's rule; without one, two carriers' values must be identical or the result is a failure naming the key.
+ * preference wins. An empty `region` or `only` in the result means no route can qualify. The result is a decision:
+ * it may be over a limit, and `formatPolicy` says whether it can be written.
  */
-export function combinePolicies(layers: { key?: Policy; header?: Policy; suffix?: Policy }, vendor?: VendorRules): Result<Policy> {
+export function combinePolicies(layers: { key?: Policy; header?: Policy; suffix?: Policy }): Policy {
   const bySpecificity = [layers.suffix, layers.header, layers.key].filter((p) => p !== undefined);
-  const vendorValues = new Map<string, Value>();
-  for (const layer of bySpecificity) {
-    for (const [key, value] of layer.vendor) {
-      const held = vendorValues.get(key);
-      if (held === undefined) {
-        vendorValues.set(key, copy(value));
-        continue;
-      }
-      const combine = vendor?.get(key)?.combine;
-      const combined = combine !== undefined ? combine(held, value) : identical(held, value) ? held : null;
-      if (combined === null) return fail(key, "vendor values by two carriers cannot be combined");
-      vendorValues.set(key, copy(combined));
-    }
-  }
   const bits = bySpecificity.map((p) => p.bits).filter((b) => b !== null);
   const order = bySpecificity.find((p) => p.order !== null)?.order ?? null;
   return {
-    ok: true,
-    value: {
-      zdr: bySpecificity.some((p) => p.zdr),
-      notrain: bySpecificity.some((p) => p.notrain),
-      bits: bits.length > 0 ? Math.max(...bits) : null,
-      region: intersection(bySpecificity.map((p) => p.region)),
-      attest: union(bySpecificity.map((p) => p.attest)),
-      only: intersection(bySpecificity.map((p) => p.only)),
-      ignore: union(bySpecificity.map((p) => p.ignore)),
-      sort: bySpecificity.find((p) => p.sort !== null)?.sort ?? null,
-      order: order === null ? null : [...order],
-      vendor: vendorValues,
-    },
+    zdr: bySpecificity.some((p) => p.zdr),
+    notrain: bySpecificity.some((p) => p.notrain),
+    bits: bits.length > 0 ? Math.max(...bits) : null,
+    region: intersection(bySpecificity.map((p) => p.region)),
+    attest: union(bySpecificity.map((p) => p.attest)),
+    only: intersection(bySpecificity.map((p) => p.only)),
+    ignore: union(bySpecificity.map((p) => p.ignore)),
+    sort: bySpecificity.find((p) => p.sort !== null)?.sort ?? null,
+    order: order === null ? null : [...order],
   };
 }
 
 /**
- * Reads a route's facts as a client must (S13). The empty string is a route that meets nothing. Facts that are
- * malformed, or that carry `only`, `ignore`, `sort`, or `order`, fail, and the caller treats the route as meeting
- * nothing. Any other well-formed key this revision does not define is kept in `other` and never matched here.
+ * Reads a route's facts as a client must (S13). The empty string is a route that meets nothing. Fails on invalid
+ * facts: outside the grammar or limits, an invalid value for `zdr`, `notrain`, `bits`, or `region`, or a key that
+ * can never be a fact. The caller then treats the route as meeting no policy that has a requirement. A well-formed
+ * key this revision does not define is kept in `other`, and an unknown `attest` item is kept in `attest`; neither
+ * is ever matched, since this reader cannot have required it.
  */
 export function parseFacts(text: string): Result<Facts> {
   const facts: Facts = { zdr: false, notrain: false, bits: null, region: null, attest: [], other: new Map() };
@@ -368,8 +312,8 @@ export function parseFacts(text: string): Result<Facts> {
 }
 
 /**
- * Checks facts a gateway is about to publish (S12): everything `parseFacts` checks, and no key beyond the five
- * this revision defines and the vendor keys the gateway defines, with `attest` values it accepts.
+ * Checks facts a gateway is about to publish (S12): everything `parseFacts` checks, and nothing beyond the five
+ * fact keys, with only the `attest` values the gateway accepts.
  */
 export function parsePublishedFacts(text: string, support: Support = baselineSupport()): Result<Facts> {
   const parsed = parseFacts(text);
@@ -377,10 +321,8 @@ export function parsePublishedFacts(text: string, support: Support = baselineSup
   const attest = defined(support.attest, BASELINE_ATTEST);
   const unknownAttest = parsed.value.attest.find((item) => !attest.has(item));
   if (unknownAttest !== undefined) return fail("attest", `"${unknownAttest}" is not an attest value this gateway accepts`);
-  for (const key of parsed.value.other.keys()) {
-    if (!key.includes(".") || !support.keys.has(key)) return fail(key, "is not a fact this gateway may publish");
-  }
-  return parsed;
+  const [unknownKey] = parsed.value.other.keys();
+  return unknownKey === undefined ? parsed : fail(unknownKey, "is not a fact a gateway may publish");
 }
 
 export function formatFacts(facts: Facts): string {
@@ -388,17 +330,17 @@ export function formatFacts(facts: Facts): string {
   if (facts.zdr) out.push("zdr");
   if (facts.notrain) out.push("notrain");
   if (facts.bits !== null) out.push(`bits=${facts.bits}`);
-  if (facts.region !== null) out.push(pair("region", facts.region));
-  if (facts.attest.length > 0) out.push(pair("attest", facts.attest));
-  out.push(...sortedPairs(facts.other));
+  if (facts.region !== null) out.push(listPair("region", facts.region));
+  if (facts.attest.length > 0) out.push(listPair("attest", facts.attest));
+  for (const key of [...facts.other.keys()].sort()) {
+    const value = facts.other.get(key)!;
+    out.push(value === true ? key : listPair(key, value));
+  }
   return out.join("+");
 }
 
-/**
- * Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. A vendor requirement is met
- * only when the route's facts carry the key and the gateway's rule for it says so; without a rule, never.
- */
-export function meets(route: { provider: string; facts: Facts }, policy: Policy, vendor?: VendorRules): boolean {
+/** Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. */
+export function meets(route: { provider: string; facts: Facts }, policy: Policy): boolean {
   const { provider, facts } = route;
   if (policy.zdr && !facts.zdr) return false;
   if (policy.notrain && !facts.notrain) return false;
@@ -409,12 +351,7 @@ export function meets(route: { provider: string; facts: Facts }, policy: Policy,
   }
   if (!policy.attest.every((item) => facts.attest.includes(item))) return false;
   if (policy.only !== null && !policy.only.includes(provider)) return false;
-  if (policy.ignore.includes(provider)) return false;
-  for (const [key, required] of policy.vendor) {
-    const fact = facts.other.get(key);
-    if (fact === undefined || vendor?.get(key)?.meets(required, fact) !== true) return false;
-  }
-  return true;
+  return !policy.ignore.includes(provider);
 }
 
 /**
@@ -435,8 +372,13 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
 /** Whether a string can be a provider id on the wire (S17). */
 export const isProviderId = (id: string): boolean => ITEM.test(id);
 
-/** The `Route-Applied` value for the route whose response is relayed (S14). */
+/**
+ * The `Route-Applied` value for the route whose response is relayed (S14). Throws on a provider id that is not an
+ * item: a gateway checks its ids when it loads them, so one that reaches here is a programming error, and writing
+ * it would produce a header no reader accepts.
+ */
 export function formatApplied(provider: string, facts: Facts): string {
+  if (!isProviderId(provider)) throw new RangeError(`"${provider}" is not a provider id`);
   const rest = formatFacts(facts);
   return rest === "" ? `provider=${provider}` : `provider=${provider}+${rest}`;
 }
@@ -451,9 +393,7 @@ export function parseApplied(text: string): Result<{ provider: string; facts: Fa
   // `provider=x+` is malformed; `provider=x` alone is a route that meets nothing.
   if (plus === text.length - 1) return fail(null, "nothing after the last +");
   const facts = parseFacts(plus < 0 ? "" : text.slice(plus + 1));
-  if (!facts.ok) return facts;
-  if (facts.value.other.has("provider")) return fail("provider", "repeated key");
-  return { ok: true, value: { provider, facts: facts.value } };
+  return facts.ok ? { ok: true, value: { provider, facts: facts.value } } : facts;
 }
 
 export type RefusalReason = "unsupported" | "unsatisfiable" | "unavailable";
@@ -461,11 +401,16 @@ export type RefusalReason = "unsupported" | "unsatisfiable" | "unavailable";
 /** HTTP status of each refusal (SPEC.md, Refusal). */
 export const REFUSAL_STATUS: Readonly<Record<RefusalReason, number>> = Object.freeze({ unsupported: 400, unsatisfiable: 400, unavailable: 503 });
 
-/** The `Route-Refused` value (S15). Only an `unsupported` refusal names a key. */
+/**
+ * The `Route-Refused` value (S15). Only an `unsupported` refusal names a key. Throws on a key that is not one,
+ * for the same reason `formatApplied` throws.
+ */
 export function formatRefused(reason: "unsupported", key?: string | null): string;
 export function formatRefused(reason: "unsatisfiable" | "unavailable"): string;
 export function formatRefused(reason: RefusalReason, key: string | null = null): string {
-  return key === null ? `reason=${reason}` : `reason=${reason}+key=${key}`;
+  if (key === null) return `reason=${reason}`;
+  if (reason !== "unsupported" || !KEY.test(key)) throw new RangeError(`cannot name key "${key}" in a "${reason}" refusal`);
+  return `reason=${reason}+key=${key}`;
 }
 
 /** Reads `Route-Refused` (S15). A value that does not match is still a refusal to the client; it just has no reason to show. */
@@ -481,7 +426,11 @@ export function parseRefused(text: string): Result<{ reason: RefusalReason; key:
 export interface Detection {
   /** What this client can use: the reply's lists, without keys and values this revision does not define. */
   support: Support;
-  /** The policy bound to the key the detection request carried, as sent; null when there is none. */
+  /**
+   * The policy bound to the key the detection request carried, as sent; null when there is none. It was checked
+   * against the reply's lists as given, so it may use a key or value from a later revision that `support` lacks.
+   * `parsePolicy(keyPolicy, support)` says whether this client can interpret it.
+   */
   keyPolicy: string | null;
 }
 
@@ -489,13 +438,17 @@ export interface Detection {
 function ownList(reply: object, name: string, shape: RegExp, fallback: readonly string[]): string[] | null {
   if (!Object.hasOwn(reply, name)) return [...fallback];
   const value: unknown = Reflect.get(reply, name);
-  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string" && shape.test(entry)) ? value : null;
+  if (!Array.isArray(value)) return null;
+  // Array.from fills holes with undefined, so a sparse array, which is not a JSON list, fails like any non-string.
+  const entries: unknown[] = Array.from(value);
+  return entries.every((entry): entry is string => typeof entry === "string" && shape.test(entry)) ? entries : null;
 }
 
 /**
  * Reads a detection reply body (SPEC.md, Detection). A reply is valid only when every known member is: anything
- * else is no detection. From a valid one, members, dotless keys, and `attest`/`sort` values this revision does not
- * define are dropped, since this client cannot use them. Members are read as the object's own, never inherited.
+ * else is no detection. From a valid one, members, keys, and `attest`/`sort` values this revision does not define
+ * are dropped from `support`, since this client cannot use them. Members are read as the object's own, never
+ * inherited.
  */
 export function parseDetection(body: unknown): Result<Detection> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return fail(null, "not a JSON object");
@@ -511,26 +464,20 @@ export function parseDetection(body: unknown): Result<Detection> {
   if (Object.hasOwn(body, "key_policy")) {
     const bound: unknown = Reflect.get(body, "key_policy");
     if (typeof bound !== "string") return fail("key_policy", "is not a string");
-    // Valid under the reply's own lists, including keys this revision does not define, whose values cannot be judged here.
+    // Checked against the lists exactly as given. A listed key from a later revision passes with any well-formed value.
     const listed = { keys: new Set(keys), attest: new Set(attest), sort: new Set(sort) };
     const failure = walk(bound, (key, value) => {
       if (!listed.keys.has(key)) return fail(key, "key not listed");
-      const known = !key.includes(".") && BASELINE_KEYS.some((baseline) => baseline === key);
-      return known ? valueFailure(key, value, listed.attest, listed.sort) : null;
+      return BASELINE_KEYS.includes(key) ? valueFailure(key, value, listed.attest, listed.sort) : null;
     });
-    if (failure !== null) return fail("key_policy", `is not valid under the reply's lists: ${failure.detail}`);
+    if (failure !== null) return fail("key_policy", `fails the order of checks under the reply's lists: ${failure.detail}`);
     keyPolicy = bound;
   }
 
-  const baselineKeys: readonly string[] = BASELINE_KEYS;
   return {
     ok: true,
     value: {
-      support: {
-        keys: new Set(keys.filter((key) => key.includes(".") || baselineKeys.includes(key))),
-        attest: defined(new Set(attest), BASELINE_ATTEST),
-        sort: defined(new Set(sort), BASELINE_SORT),
-      },
+      support: { keys: defined(new Set(keys), BASELINE_KEYS), attest: defined(new Set(attest), BASELINE_ATTEST), sort: defined(new Set(sort), BASELINE_SORT) },
       keyPolicy,
     },
   };

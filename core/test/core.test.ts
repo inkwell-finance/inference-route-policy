@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { COUNTRIES } from "../src/countries.ts";
 import {
@@ -19,23 +20,16 @@ import {
   parsePolicy,
   parsePublishedFacts,
   parseRefused,
-  readModel,
   splitModel,
   supports,
   type Facts,
   type Policy,
   type Support,
   type Value,
-  type VendorRules,
 } from "../src/index.ts";
 
-function withKeys(...extra: string[]): Support {
-  const base = baselineSupport();
-  return { ...base, keys: new Set([...base.keys, ...extra]) };
-}
-
-function policy(text: string, support?: Support, vendor?: VendorRules): Policy {
-  const parsed = parsePolicy(text, support, vendor);
+function policy(text: string, support?: Support): Policy {
+  const parsed = parsePolicy(text, support);
   assert.ok(parsed.ok, `"${text}" should parse: ${parsed.ok ? "" : parsed.detail}`);
   return parsed.value;
 }
@@ -47,24 +41,13 @@ function facts(text: string): Facts {
 }
 
 /** Asserts the policy is refused and returns the key the refusal names. */
-function refusedKey(text: string, support?: Support, vendor?: VendorRules): string | null {
-  const parsed = parsePolicy(text, support, vendor);
+function refusedKey(text: string, support?: Support): string | null {
+  const parsed = parsePolicy(text, support);
   assert.ok(!parsed.ok, `"${text}" should be refused`);
   return parsed.key;
 }
 
-/** A vendor key `acme.tier` whose value is one digit 1 to 3: a route meets it when its own tier is at most the required one. */
-const tierRule: VendorRules = new Map([
-  [
-    "acme.tier",
-    {
-      accepts: (value: Value) => value !== true && value.length === 1 && /^[1-3]$/.test(value[0]!),
-      meets: (required: Value, fact: Value) => required !== true && fact !== true && Number(fact[0]) <= Number(required[0]),
-    },
-  ],
-]);
-
-test("S1: a policy with every baseline key parses to its meaning", () => {
+test("S1: a policy with every key parses to its meaning", () => {
   assert.deepEqual(policy("zdr+notrain+bits=8+region=us,de+attest=weights,prompt+only=a,b+ignore=c+sort=latency+order=b,a"), {
     zdr: true,
     notrain: true,
@@ -75,8 +58,8 @@ test("S1: a policy with every baseline key parses to its meaning", () => {
     ignore: ["c"],
     sort: "latency",
     order: ["b", "a"],
-    vendor: new Map(),
   });
+  assert.deepEqual(policy("sort=price"), { zdr: false, notrain: false, bits: null, region: null, attest: [], only: null, ignore: [], sort: "price", order: null });
 });
 
 test("S1: empty strings, empty pairs, empty lists, and whitespace are malformed", () => {
@@ -86,12 +69,10 @@ test("S1: empty strings, empty pairs, empty lists, and whitespace are malformed"
 });
 
 test("S2: key and item character sets and lengths are enforced at the boundary", () => {
-  const support = withKeys(`v.${"k".repeat(16)}`, `${"v".repeat(16)}.k`);
-  policy(`v.${"k".repeat(16)}`, support);
-  policy(`${"v".repeat(16)}.k`, support);
-  assert.equal(refusedKey(`v.${"k".repeat(17)}`, support), null);
-  assert.equal(refusedKey(`${"v".repeat(17)}.k`, support), null);
-  for (const key of ["Zdr", "1zdr", "z_dr", "z-dr", "a.b.c", "a.", ".a", "a..b", "zdr\u00e9", "__proto__"]) assert.equal(refusedKey(key), null, key);
+  // A 16-character key is well formed, so it is refused by name; a 17-character one is not a key at all.
+  assert.equal(refusedKey("k".repeat(16)), "k".repeat(16));
+  assert.equal(refusedKey("k".repeat(17)), null);
+  for (const key of ["Zdr", "1zdr", "z_dr", "z-dr", "a.b", "acme.tier=2", "a.", ".a", "zdr\u00e9", "__proto__"]) assert.equal(refusedKey(key), null, key);
 
   policy(`only=${"a".repeat(32)}`);
   assert.equal(refusedKey(`only=${"a".repeat(33)}`), "only");
@@ -111,10 +92,12 @@ test("S4: limits are inclusive at 512 bytes, 16 pairs, and 16 items, and bytes a
   policy(`only=${items(16)}`);
   assert.equal(refusedKey(`only=${items(17)}`), "only");
 
-  const vendorKeys = Array.from({ length: 17 }, (_, i) => `v.k${i}`);
-  const support: Support = { ...baselineSupport(), keys: new Set(vendorKeys) };
-  policy(vendorKeys.slice(0, 16).join("+"), support);
-  assert.equal(refusedKey(vendorKeys.join("+"), support), null);
+  // Only facts can hold sixteen distinct well-formed keys, since a reader keeps the ones it does not know.
+  const unknown = Array.from({ length: 17 }, (_, i) => `k${i}`);
+  assert.equal(facts(unknown.slice(0, 16).join("+")).other.size, 16);
+  const seventeen = parseFacts(unknown.join("+"));
+  assert.ok(!seventeen.ok);
+  assert.equal(seventeen.key, null);
 
   // "only=" and fifteen 32-byte items is 499 bytes; a sixteenth item of 12 bytes makes exactly 512.
   const fifteen = Array.from({ length: 15 }, (_, i) => String.fromCharCode(97 + i).repeat(32)).join(",");
@@ -123,7 +106,7 @@ test("S4: limits are inclusive at 512 bytes, 16 pairs, and 16 items, and bytes a
   policy(at);
   assert.equal(refusedKey(`only=${fifteen},${"p".repeat(13)}`), null);
 
-  // 259 characters but 513 bytes: over the limit, so no key is named, although its first pair is well formed.
+  // 264 characters but 514 bytes: over the limit, so no key is named, although its first pair is well formed.
   const wide = `only=a+ignore=${"\u00e9".repeat(250)}`;
   assert.equal(wide.length < 512, true);
   assert.equal(new TextEncoder().encode(wide).length > 512, true);
@@ -144,12 +127,17 @@ test("S6: bits takes one integer from 1 to 64 with no leading zero", () => {
   assert.equal(refusedKey("bits"), "bits");
 });
 
-test("S7: region takes assigned ISO 3166-1 alpha-2 codes only", () => {
-  assert.equal(Object.keys(COUNTRIES).length, 249);
+test("S7: region takes exactly the assigned ISO 3166-1 alpha-2 codes", () => {
+  // The set, checked once against an independent ISO 3166-1 listing, is pinned by its digest so that no code can
+  // be swapped for another without this failing.
+  const codes = Object.keys(COUNTRIES).sort();
+  assert.equal(codes.length, 249);
+  assert.equal(createHash("sha256").update(codes.join(",")).digest("hex"), "792d849dd15e8c7053629d4ce0683b28565d05f4f1f5431d13284245313534c6");
+  for (const code of codes) assert.deepEqual(policy(`region=${code}`).region, [code]);
+
   assert.deepEqual(policy("region=us,de,jp").region, ["us", "de", "jp"]);
-  for (const value of ["ab", "eu", "uk", "xk", "zz", "usa", "u", "u1", "us,deu", "us,ab"]) assert.equal(refusedKey(`region=${value}`), "region", value);
+  for (const value of ["ab", "eu", "uk", "xk", "xa", "zz", "usa", "u", "u1", "us,deu", "us,ab", "constructor"]) assert.equal(refusedKey(`region=${value}`), "region", value);
   assert.equal(refusedKey("region"), "region");
-  assert.equal(refusedKey("region=constructor"), "region");
   assert.equal(parseFacts("region=ab").ok, false);
   assert.equal(parseFacts("region=us,eu").ok, false);
 });
@@ -181,13 +169,14 @@ test("S9: only, ignore, and order take lists of any items", () => {
 });
 
 test("S16: the whole-string limits are checked first and name no key", () => {
-  const seventeen = `bits=0+${Array.from({ length: 16 }, (_, i) => `only${i}`).join("+")}`;
-  assert.equal(seventeen.split("+").length, 17);
-  assert.equal(refusedKey(seventeen), null);
+  const tail = Array.from({ length: 16 }, (_, i) => `k${i}`).join("+");
+  // Sixteen pairs: the first, which is invalid, is named. Seventeen: the whole string fails first.
+  assert.equal(refusedKey(`bits=0+${tail.split("+").slice(0, 15).join("+")}`), "bits");
+  assert.equal(refusedKey(`bits=0+${tail}`), null);
   assert.equal(refusedKey(`bits=0+only=${"a".repeat(32)},${"b,".repeat(250)}c`), null);
 });
 
-test("S16: the first failing pair in the order written decides, whether it fails on grammar or on meaning", () => {
+test("S16: the first failing pair in the order written decides, whatever each pair's failure is", () => {
   assert.equal(refusedKey("bits=0+only=a,a"), "bits");
   assert.equal(refusedKey("only=a,a+bits=0"), "only");
   assert.equal(refusedKey("zdr=1+only="), "zdr");
@@ -198,61 +187,45 @@ test("S16: the first failing pair in the order written decides, whether it fails
   assert.equal(refusedKey("later+bits=999"), "later");
   assert.equal(refusedKey("bits=999+later"), "bits");
   assert.equal(refusedKey("zdr+Bad=1+bits=0"), null);
+  assert.equal(refusedKey("zdr+notrain+zdr+bits=0"), "zdr");
 });
 
-test("S16: within one pair, grammar comes before a repeated key, then the key, then the value", () => {
-  assert.equal(refusedKey("zdr+zdr=A"), "zdr");
+test("G21: a key the gateway does not list is refused by name, and listing an undefined key does not define it", () => {
   const subset: Support = { ...baselineSupport(), keys: new Set(["only", "sort"]) };
   assert.equal(refusedKey("zdr", subset), "zdr");
-  assert.equal(refusedKey("bits=0", subset), "bits");
-  // A dotless key the gateway lists but this document does not define cannot be accepted.
+  assert.equal(refusedKey("only=a+bits=8", subset), "bits");
+  policy("only=a+sort=price", subset);
   assert.equal(refusedKey("later", { ...baselineSupport(), keys: new Set(["later"]) }), "later");
 });
 
-test("vendor keys: refused unless the gateway lists them, and values are judged by the gateway's rule", () => {
-  assert.equal(refusedKey("acme.tier=2"), "acme.tier");
-  const support = withKeys("acme.tier", "acme.audited");
-  assert.deepEqual(policy("acme.tier=2+acme.audited", support, tierRule).vendor, new Map<string, Value>([["acme.tier", ["2"]], ["acme.audited", true]]));
-  assert.equal(refusedKey("acme.tier=9", support, tierRule), "acme.tier");
-  assert.equal(refusedKey("acme.tier", support, tierRule), "acme.tier");
-  assert.equal(refusedKey("acme.tier=1,2", support, tierRule), "acme.tier");
-  // A client has the key from detection but not the rule, so any grammatical value passes its own check.
-  policy("acme.tier=9", support);
-});
-
 test("formatPolicy: a parsed policy formats to a string that parses to the same policy", () => {
-  const support = withKeys("acme.tier", "acme.audited");
-  for (const text of ["zdr", "sort=price", "order=b,a+sort=throughput", "acme.tier=2+zdr+acme.audited", "ignore=c+only=a,b+attest=prompt+region=de,us+bits=16+notrain+zdr"]) {
-    const first = policy(text, support);
+  for (const text of ["zdr", "sort=price", "order=b,a+sort=throughput", "ignore=c+only=a,b+attest=prompt+region=de,us+bits=16+notrain+zdr"]) {
+    const first = policy(text);
     const formatted = formatPolicy(first);
     assert.ok(formatted.ok, text);
-    assert.deepEqual(policy(formatted.value, support), first, text);
+    assert.deepEqual(policy(formatted.value), first, text);
   }
   assert.deepEqual(formatPolicy(policy("sort=price+zdr+bits=8")), { ok: true, value: "zdr+bits=8+sort=price" });
 });
 
-test("formatPolicy: a combined policy that cannot be written as a valid policy fails instead of producing one", () => {
-  const empty = combinePolicies({});
-  assert.ok(empty.ok);
-  assert.equal(formatPolicy(empty.value).ok, false);
-
-  const disjointRegion = combinePolicies({ key: policy("region=us"), suffix: policy("region=de") });
-  assert.ok(disjointRegion.ok);
-  const region = formatPolicy(disjointRegion.value);
-  assert.ok(!region.ok);
-  assert.equal(region.key, "region");
-
-  const disjointOnly = combinePolicies({ key: policy("only=a"), suffix: policy("only=b") });
-  assert.ok(disjointOnly.ok);
-  assert.equal(formatPolicy(disjointOnly.value).ok, false);
-
-  const sixteen = Array.from({ length: 16 }, (_, i) => `p${i}`).join(",");
-  const seventeen = combinePolicies({ key: policy(`ignore=${sixteen}`), suffix: policy("ignore=extra") });
-  assert.ok(seventeen.ok);
-  assert.equal(seventeen.value.ignore.length, 17);
-  const ignore = formatPolicy(seventeen.value);
-  assert.ok(!ignore.ok);
-  assert.equal(ignore.key, "ignore");
+test("C10: a policy that cannot be written as a valid one fails to format instead of producing a string", () => {
+  const cases: [name: string, policy: Policy, key: string | null][] = [
+    ["nothing", combinePolicies({}), null],
+    ["disjoint region", combinePolicies({ key: policy("region=us"), suffix: policy("region=de") }), "region"],
+    ["disjoint only", combinePolicies({ key: policy("only=a"), suffix: policy("only=b") }), "only"],
+    ["17 ignores", combinePolicies({ key: policy(`ignore=${Array.from({ length: 16 }, (_, i) => `p${i}`).join(",")}`), suffix: policy("ignore=extra") }), "ignore"],
+    ["bits out of range", { ...policy("zdr"), bits: 0 }, "bits"],
+    ["undefined sort", { ...policy("zdr"), sort: "custom" }, "sort"],
+    ["undefined attest", { ...policy("zdr"), attest: ["custom"] }, "attest"],
+    ["unassigned region", { ...policy("zdr"), region: ["ab"] }, "region"],
+    ["malformed provider id", { ...policy("zdr"), only: ["Org/Provider"] }, "only"],
+  ];
+  for (const [name, value, key] of cases) {
+    const formatted = formatPolicy(value);
+    assert.ok(!formatted.ok, name);
+    assert.equal(formatted.key, key, name);
+  }
+  assert.equal(combinePolicies({ key: policy(`ignore=${Array.from({ length: 16 }, (_, i) => `p${i}`).join(",")}`), suffix: policy("ignore=extra") }).ignore.length, 17);
 });
 
 test("hasRequirements separates requirements from preferences", () => {
@@ -263,7 +236,6 @@ test("hasRequirements separates requirements from preferences", () => {
     assert.equal(hasRequirements(policy(text)), true, text);
     assert.equal(hasRequirements(policy(`sort=price+${text}`)), true, text);
   }
-  assert.equal(hasRequirements(policy("acme.tier=2", withKeys("acme.tier"))), true);
 });
 
 test("C1: supports needs every key listed, and every attest and sort value listed, wherever it stands in its list", () => {
@@ -271,107 +243,75 @@ test("C1: supports needs every key listed, and every attest and sort value liste
   assert.equal(supports(narrow, policy("zdr+sort=price+attest=weights")), true);
   assert.equal(supports(narrow, policy("notrain")), false);
   assert.equal(supports(narrow, policy("zdr+ignore=a")), false);
+  assert.equal(supports(narrow, policy("zdr+order=a")), false);
   assert.equal(supports(narrow, policy("sort=latency")), false);
   assert.equal(supports(narrow, policy("attest=prompt")), false);
   assert.equal(supports(narrow, policy("attest=weights,prompt")), false);
   assert.equal(supports(narrow, policy("attest=prompt,weights")), false);
   // Keys with a fixed domain have no list of values to check.
   assert.equal(supports(narrow, policy("bits=64+region=fr+only=constructor")), true);
-  assert.equal(supports(narrow, policy("acme.tier=2", withKeys("acme.tier"))), false);
 });
 
-test("S11: the model field splits at its first plus, and readModel checks both halves", () => {
+test("S11: the model field splits at its first plus", () => {
   assert.deepEqual(splitModel("example-model"), { id: "example-model", policy: null });
   assert.deepEqual(splitModel("vendor/example-model:free+zdr+sort=price"), { id: "vendor/example-model:free", policy: "zdr+sort=price" });
-
-  const none = readModel("example-model");
-  assert.ok(none.ok);
-  assert.deepEqual(none.value, { id: "example-model", policy: null });
-
-  const suffixed = readModel("vendor/example-model:free+zdr+sort=price");
-  assert.ok(suffixed.ok);
-  assert.equal(suffixed.value.id, "vendor/example-model:free");
-  assert.equal(suffixed.value.policy?.zdr, true);
-  assert.equal(suffixed.value.policy?.sort, "price");
-
-  const emptyId = readModel("+notrain");
-  assert.ok(!emptyId.ok);
-  assert.equal(emptyId.key, null);
-  const emptyPolicy = readModel("example-model+");
-  assert.ok(!emptyPolicy.ok);
-  assert.equal(emptyPolicy.key, null);
-  const badPolicy = readModel("example-model+bits=0");
-  assert.ok(!badPolicy.ok);
-  assert.equal(badPolicy.key, "bits");
-  const narrow = readModel("example-model+zdr", { ...baselineSupport(), keys: new Set(["sort"]) });
-  assert.ok(!narrow.ok);
-  assert.equal(narrow.key, "zdr");
+  assert.deepEqual(splitModel("example-model+"), { id: "example-model", policy: "" });
+  assert.deepEqual(splitModel("+zdr"), { id: "", policy: "zdr" });
+  assert.deepEqual(splitModel(""), { id: "", policy: null });
+  // What follows the plus is a policy like any other: an empty one is refused, with no key.
+  assert.equal(refusedKey(splitModel("example-model+").policy ?? "unreachable"), null);
 });
 
 test("combining: requirements accumulate and only narrow", () => {
-  const combined = combinePolicies({
-    key: policy("zdr+bits=8+region=us,de,fr+only=a,b,c+ignore=x+attest=weights"),
-    header: policy("notrain+bits=16+region=de,fr+ignore=y"),
-    suffix: policy("bits=4+region=fr,gb+only=b,c,d+attest=prompt"),
-  });
-  assert.ok(combined.ok);
-  assert.deepEqual(combined.value, {
-    zdr: true,
-    notrain: true,
-    bits: 16,
-    region: ["fr"],
-    attest: ["prompt", "weights"],
-    only: ["b", "c"],
-    ignore: ["y", "x"],
-    sort: null,
-    order: null,
-    vendor: new Map(),
-  });
+  assert.deepEqual(
+    combinePolicies({
+      key: policy("zdr+bits=8+region=us,de,fr+only=a,b,c+ignore=x+attest=weights"),
+      header: policy("notrain+bits=16+region=de,fr+ignore=y"),
+      suffix: policy("bits=4+region=fr,gb+only=b,c,d+attest=prompt"),
+    }),
+    { zdr: true, notrain: true, bits: 16, region: ["fr"], attest: ["prompt", "weights"], only: ["b", "c"], ignore: ["y", "x"], sort: null, order: null },
+  );
+  // bits is the highest wherever it comes from.
+  assert.equal(combinePolicies({ key: policy("bits=32"), header: policy("bits=8"), suffix: policy("bits=16") }).bits, 32);
+  assert.equal(combinePolicies({ key: policy("bits=8"), suffix: policy("bits=32") }).bits, 32);
 });
 
 test("G12: an empty region intersection alone, and an empty only intersection alone, each qualify no route", () => {
   const open = { provider: "a", facts: facts("region=us") };
 
   const region = combinePolicies({ key: policy("region=us"), suffix: policy("region=de") });
-  assert.ok(region.ok);
-  assert.deepEqual(region.value.region, []);
-  assert.equal(region.value.only, null);
-  assert.equal(meets(open, region.value), false);
-  assert.equal(meets({ provider: "a", facts: facts("region=de") }, region.value), false);
-  assert.equal(meets({ provider: "a", facts: facts("") }, region.value), false);
+  assert.deepEqual(region.region, []);
+  assert.equal(region.only, null);
+  assert.equal(meets(open, region), false);
+  assert.equal(meets({ provider: "a", facts: facts("region=de") }, region), false);
+  assert.equal(meets({ provider: "a", facts: facts("") }, region), false);
 
   const only = combinePolicies({ key: policy("only=a"), header: policy("only=b") });
-  assert.ok(only.ok);
-  assert.deepEqual(only.value.only, []);
-  assert.equal(only.value.region, null);
-  assert.equal(meets(open, only.value), false);
-  assert.equal(meets({ provider: "b", facts: facts("") }, only.value), false);
+  assert.deepEqual(only.only, []);
+  assert.equal(only.region, null);
+  assert.equal(meets(open, only), false);
+  assert.equal(meets({ provider: "b", facts: facts("") }, only), false);
 });
 
 test("combining: the most specific preference wins, per key", () => {
   const all = combinePolicies({ key: policy("sort=price+order=a"), header: policy("sort=latency+order=b"), suffix: policy("sort=throughput") });
-  assert.ok(all.ok);
-  assert.equal(all.value.sort, "throughput");
-  assert.deepEqual(all.value.order, ["b"]);
+  assert.equal(all.sort, "throughput");
+  assert.deepEqual(all.order, ["b"]);
 
   const headerOverKey = combinePolicies({ key: policy("sort=price+order=a"), header: policy("sort=latency") });
-  assert.ok(headerOverKey.ok);
-  assert.equal(headerOverKey.value.sort, "latency");
-  assert.deepEqual(headerOverKey.value.order, ["a"]);
+  assert.equal(headerOverKey.sort, "latency");
+  assert.deepEqual(headerOverKey.order, ["a"]);
 
   const keyOnly = combinePolicies({ key: policy("sort=price+order=a") });
-  assert.ok(keyOnly.ok);
-  assert.equal(keyOnly.value.sort, "price");
-  assert.deepEqual(keyOnly.value.order, ["a"]);
+  assert.equal(keyOnly.sort, "price");
+  assert.deepEqual(keyOnly.order, ["a"]);
 });
 
 test("G13: no layer removes or weakens a requirement of another", () => {
   const key = policy("zdr+notrain+bits=16+region=us+attest=weights+only=a+ignore=b");
   for (const other of ["sort=price", "bits=1", "region=us,de,fr", "only=a,b,c", "attest=prompt", "ignore=c"]) {
     for (const carrier of ["header", "suffix"] as const) {
-      const combined = combinePolicies({ key, [carrier]: policy(other) });
-      assert.ok(combined.ok);
-      const { value } = combined;
+      const value = combinePolicies({ key, [carrier]: policy(other) });
       assert.equal(value.zdr, true, other);
       assert.equal(value.notrain, true, other);
       assert.equal(value.bits, 16, other);
@@ -383,99 +323,71 @@ test("G13: no layer removes or weakens a requirement of another", () => {
   }
 });
 
-test("combining: the result shares no list or map with its inputs", () => {
-  const support = withKeys("acme.list");
-  const key = policy("order=a,b+region=us,de+only=a,b+ignore=x+attest=weights+acme.list=one,two", support);
-  const combined = combinePolicies({ key });
-  assert.ok(combined.ok);
-  const result = combined.value;
-  for (const list of [result.order, result.region, result.only, result.ignore, result.attest, result.vendor.get("acme.list")]) {
+test("combining: the result shares no list with its inputs", () => {
+  const text = "order=a,b+region=us,de+only=a,b+ignore=x+attest=weights";
+  const key = policy(text);
+  const result = combinePolicies({ key });
+  assert.deepEqual(result, key);
+  for (const list of [result.order, result.region, result.only, result.ignore, result.attest]) {
     assert.ok(Array.isArray(list));
     list.length = 0;
   }
-  (result.vendor as Map<string, Value>).clear();
-  assert.deepEqual(key, policy("order=a,b+region=us,de+only=a,b+ignore=x+attest=weights+acme.list=one,two", support));
+  assert.deepEqual(key, policy(text));
 });
 
-test("G28: vendor values by two carriers must be identical, in order, unless the gateway defines how they combine", () => {
-  const support = withKeys("acme.tier", "acme.list", "acme.audited");
-  const p = (text: string): Policy => policy(text, support);
-
-  const conflict = combinePolicies({ key: p("acme.tier=1"), suffix: p("acme.tier=2") });
-  assert.ok(!conflict.ok);
-  assert.equal(conflict.key, "acme.tier");
-  assert.equal(combinePolicies({ key: p("acme.tier"), header: p("acme.tier=2") }).ok, false);
-  assert.equal(combinePolicies({ key: p("acme.list=a,b"), header: p("acme.list=b,a") }).ok, false);
-
-  const same = combinePolicies({ key: p("acme.list=a,b+acme.audited"), header: p("acme.list=a,b"), suffix: p("acme.audited") });
-  assert.ok(same.ok);
-  assert.deepEqual(same.value.vendor, new Map<string, Value>([["acme.audited", true], ["acme.list", ["a", "b"]]]));
-
-  // With a rule, the gateway's rule decides: here the stricter (lower) tier wins.
-  const strictest: VendorRules = new Map([
-    ["acme.tier", { accepts: () => true, meets: () => true, combine: (a: Value, b: Value): Value | null => (a === true || b === true ? null : [String(Math.min(Number(a[0]), Number(b[0])))]) }],
-  ]);
-  const ruled = combinePolicies({ key: p("acme.tier=1"), suffix: p("acme.tier=2") }, strictest);
-  assert.ok(ruled.ok);
-  assert.deepEqual(ruled.value.vendor.get("acme.tier"), ["1"]);
-  assert.equal(combinePolicies({ key: p("acme.tier"), suffix: p("acme.tier=2") }, strictest).ok, false);
-});
-
-test("G29: a vendor conflict is reported even when an intersection is also empty", () => {
-  const support = withKeys("acme.tier");
-  const both = combinePolicies({ key: policy("region=us+acme.tier=1", support), suffix: policy("region=de+acme.tier=2", support) });
-  assert.ok(!both.ok);
-  assert.equal(both.key, "acme.tier");
-});
-
-test("S13: a reader keeps unknown well-formed fact keys, never matches on them, and refuses known non-facts", () => {
+test("S13: a reader ignores unknown fact keys and unknown attest items, and they change nothing it matches", () => {
   assert.deepEqual(facts(""), { zdr: false, notrain: false, bits: null, region: null, attest: [], other: new Map() });
-  const read = facts("zdr+bits=8+region=us,de+attest=weights,later+acme.tier=2+later");
+  const read = facts("zdr+bits=8+region=us,de+attest=weights,later+later+newkey=x,y");
   assert.deepEqual(read, {
     zdr: true,
     notrain: false,
     bits: 8,
     region: ["us", "de"],
     attest: ["weights", "later"],
-    other: new Map<string, Value>([["acme.tier", ["2"]], ["later", true]]),
+    other: new Map<string, Value>([["later", true], ["newkey", ["x", "y"]]]),
   });
-  // The unknown keys change nothing about what the route meets.
   const route = { provider: "a", facts: read };
   assert.equal(meets(route, policy("zdr+bits=8+region=us,de+attest=weights")), true);
   assert.equal(meets(route, policy("notrain")), false);
   assert.equal(meets(route, policy("attest=prompt")), false);
-
-  for (const text of ["only=x", "ignore=x", "ignore", "sort", "sort=price", "order=x", "zdr+order=x"]) assert.equal(parseFacts(text).ok, false, text);
-  for (const text of ["zdr=1", "bits=0", "region=usa", "attest", "zdr+zdr", "+", "zdr+"]) assert.equal(parseFacts(text).ok, false, text);
+  assert.equal(meets(route, policy("attest=weights,prompt")), false);
 
   // An absent key reads as absent, whatever its name.
   assert.equal(facts("").other.get("constructor"), undefined);
-  assert.equal(facts("").other.has("toString"), false);
+  assert.equal(facts("").other.has("valueof"), false);
   assert.deepEqual(facts("constructor=x").other.get("constructor"), ["x"]);
 
-  const text = "zdr+notrain+bits=8+region=us,de+attest=weights,prompt+acme.tier=2";
+  const text = "zdr+notrain+bits=8+region=us,de+attest=weights,prompt+later=1";
   assert.equal(formatFacts(facts(text)), text);
 });
 
-test("S12: a gateway may publish only the five fact keys and vendor keys it defines, with values it accepts", () => {
-  const support = withKeys("acme.tier");
-  assert.equal(parsePublishedFacts("", support).ok, true);
-  assert.equal(parsePublishedFacts("zdr+notrain+bits=8+region=us+attest=weights,prompt+acme.tier=2", support).ok, true);
+test("S13: facts are invalid when malformed, when a known key has an invalid value, or when they carry a key that is never a fact", () => {
+  for (const text of ["only=x", "ignore=x", "ignore", "sort", "sort=price", "order=x", "provider=a", "provider", "zdr+order=x", "zdr+provider=a"]) assert.equal(parseFacts(text).ok, false, text);
+  for (const text of ["zdr=1", "notrain=x", "bits=0", "bits", "bits=8,16", "region=usa", "region=ab", "region", "attest", "zdr+zdr", "+", "zdr+", "Zdr", "attest=Weights"]) assert.equal(parseFacts(text).ok, false, text);
+});
+
+test("S12: a gateway may publish only the five fact keys, with values it accepts", () => {
+  assert.equal(parsePublishedFacts("").ok, true);
+  assert.equal(parsePublishedFacts("zdr+notrain+bits=8+region=us+attest=weights,prompt").ok, true);
   const cases: [facts: string, key: string][] = [
     ["later", "later"],
-    ["zdr+other.key", "other.key"],
+    ["zdr+newkey=1", "newkey"],
     ["provider=a", "provider"],
     ["attest=custom", "attest"],
+    ["attest=weights,custom", "attest"],
     ["only=a", "only"],
     ["region=ab", "region"],
+    ["bits=0", "bits"],
   ];
   for (const [text, key] of cases) {
-    const parsed = parsePublishedFacts(text, support);
+    const parsed = parsePublishedFacts(text);
     assert.ok(!parsed.ok, text);
     assert.equal(parsed.key, key, text);
   }
-  assert.equal(parsePublishedFacts("acme.tier=2").ok, false);
-  assert.equal(parsePublishedFacts("attest=prompt", { ...baselineSupport(), attest: new Set(["weights"]) }).ok, false);
+  const narrow: Support = { ...baselineSupport(), attest: new Set(["weights"]) };
+  assert.equal(parsePublishedFacts("attest=weights", narrow).ok, true);
+  assert.equal(parsePublishedFacts("attest=prompt", narrow).ok, false);
+  assert.equal(parsePublishedFacts("attest=weights,prompt", narrow).ok, false);
 });
 
 test("G6: each requirement is checked against the route's facts, and an absent fact is not met", () => {
@@ -506,40 +418,30 @@ test("G6: each requirement is checked against the route's facts, and an absent f
     ["zdr+bits=8+region=us+only=a", "a", "zdr+bits=8+region=us", true],
     ["zdr+bits=8+region=us+only=a", "a", "zdr+bits=8+region=us,de", false],
     ["zdr+bits=8+region=us+only=a", "b", "zdr+bits=8+region=us", false],
+    ["zdr+ignore=a", "a", "zdr", false],
   ];
   for (const [p, provider, f, expected] of cases) assert.equal(meets({ provider, facts: facts(f) }, policy(p)), expected, `${p} vs ${provider} [${f}]`);
 });
 
-test("G28: a vendor requirement is met only when the route's facts carry the key and the gateway's rule agrees", () => {
-  const support = withKeys("acme.tier");
-  const required = policy("acme.tier=2", support, tierRule);
-  const route = (text: string) => ({ provider: "a", facts: facts(text) });
-  assert.equal(meets(route("acme.tier=2"), required, tierRule), true);
-  assert.equal(meets(route("acme.tier=1"), required, tierRule), true);
-  assert.equal(meets(route("acme.tier=3"), required, tierRule), false);
-  // No rule: never met. Rule that says yes to everything, but the route does not publish the key: not met.
-  assert.equal(meets(route("acme.tier=2"), required), false);
-  const yes: VendorRules = new Map([["acme.tier", { accepts: () => true, meets: () => true }]]);
-  assert.equal(meets(route(""), required, yes), false);
-  assert.equal(meets(route("zdr"), required, yes), false);
-  assert.equal(meets(route("acme.tier=3"), required, yes), true);
-});
-
-test("G7: order first as listed, then the rest by rank, and unknown ids have no effect", () => {
+test("G7: order first as listed, then the rest by the rank of the requested sort, and unknown ids have no effect", () => {
+  // Price and throughput rank these routes in opposite directions, so using the wrong one shows.
   const routes = [
-    { provider: "a", price: 3 },
-    { provider: "b", price: 1 },
-    { provider: "c", price: 2 },
-    { provider: "d", price: 2 },
+    { provider: "a", price: 3, throughput: 30 },
+    { provider: "b", price: 1, throughput: 10 },
+    { provider: "c", price: 2, throughput: 20 },
+    { provider: "d", price: 2, throughput: 20 },
   ];
+  const rank = (route: (typeof routes)[number], sort: string): number => (sort === "price" ? route.price : -route.throughput);
   const ids = (p: string): string =>
-    orderRoutes(routes, policy(p), (route) => route.price)
+    orderRoutes(routes, policy(p), rank)
       .map((route) => route.provider)
       .join("");
   assert.equal(ids("sort=price"), "bcda");
+  assert.equal(ids("sort=throughput"), "acdb");
   assert.equal(ids("order=d,a"), "dabc");
   // The remainder (a, b, c) is not already in rank order, so it must be ranked after the ordered one.
   assert.equal(ids("order=d+sort=price"), "dbca");
+  assert.equal(ids("order=d+sort=throughput"), "dacb");
   assert.equal(ids("order=c,nosuch+sort=price"), "cbda");
   assert.equal(ids("order=nosuch"), "abcd");
   assert.equal(ids("zdr"), "abcd");
@@ -564,27 +466,37 @@ test("S14: Route-Applied names the provider first, then the facts, whose limits 
   }
 
   // Sixteen fact pairs and a 512-byte facts string are legal facts, so they round-trip behind the provider.
-  const sixteen = facts(Array.from({ length: 16 }, (_, i) => `v.k${i}`).join("+"));
+  const sixteen = facts(Array.from({ length: 16 }, (_, i) => `k${i}`).join("+"));
   const many = parseApplied(formatApplied("aurora", sixteen));
   assert.ok(many.ok);
   assert.equal(many.value.facts.other.size, 16);
-  const long = facts(`v.k=${Array.from({ length: 15 }, (_, i) => String.fromCharCode(97 + i).repeat(32)).join(",")},${"p".repeat(13)}`);
+  const long = facts(`newkey=${Array.from({ length: 15 }, (_, i) => String.fromCharCode(97 + i).repeat(32)).join(",")},${"p".repeat(10)}`);
   assert.equal(formatFacts(long).length, 512);
   const wide = parseApplied(formatApplied("aurora", long));
   assert.ok(wide.ok);
   assert.equal(formatFacts(wide.value.facts).length, 512);
 });
 
-test("S17: provider ids are items", () => {
-  for (const id of ["aurora", "a", "0", "data-east", "a.b_c"]) assert.equal(isProviderId(id), true, id);
-  for (const id of ["", "org/provider", "Data-East", "a b", "-a", "a".repeat(33)]) assert.equal(isProviderId(id), false, id);
+test("S14, S15, S17: the writers refuse to write what a reader would refuse to read", () => {
+  for (const id of ["aurora", "a", "0", "data-east", "a.b_c", "constructor"]) {
+    assert.equal(isProviderId(id), true, id);
+    const read = parseApplied(formatApplied(id, facts("zdr")));
+    assert.ok(read.ok, id);
+    assert.equal(read.value.provider, id);
+  }
+  for (const id of ["", "org/provider", "Data-East", "a b", "-a", "a".repeat(33)]) {
+    assert.equal(isProviderId(id), false, id);
+    assert.throws(() => formatApplied(id, facts("")), RangeError, id);
+  }
+  for (const key of ["bad key", "Bad", "", "a.b", "k".repeat(17)]) assert.throws(() => formatRefused("unsupported", key), RangeError, key);
 });
 
 test("S15: Route-Refused is a reason, then a key only with unsupported, and nothing else", () => {
   assert.equal(formatRefused("unsupported", "bits"), "reason=unsupported+key=bits");
   assert.equal(formatRefused("unsupported"), "reason=unsupported");
+  assert.equal(formatRefused("unsatisfiable"), "reason=unsatisfiable");
   assert.equal(formatRefused("unavailable"), "reason=unavailable");
-  assert.deepEqual(parseRefused("reason=unsupported+key=acme.tier"), { ok: true, value: { reason: "unsupported", key: "acme.tier" } });
+  assert.deepEqual(parseRefused(formatRefused("unsupported", "later")), { ok: true, value: { reason: "unsupported", key: "later" } });
   assert.deepEqual(parseRefused("reason=unsupported"), { ok: true, value: { reason: "unsupported", key: null } });
   assert.deepEqual(parseRefused("reason=unsatisfiable"), { ok: true, value: { reason: "unsatisfiable", key: null } });
   assert.deepEqual(parseRefused("reason=unavailable"), { ok: true, value: { reason: "unavailable", key: null } });
@@ -597,6 +509,7 @@ test("S15: Route-Refused is a reason, then a key only with unsupported, and noth
     "reason=unsupported+key=bits+key=only",
     "reason=unsupported+key=Bad",
     "reason=unsupported+key=",
+    "reason=unsupported+key=a.b",
     "reason=unsupported++",
     "reason=unsupported+garbage",
     "what=ever+reason=unsupported",
@@ -618,18 +531,24 @@ test("C6: a detection reply without lists means the baseline, and unknown member
   assert.equal(supports(minimal.value.support, policy("attest=weights,prompt+sort=throughput")), true);
 });
 
-test("C6: keys and values this revision does not define are dropped from what the client may use", () => {
-  const newer = parseDetection({ route_policy: 1, keys: ["zdr", "later", "acme.tier"], attest: ["weights", "later"], sort: ["price", "later"], key_policy: "zdr+later=x+acme.tier=2" });
+test("C6: keys and values this revision does not define are dropped from what the client may use, and the reply stays valid", () => {
+  const newer = parseDetection({ route_policy: 1, keys: ["zdr", "later", "sort", "attest"], attest: ["weights", "later"], sort: ["price", "later"], key_policy: "zdr+later=x+sort=later+attest=later" });
   assert.ok(newer.ok);
-  assert.deepEqual([...newer.value.support.keys], ["zdr", "acme.tier"]);
+  assert.deepEqual([...newer.value.support.keys], ["zdr", "attest", "sort"]);
   assert.deepEqual([...newer.value.support.attest], ["weights"]);
   assert.deepEqual([...newer.value.support.sort], ["price"]);
-  assert.equal(newer.value.keyPolicy, "zdr+later=x+acme.tier=2");
   assert.equal(supports(newer.value.support, policy("zdr")), true);
   assert.equal(supports(newer.value.support, policy("notrain")), false);
+  // The bound policy is kept as sent. This client cannot interpret it, and can tell that it cannot.
+  assert.equal(newer.value.keyPolicy, "zdr+later=x+sort=later+attest=later");
+  assert.equal(parsePolicy(newer.value.keyPolicy, newer.value.support).ok, false);
 });
 
 test("C6: a reply with any known member invalid is no detection", () => {
+  const sparseKeys: unknown[] = ["zdr"];
+  sparseKeys.length = 3;
+  const sparseAttest: unknown[] = [];
+  sparseAttest.length = 1;
   const bodies: unknown[] = [
     null,
     [],
@@ -637,11 +556,14 @@ test("C6: a reply with any known member invalid is no detection", () => {
     {},
     { route_policy: "1" },
     { route_policy: 2 },
+    { route_policy: true },
     Object.create({ route_policy: 1 }),
     { route_policy: 1, keys: "zdr" },
     { route_policy: 1, keys: ["bits", "bad key"] },
-    { route_policy: 1, keys: ["a.b.c"] },
+    { route_policy: 1, keys: ["a.b"] },
     { route_policy: 1, keys: [1] },
+    { route_policy: 1, keys: sparseKeys },
+    { route_policy: 1, attest: sparseAttest },
     { route_policy: 1, sort: [1] },
     { route_policy: 1, sort: ["a,b"] },
     { route_policy: 1, attest: {} },
@@ -651,23 +573,25 @@ test("C6: a reply with any known member invalid is no detection", () => {
     { route_policy: 1, key_policy: "only=" },
     { route_policy: 1, key_policy: "bits=0" },
     { route_policy: 1, keys: [], key_policy: "zdr" },
+    { route_policy: 1, keys: ["zdr"], key_policy: "zdr+notrain" },
     { route_policy: 1, sort: ["price"], key_policy: "sort=latency" },
     { route_policy: 1, attest: ["weights"], key_policy: "attest=prompt" },
     { route_policy: 1, key_policy: "region=ab" },
+    { route_policy: 1, key_policy: "later" },
   ];
   for (const body of bodies) assert.equal(parseDetection(body).ok, false, JSON.stringify(body));
 });
 
 test("G20 to G22: what a gateway formats is what a client reads back, lists and key policy included", () => {
-  const support: Support = { keys: new Set(["zdr", "sort", "attest", "acme.tier"]), attest: new Set(["prompt"]), sort: new Set(["latency", "price"]) };
-  const body: unknown = JSON.parse(JSON.stringify(formatDetection(support, "zdr+acme.tier=2")));
-  assert.deepEqual(body, { route_policy: 1, keys: ["zdr", "sort", "attest", "acme.tier"], attest: ["prompt"], sort: ["latency", "price"], key_policy: "zdr+acme.tier=2" });
+  const support: Support = { keys: new Set(["zdr", "sort", "attest"]), attest: new Set(["prompt"]), sort: new Set(["latency", "price"]) };
+  const body: unknown = JSON.parse(JSON.stringify(formatDetection(support, "zdr+sort=latency")));
+  assert.deepEqual(body, { route_policy: 1, keys: ["zdr", "sort", "attest"], attest: ["prompt"], sort: ["latency", "price"], key_policy: "zdr+sort=latency" });
   const parsed = parseDetection(body);
   assert.ok(parsed.ok);
-  assert.deepEqual([...parsed.value.support.keys], ["zdr", "sort", "attest", "acme.tier"]);
+  assert.deepEqual([...parsed.value.support.keys].sort(), ["attest", "sort", "zdr"]);
   assert.deepEqual([...parsed.value.support.attest], ["prompt"]);
   assert.deepEqual([...parsed.value.support.sort].sort(), ["latency", "price"]);
-  assert.equal(parsed.value.keyPolicy, "zdr+acme.tier=2");
+  assert.equal(parsed.value.keyPolicy, "zdr+sort=latency");
   assert.equal(Object.hasOwn(formatDetection(support), "key_policy"), false);
 });
 
@@ -678,4 +602,5 @@ test("the baseline cannot be changed by a caller", () => {
   assert.equal(parsePolicy("attest=custom").ok, false);
   assert.equal(parsePolicy("zdr").ok, true);
   assert.equal(baselineSupport().keys.has("zdr"), true);
+  assert.equal(baselineSupport().attest.has("custom"), false);
 });

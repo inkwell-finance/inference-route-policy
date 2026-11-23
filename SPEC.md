@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 2.
+Draft 3.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -62,8 +62,7 @@ are not content.
 ```
 policy := pair ("+" pair)*
 pair   := key | key "=" list
-key    := name | name "." name
-name   := [a-z][a-z0-9]{0,15}
+key    := [a-z][a-z0-9]{0,15}
 list   := item ("," item)*
 item   := [a-z0-9][a-z0-9_.-]{0,31}
 ```
@@ -76,10 +75,11 @@ item   := [a-z0-9][a-z0-9_.-]{0,31}
 - There is no whitespace anywhere in a policy.
 - A key with no `=` is a flag. A flag states a requirement by being
   present. There is no way to write its absence; leave it out.
-- A key with a dot is a [vendor key](#vendor-keys). Keys without a dot
-  are defined only by this document.
 - A key appears at most once in a policy, and an item at most once in
   a list.
+- Keys and their values are defined only by this document. There are
+  no private keys. A later revision may add keys and values, and a
+  gateway says which it accepts in [detection](#detection).
 
 **A policy is honored whole or refused whole.** A gateway that is sent
 a policy it cannot honor in full MUST refuse the request (see
@@ -93,14 +93,12 @@ refusal and whether it names a key:
 
 1. **The whole string.** It is longer than 512 bytes, or has more than
    16 pairs (more than 15 `+`). No key is named.
-2. **Each pair, in the order written.** For each: its grammar, then
-   whether its key repeats an earlier one, then whether the gateway
-   accepts the key, then whether it accepts the value. The first pair
-   that fails is the offending pair. Its key is named when the key
-   itself matches the `key` grammar, and not otherwise.
-
-A list with more than 16 items, or with a repeated item, is a grammar
-failure of its pair.
+2. **Each pair, in the order written.** A pair fails when it does not
+   fit the grammar, its list has more than 16 items or a repeated item,
+   its key repeats an earlier pair's, the gateway does not accept its
+   key, or the gateway does not accept its value. The first pair that
+   fails is the offending pair. Its key is named when the key itself
+   fits the `key` grammar, and not otherwise.
 
 ## Carriers
 
@@ -115,8 +113,9 @@ id    := one or more characters, none of them "+"
 
 A `model` field that contains `+` is always read this way: the gateway
 splits it at its first `+`, resolves the id as it would have without
-the suffix, and applies the rest as a policy. If the id is empty the
-suffix is malformed and no key is named. This carrier works in any
+the suffix, and applies the rest as a policy. An empty id names no
+model, and the gateway answers as it does for any unknown model id
+(see [Result](#result)). This carrier works in any
 harness that lets the user type a model id, which is why it exists. A
 gateway SHOULD list the suffixed ids it expects to be popular in its
 model list, so they appear in pickers with their metadata.
@@ -131,8 +130,10 @@ requests or pass the lines through unjoined.
 
 **Key default.** A gateway MAY bind a policy to an API key, which is
 what an account setting in a web console is. It MUST NOT bind a policy
-it would refuse. [Detection](#detection) reports the bound policy to
-the holder of the key.
+that fails the [order of checks](#order-of-checks). Whether any route
+meets a bound policy is decided for each request, like any other
+policy. [Detection](#detection) reports the bound policy to the holder
+of the key.
 
 When more than one reaches a request, all of them apply; see
 [Combining](#combining). The gateway checks the header first and the
@@ -197,24 +198,6 @@ matches no route, and in `ignore` and `order` it has no effect.
 Choosing between models is out of scope. A policy picks among routes of
 the model the request names.
 
-### Vendor keys
-
-A vendor key, such as `acme.tier=2`, is defined by the gateway that
-lists it in detection, and by no one else. Every other gateway refuses
-it. The part before the dot names the vendor.
-
-- A vendor key is always a requirement, never a preference.
-- The gateway defines which values it accepts. Any other value is one
-  it does not accept.
-- A route meets a vendor requirement only if its published facts carry
-  the same key, and then as the gateway's rule for that key says.
-- The gateway defines how two carriers' values for the key combine.
-  Where it defines no rule, the two values MUST be identical, the same
-  items in the same order, or the request is refused as `unsupported`
-  naming the key.
-- A client cannot check a vendor value against detection. It MAY send
-  any value that fits the grammar for a vendor key the gateway lists.
-
 ## Facts
 
 A gateway that supports this protocol publishes, for each route in its
@@ -235,9 +218,9 @@ model list, the requirements that route meets, in the same grammar:
 
 A gateway MUST publish facts that:
 
-- use only `zdr`, `notrain`, `bits`, `region`, `attest`, and vendor
-  keys it defines, each with a value valid for that key, or are the
-  empty string for a route that meets nothing;
+- use only `zdr`, `notrain`, `bits`, `region`, and `attest`, each with
+  a value valid for that key, or are the empty string for a route that
+  meets nothing;
 - hold for every party the key constrains, including every party behind
   the route. A gateway behind a route is a provider like any other;
 - are the facts its routing uses.
@@ -256,40 +239,48 @@ A route meets a policy when all of these hold:
   in the route's is in the policy's;
 - every item in the policy's `attest` is in the route's;
 - its provider id is in the policy's `only`, if there is one, and not
-  in its `ignore`;
-- every vendor requirement is met as [Vendor keys](#vendor-keys) says.
+  in its `ignore`.
 
 A fact that is absent is not met.
 
-A reader of facts, such as a client, MUST treat a route as meeting
-nothing when its facts are malformed or contain `only`, `ignore`,
-`sort`, or `order`. It MUST ignore any other well-formed key it does
-not know: a fact it does not know cannot be one it required.
+A reader of facts, such as a client, reads them by the same grammar and
+limits, with two allowances for a gateway on a later revision: it MUST
+ignore a well-formed key it does not know, and an `attest` item it does
+not know. Neither can be something it required. Facts are **invalid**
+when they do not fit the grammar or limits, when `zdr`, `notrain`,
+`bits`, or `region` has a value that is not valid for it, or when they
+contain `only`, `ignore`, `sort`, `order`, or `provider`. A reader MUST
+treat a route with invalid facts as meeting no policy that has a
+requirement, `only` and `ignore` included.
 
 Facts let a client show which choices exist before sending anything.
 Prices and measured speed are not facts and are not defined here.
 
 ## Result
 
-A gateway relays a route's response, or it refuses. A route **fails**
-when the gateway decides, before relaying any byte of that route's
-response body, not to relay its response: on a connection error, a
-timeout, or a status the gateway treats as retryable. Which conditions
-count is the gateway's choice. When a route fails, the gateway MAY try
-another qualifying route. It MUST NOT move a request to another route
-after relaying any byte of a response body.
+A gateway relays a route's response, or it answers itself. A route
+**fails** when the gateway decides, before it has begun its own
+response to the client, not to relay that route's response: on a
+connection error, a timeout, or a status the gateway treats as
+retryable. Which conditions count is the gateway's choice. When a route
+fails, the gateway MAY try another qualifying route. Once it has begun
+its response it MUST NOT move the request to another route.
 
-Every request ends in exactly one of these outcomes:
+Every request ends in exactly one of these outcomes. They are listed in
+the order a gateway decides them:
 
 | Outcome | Status | `Route-Applied` | `Route-Refused` | `Route-Evidence` |
 | ------- | ------ | --------------- | --------------- | ---------------- |
-| No policy reached the request, by any carrier. | As without this protocol | MAY | MUST NOT | MUST NOT |
-| A policy reached it and was refused before routing. | 400 | MUST NOT | MUST: `unsupported` or `unsatisfiable` | MUST NOT |
-| A policy reached it, routes qualify, and every one tried failed. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
-| A policy reached it and a qualifying route's response is relayed. | The route's | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
+| **Own error.** The gateway answers with an error it would give the same request with no policy: bad credentials, an unreadable body, an unknown model id, a rate limit. | As without this protocol | MUST NOT | MUST NOT | MUST NOT |
+| **No policy** reached the request, by any carrier. | As without this protocol | MAY | MUST NOT | MUST NOT |
+| **Refused before routing.** A policy reached it and is `unsupported`, or no route meets it. | 400 | MUST NOT | MUST: `unsupported` or `unsatisfiable` | MUST NOT |
+| **Unavailable.** A policy reached it, routes qualify, and every one tried failed. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
+| **Relayed.** A policy reached it and a qualifying route's response is relayed. | The route's | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
 
-A relayed response is never rewritten as a refusal, and a refusal never
-carries a provider's body.
+An own error comes first: a gateway does not check a policy on a
+request it would reject anyway, and no content is sent. A relayed
+response is never rewritten as a refusal, and a refusal never carries a
+provider's body.
 
 ```
 applied := "provider=" item ("+" facts)?
@@ -301,7 +292,7 @@ Route-Applied: provider=aurora+zdr+notrain+bits=8+region=us
 
 `Route-Applied` names the provider id of the route whose response is
 relayed, followed by that route's published facts when they are not
-empty. It is final before the first byte of the body.
+empty.
 
 `Route-Evidence: <URI>` is the `evidence` URI published for that route:
 where the provider serves its own attestation evidence covering this
@@ -329,7 +320,7 @@ Route-Refused: reason=unsupported+key=bits
 
 | `reason`        | Status | Meaning |
 | --------------- | ------ | ------- |
-| `unsupported`   | 400 | A carrier is malformed (a repeated `Route-Policy` line, an empty id before a suffix), a policy that reached the request failed the [order of checks](#order-of-checks), or two carriers' vendor values could not be combined. `key` is present exactly when a key is named. |
+| `unsupported`   | 400 | The request has more than one `Route-Policy` line, or a policy that reached it failed the [order of checks](#order-of-checks). `key` is present exactly when that order names one. |
 | `unsatisfiable` | 400 | No route of this model meets the combined policy. Retrying does not help. `key` is never present. |
 | `unavailable`   | 503 | Routes meet the combined policy, and every one the gateway tried failed. The gateway MUST NOT fall back to one that does not meet it. `key` is never present. |
 
@@ -362,9 +353,8 @@ appends `/models` to. Detection does not require credentials. The reply
 is `200` with a JSON object:
 
 - `route_policy` is the integer `1`.
-- `keys` lists every key the gateway accepts, vendor keys included.
-  Each entry fits the `key` grammar. Absent means exactly the nine
-  above.
+- `keys` lists every key the gateway accepts. Each entry fits the `key`
+  grammar. Absent means exactly the nine above.
 - `attest` and `sort` list the values the gateway accepts for those two
   keys. Each entry fits the `item` grammar. Absent means exactly the
   lists above.
@@ -372,23 +362,25 @@ is `200` with a JSON object:
   revisions, so a client that wants something newer checks for it and
   falls back.
 - `key_policy` is present only when the request carries credentials
-  whose key has a policy bound to it, and is that policy. It is valid
-  under the reply's own lists.
+  whose key has a policy bound to it, and is that policy. It passes the
+  order of checks under the reply's own lists.
 
 For `bits`, `region`, `only`, `ignore`, and `order`, listing the key
 means accepting every value that is valid for it; there is no list of
-values to check. For a vendor key, listing it says nothing about which
-values are accepted.
+values to check.
 
 A gateway MUST refuse, as `unsupported`, any key it did not list and
 any `attest` or `sort` value it did not list.
 
 A reply is **valid** when it is a JSON object whose own members satisfy
-every rule above. A client MUST treat anything else, including a reply
-it cannot fetch, as no detection. Within a valid reply a client MUST
-ignore members it does not know, keys without a dot that this revision
-does not define, and `attest` and `sort` values this revision does not
-define.
+every rule above, where `key_policy` is checked against the reply's
+lists exactly as given. A client MUST treat anything else, including a
+reply it cannot fetch, as no detection. Within a valid reply a client
+MUST ignore members it does not know, keys this revision does not
+define, and `attest` and `sort` values this revision does not define.
+A `key_policy` may therefore use a key or value from a later revision
+that the reply lists; a client that cannot interpret it shows it as
+text and relies on nothing in it.
 
 ## Combining
 
@@ -402,7 +394,6 @@ requirements accumulate and can only narrow:
 | `region`, `only` | The intersection of those present. An empty intersection is `unsatisfiable`. |
 | `attest`, `ignore` | The union. |
 | `sort`, `order` | The most specific wins: suffix, then header, then key default. |
-| vendor keys | As [Vendor keys](#vendor-keys) says. |
 
 No request can remove or weaken a requirement its key carries.
 
@@ -423,21 +414,23 @@ preferences MAY be sent without detection.
 **Holding a policy.** A client that holds a policy of its own, and
 finds another typed into the model id as a suffix, applies both. Where
 it can use both carriers, it sends its own by the header and leaves the
-suffix as typed. Where it can use only one, it combines the two as
-[Combining](#combining) says, with the typed suffix as the more
-specific, and sends the result. If the result cannot be written as a
+suffix as typed. Where it can use only one carrier, it combines the two
+as [Combining](#combining) says, with the typed suffix as the more
+specific, and sends the result; if that result cannot be written as a
 valid policy, because an intersection is empty or a limit is exceeded,
-the client MUST NOT send the request and MUST NOT send a weaker policy
-in its place.
+it MUST NOT send the request and MUST NOT send a weaker policy in its
+place.
 
-**Reading the result.** For a request it sent with a requirement, a
-client MUST treat the policy as **not honored** when the response has
-no `Route-Applied` and no `Route-Refused`: it MUST NOT report the
-policy as applied, to its user or to code that asks. It SHOULD check
-that the provider and facts in `Route-Applied` meet the requirements it
-sent, and treat a mismatch the same way. A response with
-`Route-Refused` is a refusal even when the client cannot parse the
-value; a client SHOULD tell its user the reason and the key.
+**Reading the result.** A client MUST treat a response that carries
+`Route-Refused` as a refusal, even when it cannot parse the value. It
+SHOULD tell its user the reason, and the key when there is one.
+
+For a request it sent with a requirement, a client MUST treat the
+policy as **not honored** when the response has no `Route-Refused` and
+no `Route-Applied` that fits the `applied` grammar with valid facts: it
+MUST NOT report the policy as applied, to its user or to code that
+asks. It SHOULD check that the provider and facts in `Route-Applied`
+meet the requirements it sent, and treat a mismatch the same way.
 
 **Claims.** A client SHOULD NOT present a fact as verified unless it
 verified the evidence for it itself.
@@ -481,7 +474,7 @@ result as **unconfirmed**: it MUST NOT report the policy as applied.
 | Whole policy string | 512 bytes |
 | Pairs | 16 |
 | Items in one list | 16 |
-| Key | 16 bytes, or 33 with a vendor prefix |
+| Key | 16 bytes |
 | Item | 32 bytes |
 
 These apply to a policy on a carrier, to a key default, and to a facts
@@ -539,3 +532,7 @@ adopted this protocol, by [translation](#clients).
    surveyed.
 5. **Choosing a model.** "The best model that meets this policy" is a
    different protocol.
+6. **Private requirements.** A gateway's own controls, such as a
+   provider tier, have no key here. Letting a gateway define keys needs
+   rules for how their values are checked, matched, and combined that
+   every client and gateway would apply the same way.
