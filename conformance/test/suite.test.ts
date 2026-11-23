@@ -3,10 +3,11 @@ import { once } from "node:events";
 import { createServer, request as relayRequest } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
-import { formatApplied, formatRefused, REFUSAL_STATUS, splitModel, type RefusalReason } from "../../core/src/index.ts";
+import { combinePolicies, formatApplied, formatRefused, parsePolicy, REFUSAL_STATUS, splitModel, type RefusalReason } from "../../core/src/index.ts";
 import { startDemo } from "../../gateway/src/demo.ts";
 import { createGateway, type RequestHandler, type Route } from "../../gateway/src/gateway.ts";
 import { serve } from "../../gateway/src/serve.ts";
+import { auditResults } from "../src/outcomes.ts";
 import { INFERENCE_ENDPOINTS, runConformance, type Endpoint } from "../src/suite.ts";
 
 const key = "probe-key";
@@ -134,7 +135,7 @@ const faults: Record<Id, Mutation> = {
   G29: ({ header, suffix, next, rewrite }) => header === "bits=64" && suffix === "bits=0" ? rewrite({ suffix: null }) : next(),
   G34: async ({ header, next }) => {
     const reply = await next();
-    return header === "bits=0" && reply.status === 400 ? change(reply, { body: '{"message":"unsupported"}' }) : reply;
+    return header === "bits=0" && reply.status === 400 ? change(reply, { body: '{"error":"unsupported"}' }) : reply;
   },
 };
 
@@ -155,6 +156,7 @@ test(`${idList.join(" ")}: the reference implementation passes every black-box c
   assert.deepEqual(new Set(report.checks.map(({ id }) => id)), new Set(idList));
   assert.deepEqual(report.checks.filter((c) => c.status !== "PASS"), []);
   assert.equal(report.passed, idList.length);
+  for (const { detail } of report.checks) assert.match(detail, /; observed \d+ × HTTP \d{3}/);
 });
 
 for (const id of idList) test(`${id}: conformance rejects the gateway that breaks this requirement`, async (t) => {
@@ -340,7 +342,7 @@ test("G10 G13 G23: an inaccessible policy-key catalog does not borrow models fro
   for (const id of ["G10", "G13", "G23"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "SKIP", id);
 });
 
-function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "nested-type" | "array-member-type" | "empty-body"): RequestHandler {
+function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "problem-type" | "request-id-type" | "nested-type" | "array-member-type" | "empty-body"): RequestHandler {
   return async (request, transport) => {
     const reply = await good(request, transport);
     if (request.method !== "POST" || reply.status < 400) return reply;
@@ -357,11 +359,11 @@ function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "nested-type" |
     const issues = refused ? [{ severity: 1 }] : [{ severity: 1 }, { severity: 2 }];
     const envelope = {
       ...body, error,
-      problem: {
+      problem: defect === "problem-type" && refused ? "policy" : {
         issues: defect === "array-member-type" && refused ? [...issues, { severity: "low" }] : issues,
         category: refused ? "policy" : "input",
       },
-      request_id: refused ? "second" : "first",
+      request_id: refused ? (defect === "request-id-type" ? 7 : "second") : "first",
     };
     return change(reply, { body: JSON.stringify(envelope) });
   };
@@ -372,12 +374,20 @@ test("G34: matching nested envelopes may have different codes, messages, and lis
   assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
 });
 
-for (const defect of ["missing-envelope", "nested-type", "array-member-type", "empty-body"] as const) {
+for (const defect of ["problem-type", "request-id-type", "nested-type", "array-member-type", "empty-body"] as const) {
   test(`G34: conformance rejects ${defect} in a refusal against an endpoint with enriched errors`, async (t) => {
     const report = await run(t, gatewayWithEnrichedErrors(defect));
     assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS").map(({ id, status }) => [id, status]), [["G34", "FAIL"]]);
   });
 }
+
+test("G34: omission of problem and request_id alone is inconclusive even when every sampled control includes them", async (t) => {
+  const report = await run(t, gatewayWithEnrichedErrors("missing-envelope"));
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /missing refusal members \$\.problem, \$\.request_id cannot be established/);
+});
 
 test("G25: a model not published in the catalog can still resolve", async (t) => {
   let undisclosedRequests = 0;
@@ -1125,29 +1135,26 @@ for (const order of [[0, 1], [1, 0]] as const) test(`G11: provider-only narrowin
   assert.equal(check?.status, order[0] === 0 ? "PASS" : "SKIP");
 });
 
-for (const comparable of [true, false]) test(`G34: a missing traceId ${comparable ? "matches an observed bad input field error" : "is inconclusive without a comparable HTTP 400 field error"}`, async (t) => {
+for (const comparable of [true, false]) test(`G34: a missing traceId ${comparable ? "matches a negative output token limit error" : "is inconclusive even when all field controls include it"}`, async (t) => {
   const fieldControls = new Set<string | null>();
   const report = await run(t, fixture(async ({ body, request, auth, next }) => {
     if (request.method !== "POST") return next();
     const problem = { type: "about:blank", title: "Bad request" };
     const headers = { "content-type": "application/problem+json" };
-    if (body.model === model && body.messages === 4) {
+    if (body.model === model && body.max_output_tokens === -1) {
       fieldControls.add(auth);
-      return Response.json(comparable ? problem : { ...problem, traceId: "ordinary" }, { status: comparable ? 400 : 422, headers });
+      return Response.json(comparable ? problem : { ...problem, traceId: "ordinary" }, { status: 400, headers });
     }
-    const raw = await request.clone().text();
     const reply = await next();
     if (reply.status < 400) return reply;
-    const refused = reply.headers.has(refusal);
-    const details = refused ? problem : { ...problem, traceId: "ordinary" };
-    const bodyFieldStatus = !refused && (Object.hasOwn(body, "model") || raw === "{}") && reply.status === 400 ? 422 : reply.status;
-    return change(reply, { status: bodyFieldStatus, body: JSON.stringify(details), replace: headers });
-  }));
+    const details = reply.headers.has(refusal) ? problem : { ...problem, traceId: "ordinary" };
+    return change(reply, { body: JSON.stringify(details), replace: headers });
+  }), ["responses"]);
   assert.deepEqual(fieldControls, new Set([`Bearer ${key}`, `Bearer ${policyKey}`]));
   const check = report.checks.find(({ id }) => id === "G34");
   assert.equal(check?.status, comparable ? "PASS" : "SKIP");
   if (comparable) assert.match(check.detail, /matches an ordinary error shape observed on this endpoint and credential/);
-  else assert.match(check.detail, /missing refusal member \$\.traceId/);
+  else assert.match(check.detail, /missing refusal members \$\.traceId cannot be established/);
   assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
 });
 
@@ -1236,4 +1243,49 @@ for (const additional of ["bits", "sort"] as const) test(`G11: impossible precis
   }, target));
   assert.deepEqual(pairs, new Set([`${partner}:${impossible}`, `${impossible}:${partner}`]));
   assert.equal(report.checks.find(({ id }) => id === "G11")?.status, "PASS");
+});
+
+for (const broken of [false, true]) test(`G3 G6: opaque future defaults ${broken ? "cannot admit an explicitly excluded provider" : "preserve explicit impossibility without proving complete qualification"}`, async (t) => {
+  const local = { ...routes[0]!, provider: "local" };
+  const policy = "only=0,a-b_c.d";
+  let opaqueRefusals = 0;
+  const replies: { status: number; applied: string | null }[] = [];
+  const report = await run(t, fixture(async ({ path, auth, header, next, rewrite }) => {
+    if (path === "/v1/route-policy" && auth !== null) {
+      return Response.json({ route_policy: "1", keys: ["only", "order", "future"], key_policy: "future=narrow" });
+    }
+    if (header === "order=0,a-b_c.d") {
+      opaqueRefusals++;
+      return protocolError("unsatisfiable");
+    }
+    if (header !== policy) return next();
+    const reply = broken ? await rewrite({ header: "only=local" }) : await next();
+    replies.push({ status: reply.status, applied: reply.headers.get(applied) });
+    return reply;
+  }, createGateway({
+    models: { [model]: [local] }, keys: { [key]: { policy: "order=local" }, [policyKey]: { policy: "order=local" } }, accept: { keys: ["only", "order"] },
+    fetch: () => Response.json({ output: "served" }),
+  })));
+  assert.equal(replies.length, 2);
+  assert.equal(opaqueRefusals, 2, "compatible explicit policies are not proof of qualification under an opaque default");
+  for (const reply of replies) assert.deepEqual(reply, broken ? { status: 200, applied: "provider=local" } : { status: 400, applied: null });
+  assert.equal(report.checks.find(({ id }) => id === "G3")?.status, broken ? "FAIL" : "PASS");
+  const qualification = report.checks.find(({ id }) => id === "G6");
+  if (!broken) assert.equal(report.checks.find(({ id }) => id === "G15")?.status, "PASS");
+  assert.equal(qualification?.status, broken ? "FAIL" : "SKIP", JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+  if (broken) assert.match(qualification.detail, /only=0,a-b_c\.d.*known requirements/);
+  else assert.equal(report.failed, 0);
+});
+
+test("G3 G29: an unavailable reply cannot claim qualification after a known empty intersection without detection", () => {
+  const header = parsePolicy("only=aurora");
+  const suffix = parsePolicy("only=basalt");
+  assert.ok(header.ok && suffix.ok);
+  const known = combinePolicies({ header: header.value, suffix: suffix.value });
+  const audit = auditResults([{
+    probe: { path: "responses", raw: JSON.stringify({ model: `${model}+only=basalt` }), policies: ["only=aurora"] },
+    reply: { status: 503, body: undefined, hasBody: true, contentType: "text/plain", applied: [], refused: ["reason=unavailable"], evidence: [], received: "503 reason=unavailable" },
+  }], () => ({ carriesPolicy: true, known, impossible: true }));
+  assert.match(audit.failures.get("G3") ?? "", /unavailable presupposes a qualifying route/);
+  assert.match(audit.failures.get("G29") ?? "", /unavailable must not mask a refusal before routing/);
 });

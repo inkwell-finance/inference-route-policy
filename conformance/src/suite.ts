@@ -175,27 +175,32 @@ function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
   const keyPolicy = scope?.detection?.keyPolicy;
   const explicit = (probe.policies?.length ?? 0) > 0 || split?.policy != null;
   const carriesPolicy = explicit || keyPolicy != null ? true : keyPolicy === null ? false : undefined;
-  const result: ResultContext = { carriesPolicy, ...(routeMap === undefined ? {} : { routes: routeMap }) };
-  if (scope?.detection === undefined) return result;
+  const result: ResultContext = { carriesPolicy, explicit, ...(routeMap === undefined ? {} : { routes: routeMap }) };
   if ((probe.policies?.length ?? 0) > 1) return { ...result, expectedRefusal: { reason: "unsupported", key: null } };
   const layers: { key?: Policy; header?: Policy; suffix?: Policy } = {};
-  for (const [layer, text] of [["header", probe.policies?.[0]], ["suffix", split?.policy], ["key", keyPolicy]] as const) {
+  let allExplicitParsed = true;
+  for (const [layer, text] of [["header", probe.policies?.[0]], ["suffix", split?.policy]] as const) {
     if (text == null) continue;
-    const parsed = parsePolicy(text, scope.detection.support);
+    const parsed = parsePolicy(text, scope?.detection?.support ?? BASELINE);
     if (!parsed.ok) {
-      // A valid later-revision key default need not be interpretable by this suite.
-      return layer === "key" ? result : { ...result, expectedRefusal: { reason: "unsupported", key: parsed.key } };
-    }
-    layers[layer] = parsed.value;
+      if (allExplicitParsed && scope?.detection !== undefined) result.expectedRefusal = { reason: "unsupported", key: parsed.key };
+      allExplicitParsed = false;
+    } else layers[layer] = parsed.value;
   }
-  if (layers.key !== undefined) result.bound = layers.key;
-  result.explicit = explicit;
-  const combined = combinePolicies(layers);
-  result.combined = combined;
-  if (carriesPolicy === true && routeMap !== undefined) {
-    result.qualifies = someRouteMeets(routeMap, combined);
-    if (!result.qualifies) result.expectedRefusal = { reason: "unsatisfiable" };
-    result.unknownProvider = [combined.only ?? [], combined.ignore, combined.order ?? []].some((ids) =>
+  result.acceptedExplicit = scope?.detection !== undefined && allExplicitParsed;
+  const bound = keyPolicy == null ? undefined : parsePolicy(keyPolicy, scope?.detection?.support);
+  if (bound?.ok) result.bound = layers.key = bound.value;
+  result.complete = result.acceptedExplicit && (keyPolicy === null || bound?.ok === true);
+  // Unknown requirements can only narrow. The policy we can read is an
+  // upper bound on qualification, not evidence that a route actually fits.
+  const known = combinePolicies(layers);
+  result.known = known;
+  if (carriesPolicy === true) {
+    result.impossible = known.only?.length === 0 || known.region?.length === 0
+      || (routeMap !== undefined && !someRouteMeets(routeMap, known));
+    if (result.impossible && result.acceptedExplicit) result.expectedRefusal = { reason: "unsatisfiable" };
+    if (!result.impossible && routeMap !== undefined && result.complete) result.qualifies = true;
+    if (scope?.catalogAvailable) result.unknownProvider = [known.only ?? [], known.ignore, known.order ?? []].some((ids) =>
       ids.some((id) => !scope.models.some((entry) => entry.routes.has(id))));
   }
   return result;
@@ -242,13 +247,26 @@ export async function runConformance(options: Options): Promise<Report> {
     }
     throw mismatch(probe, reply.received, requirement);
   }
-  async function check(id: string, detail: string, run: () => Promise<void | string>, endpoint?: Endpoint): Promise<void> {
+  function observations(observed: readonly Exchange[]): string {
+    const responses = new Map<string, number>();
+    for (const { reply } of observed) {
+      const result = [reply.applied[0], reply.refused[0], reply.evidence[0]].filter((value) => value !== undefined).join("; ");
+      const label = `HTTP ${reply.status}${result === "" ? "" : ` ${result}`}`;
+      responses.set(label, (responses.get(label) ?? 0) + 1);
+    }
+    return [...responses].map(([reply, count]) => `${count} × ${reply}`).join(", ");
+  }
+
+  async function check(id: string, detail: string, run: () => Promise<void | string>, endpoint?: Endpoint, before = exchanges.length): Promise<void> {
     const tag = endpoint === undefined ? { id } : { id, endpoint };
     try {
       precondition = undefined;
       const missing = await run();
-      const absent = precondition ?? missing;
-      checks.push(absent === undefined ? { ...tag, status: "PASS", detail } : { ...tag, status: "SKIP", detail: `missing precondition: ${absent}` });
+      const evidence = observations(exchanges.slice(before));
+      const absent = precondition ?? missing ?? (evidence === "" ? "an observed response for this check" : undefined);
+      checks.push(absent === undefined
+        ? { ...tag, status: "PASS", detail: `${detail}; observed ${evidence}` }
+        : { ...tag, status: "SKIP", detail: `missing precondition: ${absent}` });
     } catch (error) {
       checks.push({ ...tag, status: "FAIL", detail: error instanceof Error ? error.message : String(error) });
     }
@@ -279,7 +297,8 @@ export async function runConformance(options: Options): Promise<Report> {
   const modelScopes = new Set(selections.flatMap(({ primary, bound }) => [primary, bound]));
   const detectionScopes = new Set([anonymous, ...modelScopes]);
   const metadata = (path: string, current: Scope): Probe => ({ path, ...(current.credential === undefined ? {} : { credential: current.credential }) });
-  await check("G20", "complete detection reply is valid with and without supplied credentials", async () => {
+  const firstDetection = exchanges.length;
+  await check("G20", `valid detection objects returned for all ${detectionScopes.size} requested credential scopes, including anonymous`, async () => {
     let firstFailure: unknown;
     for (const current of detectionScopes) {
       const probe = metadata("route-policy", current);
@@ -293,7 +312,7 @@ export async function runConformance(options: Options): Promise<Report> {
     }
     if (firstFailure !== undefined) throw firstFailure;
   });
-  await check("G22", "only credentialed detection may report a policy, valid under its own lists", async () => {
+  await check("G22", "the anonymous reply omitted key_policy; every observed credentialed key_policy was valid under its own lists", async () => {
     let missing: string | undefined;
     for (const current of detectionScopes) {
       const reply = current.detectionReply;
@@ -318,8 +337,8 @@ export async function runConformance(options: Options): Promise<Report> {
       }
     }
     return missing;
-  });
-  await check("G23", "unique model and provider ids with valid published facts and evidence for each credential", async () => {
+  }, undefined, firstDetection);
+  await check("G23", `validated model and route entries in all ${modelScopes.size} requested catalog scopes`, async () => {
     let firstFailure: unknown;
     let count = 0;
     for (const current of modelScopes) {
@@ -389,7 +408,7 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       throw mismatch(probe, reply.received, requirement);
     }
-    await run("G1", "invalid policies are refused, not ignored", async () => {
+    await run("G1", "the malformed-policy probes returned unsupported", async () => {
       if (first === undefined) return needModel;
       for (const invalid of ["", "bits=0", "region=uk", "only=probe0,probe0", "zdr++notrain", "zdr=1"]) {
         await expect(inference(first.id, invalid), "400 unsupported for malformed policy", (r) => {
@@ -399,13 +418,13 @@ export async function runConformance(options: Options): Promise<Report> {
         });
       }
     });
-    await run("G2", "first bad pair is named, but whole-string and malformed-key failures name no key", async () => {
+    await run("G2", "probed refusals named the first failing pair or omitted the key for whole-policy failures", async () => {
       if (first === undefined) return needModel;
       const cases = [["bits=0+only=a,a", "bits"], ["only=a,a+bits=0", "only"], ["Bad+bits=0", null], [`bits=0+${Array.from({ length: 16 }, () => "later").join("+")}`, null], [`bits=0+ignore=${"a".repeat(512)}`, null]] as const;
       for (const [text, key] of cases) await expect(inference(first.id, text), `400 ${formatRefused("unsupported", key)}`, (r) => refusal(r, "unsupported", key));
     });
-    await run("G3", "policies meeting no published route are unsatisfiable and name no key", async () => {
-      if (!knowBound || negative === undefined) return "an interpretable ordinary key default and a supported policy no published route meets";
+    await run("G3", "probes with no match even under the known requirements returned unsatisfiable without a key", async () => {
+      if (support === undefined || negative === undefined) return "an accepted policy no published route meets, even before unknown key requirements";
       const witnesses = new Map<string, typeof negative>();
       for (const candidate of [negative, ...negatives]) {
         const key = keysOf(candidate.policy)[0]!;
@@ -415,7 +434,7 @@ export async function runConformance(options: Options): Promise<Report> {
         await expect(inference(model.id, text), "400 unsatisfiable with no key or other result headers", unsatisfiable);
       }
     });
-    await run("G6", "relayed providers meet the policy by their published facts and id", async () => {
+    await run("G6", "the sampled policy relays named routes meeting the known combined policy", async () => {
       if (!knowBound || positive === undefined) return "an interpretable ordinary key default and a satisfiable advertised policy";
       const byKey = new Map<string, typeof positive>();
       for (const entry of positives) {
@@ -435,7 +454,7 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       if (relays === 0) return "a relay for a satisfiable policy (all probes returned unavailable)";
     });
-    await run("G7", "preferences cannot disqualify matching routes or admit excluded ones", async () => {
+    await run("G7", "accepted preference probes returned a qualifying provider or unavailable, not unsatisfiable", async () => {
       if (!knowBound || support === undefined) return "an interpretable ordinary key default and advertised preferences";
       const matching = positives.find(({ policy, model, allowed }) => hasRequirements(policy) && allowed.length < model.routes.size)
         ?? positives.find(({ policy }) => hasRequirements(policy));
@@ -454,24 +473,24 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       if (!ran) return "an accepted preference that can accompany the matching policy";
     });
-    await run("G8", "the suffix resolves its base model and applies its policy", async () => {
+    await run("G8", "suffixed probes resolved the published base and returned outcomes consistent with the suffix", async () => {
       if (first === undefined) return needModel;
       await expect(inference(first.id, undefined, ""), "empty suffix for an existing model resolves that model and returns 400 unsupported, no key", rejected);
-      if (!knowBound) return "a plain key default this suite can interpret";
+      if (support !== undefined && negative !== undefined) await expect(inference(negative.model.id, undefined, negative.text), "no published route meets even the known suffix requirements", unsatisfiable);
+      if (!knowBound) return "an interpretable key default to verify a satisfiable suffix";
       if (positive !== undefined) await expect(inference(positive.model.id, undefined, positive.text), "suffixed request resolves to a qualifying route or unavailable", allowedOrUnavailable(positive.allowed));
-      if (negative !== undefined) await expect(inference(negative.model.id, undefined, negative.text), "unsatisfiable suffix returns 400 unsatisfiable", unsatisfiable);
       if (positive === undefined && negative === undefined) return "an accepted policy to probe the suffix carrier";
     });
-    await run("G9", "the HTTP header applies and two differently cased field lines refuse without a key", async () => {
+    await run("G9", "single-header probes applied their policies; repeated field lines returned unsupported without a key", async () => {
       if (first === undefined) return needModel;
       const dupe = { ...inference(first.id), policies: support?.keys.has("only") ? [`only=${first.unknown}`, "probe1"] : ["bits=1", "bits=2"] };
       await expect(dupe, "two raw Route-Policy lines return 400 unsupported without a key", rejected);
-      if (!knowBound) return "a plain key default this suite can interpret";
+      if (support !== undefined && negative !== undefined) await expect({ ...inference(negative.model.id, negative.text), mixedCasePolicy: true }, "no published route meets even the known mixed-case header requirements", unsatisfiable);
+      if (!knowBound) return "an interpretable key default to verify a satisfiable single header";
       if (positive !== undefined) await expect(inference(positive.model.id, positive.text), "header routes only among matching providers or returns unavailable", allowedOrUnavailable(positive.allowed));
-      if (negative !== undefined) await expect({ ...inference(negative.model.id, negative.text), mixedCasePolicy: true }, "a mixed-case Route-Policy header applies even when unsatisfiable", unsatisfiable);
       if (positive === undefined && negative === undefined) return "an accepted policy to probe a single Route-Policy header";
     });
-    await run("G10", "a bound key policy applies with no explicit carrier", async () => {
+    await run("G10", "probes with the policy key alone returned results consistent with its detected default", async () => {
       if (policyBound === undefined) return "a usable credential with a detected, interpretable policy (supply --policy-key)";
       const cases = policyScope.models.map((model) => ({ model, allowed: qualifying(model, policyBound) }));
       if (cases.length === 0) return "a published base model for the bound key";
@@ -482,7 +501,7 @@ export async function runConformance(options: Options): Promise<Report> {
         return "a published model whose qualification can distinguish applying the bound key policy";
       }
     });
-    await run("G11", "header then suffix are validated separately; valid carriers constrain each other", async () => {
+    await run("G11", "malformed carriers attributed the first failure to the header; valid pairs matched both omission witnesses", async () => {
       if (first === undefined) return needModel;
       await expect(inference(first.id, "bits=0", "only=x,x"), "first failing carrier is the header, whose key is bits", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(first.id, "only=x,x", "bits=0"), "swapping malformed carriers reports only, the header's first failure", (r) => refusal(r, "unsupported", "only"));
@@ -597,7 +616,7 @@ export async function runConformance(options: Options): Promise<Report> {
       const missing = [...(!headerWitness ? ["header"] : []), ...(!suffixWitness ? ["suffix"] : [])];
       if (missing.length > 0) return `a combined-policy witness distinguishing omission of the ${missing.join(" and ")}`;
     });
-    await run("G12", "disjoint only and region carriers each form an empty intersection", async () => {
+    await run("G12", "the exercised empty intersections returned unsatisfiable in both carrier orders", async () => {
       if (first === undefined || support === undefined || !knowBound) return "a published base model and interpretable key default";
       const baseModel = models.find((model) => qualifying(model, withKey()).length > 0);
       let missing: string | undefined;
@@ -630,7 +649,7 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       return missing ?? (ran ? undefined : "at least one of only and region accepted");
     });
-    await run("G13", "a header, suffix or both cannot widen a key default", async () => {
+    await run("G13", "the challenged explicit carriers did not admit providers excluded by the bound requirement", async () => {
       if (policyBound === undefined || policyDetection === undefined) return "a credential with an interpretable bound policy (supply --policy-key)";
       let ran = false;
       for (const model of policyScope.models) {
@@ -677,12 +696,13 @@ export async function runConformance(options: Options): Promise<Report> {
     });
     // Supply one streaming probe and controls for both sides of the attest rule.
     // The final audit checks these and every other response observed below.
-    await run("G15", "observed policy relays named a published provider", async () => {
-      if (positive === undefined || !knowBound) return "a satisfiable advertised policy";
-      await expect(inference(positive.model.id, positive.text, undefined, true), "streaming relay or unavailable", (r) => refusal(r, "unavailable") || r.applied.length > 0);
+    await run("G15", "streaming probe returned a route result", async () => {
+      if (positive === undefined || support === undefined) return "an advertised policy with a route meeting its known requirements";
+      await expect(inference(positive.model.id, positive.text, undefined, true), "streaming relay or a refusal consistent with the known requirements",
+        (r) => refusal(r, "unavailable") || r.applied.length > 0 || (!knowBound && unsatisfiable(r)));
     });
-    await run("G17", "observed relays gave evidence exactly when required", async () => {
-      const attested = knowBound ? positives.find(({ policy }) => withKey(policy).attest.length > 0) : undefined;
+    await run("G17", "evidence probes returned inference replies for the result audit", async () => {
+      const attested = positives.find(({ policy }) => withKey(policy).attest.length > 0);
       const unattested = knowBound ? positives.find(({ model, policy, allowed }) => withKey(policy).attest.length === 0 && allowed.every((id) => model.routes.get(id)?.evidence != null))
         ?? positives.find(({ policy }) => withKey(policy).attest.length === 0) : undefined;
       for (const candidate of [attested, unattested]) {
@@ -693,7 +713,7 @@ export async function runConformance(options: Options): Promise<Report> {
         if (model !== undefined) await expect(policyInference(model.id), "an inference response for the bound evidence probe", () => true);
       }
     });
-    await run("G21", "unlisted keys and enum values refuse; listed fixed-domain keys accept their valid values", async () => {
+    await run("G21", "unlisted probes returned unsupported; tested advertised keys and values did not", async () => {
       let missing: string | undefined;
       for (const current of new Set([primary, policyScope])) {
         const model = current.models[0];
@@ -736,13 +756,14 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       return missing;
     });
-    await run("G24", "unknown providers match nothing in only and have no effect in ignore and order", async () => {
-      if (support === undefined || !knowBound) return needModel;
+    await run("G24", "probed selectors containing unknown IDs returned results consistent with the published candidates", async () => {
+      if (support === undefined) return "advertised provider selection support and a published base model";
       let ran = false;
       if (first !== undefined && support.keys.has("only")) {
         ran = true;
         await expect(inference(first.id, `only=${first.unknown}`), "valid unknown provider in only matches nothing, not unsupported", unsatisfiable);
       }
+      if (!knowBound) return "an interpretable key default to verify which routes remain for unknown ignore and order ids";
       const model = models.find((m) => qualifying(m, withKey()).length > 0);
       if (model !== undefined) for (const key of ["ignore", "order"]) {
         if (!support.keys.has(key)) continue;
@@ -765,18 +786,16 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       if (!ran) return "an accepted provider-selection key and a suitable published model";
     });
-    await run("G25", "the observed ordinary errors take precedence over policy checks", async () => {
+    await run("G25", "corroborated ordinary errors retained their status and no route headers when challenged with a policy", async () => {
       const malformed = bodyProbe("{");
       const malformedControl = await ordinaryError(malformed);
       await compareOwn(malformedControl, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] });
       for (const raw of ['{"model":4}', "{}"]) {
         const probe = bodyProbe(raw);
         const control = await ordinaryError(probe);
-        control.fieldErrorControl = true;
         await compareOwn(control, { ...probe, policies: [INVALID_POLICY] });
       }
       const emptyModel = await ordinaryError(inference(""));
-      emptyModel.fieldErrorControl = true;
       await compareOwn(emptyModel, inference("", INVALID_POLICY, INVALID_POLICY));
       const missing: string[] = [];
       const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
@@ -839,13 +858,13 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       if (missing.length > 0) return missing.join("; ");
     });
-    await run("G26", "ordinary traffic without a policy carries neither refusal nor evidence", async () => {
+    await run("G26", "the observed policy-free response carried neither refusal nor evidence", async () => {
       if (detection?.keyPolicy !== null || first === undefined) return "a known unbound ordinary credential and a published base model";
       const reply = await expect(inference(first.id), "without any policy, neither Route-Refused nor Route-Evidence", (r) => r.refused.length === 0 && r.evidence.length === 0);
       if (isBareError(reply)) return "a policy-free response distinguishable from an own error";
     });
-    await run("G29", "unsupported takes precedence over an otherwise unsatisfiable policy", async () => {
-      if (negative === undefined || !knowBound) return "a supported policy no published route meets";
+    await run("G29", "both probes with an invalid carrier and an impossible policy returned unsupported first", async () => {
+      if (negative === undefined || support === undefined) return "a supported policy no published route meets, even before unknown key requirements";
       await expect(inference(negative.model.id, "bits=0", negative.text), "invalid header takes precedence over unsatisfiable suffix", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(negative.model.id, negative.text, "bits=0"), "invalid suffix takes precedence over unsatisfiable header", (r) => refusal(r, "unsupported", "bits"));
     });
@@ -862,7 +881,6 @@ export async function runConformance(options: Options): Promise<Report> {
           const sample = await observe(scopedProbe(raw)).catch(() => undefined);
           if (sample === undefined || !isBareError(sample.reply)) continue;
           sample.ordinaryControl = true;
-          sample.fieldErrorControl = raw.startsWith("{") && raw !== "{";
         }
         const current = scopeFor(scopedProbe("{}"));
         const model = current?.models[0];
@@ -870,15 +888,15 @@ export async function runConformance(options: Options): Promise<Report> {
           // A provider can also reject an input field. Only use the ordinary
           // sample if the same error precedes validation of a malformed policy.
           const field = endpoint === "responses" ? "input" : "messages";
+          const limit = endpoint === "responses" ? "max_output_tokens" : "max_tokens";
           const body = bodyFor(endpoint, model.id);
-          for (const value of [null, 4]) {
-            const probe = scopedProbe(JSON.stringify({ ...body, [field]: value }));
+          for (const edit of [{ [field]: null }, { [field]: 4 }, { [limit]: -1 }, { route_conformance_unknown_field: true }]) {
+            const probe = scopedProbe(JSON.stringify({ ...body, ...edit }));
             const control = await observe(probe).catch(() => undefined);
             if (control === undefined || !isBareError(control.reply)) continue;
             const challenged = await observe({ ...probe, policies: [INVALID_POLICY] }).catch(() => undefined);
             if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
               control.ordinaryControl = true;
-              control.fieldErrorControl = true;
             }
           }
           const witness = model.policies[0]?.text;
@@ -898,21 +916,25 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       audit = auditResults(exchanges.slice(firstExchange), contextFor);
     }
-    const audited = (id: AuditId, detail: string, missing?: string) => {
+    const audited = (id: AuditId, detail: string, observed: readonly Exchange[] = [], missing?: string) => {
       const failure = audit.failures.get(id);
       const existing = checks.find((entry) => entry.id === id && entry.endpoint === endpoint);
+      const absent = missing ?? (observed.length === 0 ? "an observed response for this check" : undefined);
       const verdict: Check = failure !== undefined ? { id, endpoint, status: "FAIL", detail: failure }
-        : missing !== undefined ? { id, endpoint, status: "SKIP", detail: `missing precondition: ${missing}` }
-        : { id, endpoint, status: "PASS", detail };
+        : absent !== undefined ? { id, endpoint, status: "SKIP", detail: `missing precondition: ${absent}` }
+        : { id, endpoint, status: "PASS", detail: `${detail}; observed ${observations(observed)}` };
       if (existing === undefined) checks.push(verdict);
-      else if (failure !== undefined || (existing.status === "PASS" && missing !== undefined)) Object.assign(existing, verdict);
+      else if (failure !== undefined || existing.status === "PASS") Object.assign(existing, verdict);
     };
     for (const [id] of audit.failures) audited(id, "");
-    audited("G15", "observed policy relays named a published provider", audit.sawCatalogRelay ? undefined : "a policy relay with a published model catalog to verify its provider");
-    audited("G17", "observed relays gave evidence exactly when required", audit.sawAttestationRelay ? undefined : "a relay for a policy with attest");
-    audited("G19", "observed refusals and relays used exclusive single result headers", audit.sawPolicyResult ? undefined : "an observed policy refusal or relay");
-    audited("G34", "each observed refusal matches an ordinary error shape observed on this endpoint and credential", audit.sawRefusal
-      ? audit.shapeControlsNeeded.values().next().value : "an observed refusal");
+    audited("G15", "policy relays with a checked catalog named published providers", audit.catalogRelays,
+      audit.catalogRelays.length > 0 ? undefined : "a policy relay with a published model catalog to verify its provider");
+    audited("G17", "observed attested relays carried their published evidence URI; fully known unattested relays carried none", audit.attestedRelays,
+      audit.attestedRelays.length > 0 ? undefined : "a relay with a known attest requirement and published evidence");
+    audited("G19", "observed refusals and policy relays used exclusive single result headers", audit.results,
+      audit.results.length > 0 ? undefined : "an observed policy refusal or relay");
+    audited("G34", "each observed refusal matches an ordinary error shape observed on this endpoint and credential", audit.refusals,
+      audit.refusals.length > 0 ? audit.shapeControlsNeeded.values().next().value : "an observed refusal");
   }
 
   return { checks, passed: checks.filter((c) => c.status === "PASS").length, failed: checks.filter((c) => c.status === "FAIL").length, skipped: checks.filter((c) => c.status === "SKIP").length };

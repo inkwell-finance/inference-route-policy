@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { Decision } from "../src/decide.ts";
 import { addWatcher, withdrawReleases } from "../src/fetch-gate.ts";
-import type { Target } from "../src/gateway-client.ts";
+import type { Fetch, Target } from "../src/gateway-client.ts";
+import { OPENROUTER_BASE } from "../src/openrouter.ts";
 import type { Report } from "../src/outcome.ts";
 import { placeOf, type RequestContext } from "../src/request.ts";
-import { RouteClient, type Prepared } from "../src/route-client.ts";
+import { RouteClient, type Located, type Prepared } from "../src/route-client.ts";
 import { fakeGateway, type FakeGateway } from "./fixtures.ts";
 
 let gateway: FakeGateway;
@@ -53,7 +54,7 @@ function blockedFor(decision: Decision, pattern: RegExp): void {
   assert.match(decision.reason, pattern);
 }
 
-const decide = (c: RouteClient, t: Target, model = "demo-model"): Promise<Prepared> => c.decide(t, model, null);
+const decide = (c: RouteClient, t: Target, model = "demo-model"): Promise<Prepared> => c.decide({ target: t, unexact: null }, model, null);
 
 /** Releases a decided request as the plugin does, and returns the fetch that sends exactly those bytes. */
 function release(c: RouteClient, prepared: Prepared): () => Promise<Response> {
@@ -491,19 +492,98 @@ test("C8: the response to a translated request is reported unconfirmed, with or 
   assert.deepEqual(reports, [{ kind: "unconfirmed" }, { kind: "unconfirmed" }, { kind: "refused", reason: "unavailable", key: null }]);
 });
 
+const at = (t: Target): Located => ({ target: t, unexact: null });
+const c0 = (): RouteClient => client("zdr").client;
+
 test("C13, C12: /route shows the key's own policy as locked, and one the client cannot interpret as text only", async () => {
   reset();
   gateway.replies.detection = { status: 200, body: { route_policy: "1", key_policy: "zdr+region=us" } };
-  assert.match(await client().client.describe(target()), /Key policy \(locked, applied by the gateway to every request with this key\): zdr\+region=us/);
+  assert.match(await client().client.describe(at(target())), /Key policy \(locked, applied by the gateway to every request with this key\): zdr\+region=us/);
   gateway.replies.detection = { status: 200, body: { route_policy: "1", keys: ["zdr", "residency"], key_policy: "zdr+residency=eu" } };
-  const text = await client().client.describe(target());
+  const text = await client().client.describe(at(target()));
   assert.match(text, /Key policy \(locked\): "zdr\+residency=eu", which this client cannot interpret; shown as text and relied on for nothing/);
   assert.match(text, /^Route policy: zdr \(from ROUTE_POLICY\)$/m);
-  assert.match(text, /^Last result: none yet$/m);
+  assert.match(text, /^Last result: none yet in this session$/m);
 });
 
 test("C1: /route shows when a base URL has no detection, and why", async () => {
   reset();
   gateway.replies.detection = { status: 404 };
-  assert.match(await client().client.describe(target()), /: no detection \(detection reply is not valid: status is 404, not 200\)/);
+  assert.match(await client().client.describe(at(target())), /: no detection \(detection reply is not valid: status is 404, not 200\)/);
+});
+
+test("C1, C14: /route says which place and credential its detection line is for, read for each the way a request's guard reads it", async () => {
+  reset();
+  gateway.replies.detection = { status: 200, body: { route_policy: "1", keys: ["zdr"] } };
+  const { client: c } = client("zdr");
+  const east = await c.describe(at({ base: gateway.base, query: "?tenant=east", context: [["authorization", "Bearer k"], ["cookie", "who=east"]] }));
+  gateway.replies.detection = { status: 200, body: { route_policy: "1", keys: ["zdr", "notrain"] } };
+  const west = await c.describe(at({ base: gateway.base, query: "?tenant=west", context: [["x-api-key", "k2"]] }));
+  assert.match(east, new RegExp(`^Gateway ${gateway.base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?tenant=east, read with the credential in authorization, cookie: detection valid; accepts zdr$`, "m"));
+  assert.match(west, /\?tenant=west, read with the credential in x-api-key: detection valid; accepts zdr, notrain$/m);
+  assert.doesNotMatch(east + west, /Bearer k|who=east|k2/, "header names only, never values");
+  assert.deepEqual(gateway.requests.filter((r) => r.path.includes("/route-policy")).map((r) => r.path.slice(r.path.indexOf("?"))), ["?tenant=east", "?tenant=west"]);
+});
+
+test("C1, C14: a block names the base URL with its query, the place whose detection it is about", async () => {
+  reset();
+  gateway.replies.detection = { status: 404 };
+  blockedFor((await decide(c0(), placed())).decision, new RegExp(`^${gateway.base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?tenant=east has no valid detection reply`));
+});
+
+test("C9: /route mentions translation only for OpenRouter's base URL, which has no detection", async () => {
+  reset();
+  const notFound: Fetch = async () => new Response("", { status: 404 });
+  const c = new RouteClient({ carriers: "header", env: { ROUTE_POLICY: "zdr" }, fetch: notFound, onReport: () => {} });
+  const there = await c.describe(at({ base: OPENROUTER_BASE, query: "", context: bearer("k") }));
+  assert.match(there, /: no detection \(detection reply is not valid: status is 404, not 200\); policies are translated into OpenRouter's own fields where it has a filter for them$/m);
+  gateway.replies.detection = { status: 404 };
+  assert.doesNotMatch(await client().client.describe(at(target())), /OpenRouter/);
+});
+
+test("C6: /route says a key's own policy is none only for a request with a credential; without one it is unknown", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  assert.match(await c.describe(at(target())), /^Key policy: none$/m);
+  const anonymous = await c.describe(at(target(null)));
+  assert.match(anonymous, /^Key policy: unknown, the request carries no credential$/m);
+  assert.match(anonymous, /read without a credential: detection valid/);
+  assert.doesNotMatch(anonymous, /^Key policy: none$/m);
+});
+
+test("C14: /route reads nothing for a base URL that cannot be used as written, or for no place at all, and says why", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  const inexact = await c.describe({ target: target(), unexact: "the base URL cannot be used exactly as written: its query would be sent otherwise" });
+  assert.match(inexact, /: no detection \(the base URL cannot be used exactly as written: its query would be sent otherwise\)$/m);
+  assert.doesNotMatch(inexact, /detection valid|Key policy/);
+  const nowhere = await c.describe({ why: "the harness did not say which model and base URL the request is for" });
+  assert.match(nowhere, /^Gateway: unknown, nothing was read \(the harness did not say which model and base URL the request is for\)$/m);
+  assert.equal(gateway.requests.length, 0, "nothing was fetched for either");
+});
+
+test("C14: /route after a not-honored result reads detection again, and shows what the gateway says now, not the discarded reply", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  assert.match(await c.describe(at(target())), /detection valid/);
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  await sendText(release(c, await decide(c, target())));
+  gateway.replies.detection = { status: 404 };
+  const after = await c.describe(at(target()));
+  assert.match(after, /no detection \(detection reply is not valid: status is 404, not 200\)/);
+  assert.doesNotMatch(after, /detection valid/);
+});
+
+test("C3, C5: /route's last result names the request it was for: its model and base URL", async () => {
+  reset();
+  gateway.replies.models = {
+    status: 200,
+    body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr" }] }, { id: "other-model", routes: [{ provider: "aurora", facts: "zdr" }] }] },
+  };
+  const { client: c } = client("zdr");
+  await sendText(release(c, await decide(c, target(), "demo-model")));
+  gateway.replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
+  await sendText(release(c, await decide(c, placed(), "other-model")));
+  const text = await c.describe(at(target()));
+  assert.match(text, new RegExp(`^Last result \\(request for other-model to ${gateway.base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?tenant=east\\): route policy refused by the gateway: unsatisfiable$`, "m"));
 });

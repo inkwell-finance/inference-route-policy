@@ -18,7 +18,7 @@ import { heldFromEntry, heldFromEnv, holdPolicy, type Held, type HeldEntry } fro
 import { OPENROUTER_PROVIDER_APIS } from "./openrouter.ts";
 import { describeReport, isQuiet, type Report } from "./outcome.ts";
 import { contextKey, contextOf, placeOf } from "./request.ts";
-import { RouteClient, type Prepared } from "./route-client.ts";
+import { RouteClient, type Located, type Prepared } from "./route-client.ts";
 
 /**
  * APIs that name the model in the URL, not the body; their requests may leave without a body `model`. The plugin
@@ -75,8 +75,11 @@ function headersFrom(...records: unknown[]): Headers {
   return headers;
 }
 
-/** The request a hook's context is about: where it goes, with which key, for which model, over which API. */
-interface RequestOf {
+/**
+ * The request a hook's context is about: where it goes, with which key, for which model, over which API. As a
+ * `Located`, it is what every read of the gateway's metadata takes: the guard's and `/route`'s alike.
+ */
+interface RequestOf extends Located {
   /** The base URL and the key the request will carry, as far as the harness says; the fetch gate checks the key. */
   target: Target;
   modelId: string;
@@ -84,7 +87,7 @@ interface RequestOf {
   api: string | null;
   /** A `Route-Policy` the provider configuration adds on its own. */
   configured: string | null;
-  /** Why the base URL cannot be used exactly as written, or null: a request with a policy is not sent there. */
+  /** Why the base URL cannot be used exactly as written, or null: nothing is read there, and no policy sent. */
   unexact: string | null;
 }
 
@@ -102,12 +105,12 @@ function keyHeader(api: string | null, key: string): [string, string] {
  * `wire`, when the hook sees the request's own headers, is read last. This is a prediction: the fetch gate
  * compares it with the headers that actually leave, and stops the request when they differ.
  */
-async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<RequestOf | null> {
+async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<RequestOf | string> {
   const model = member(ctx, "model");
   const id = member(model, "id");
   const baseUrl = member(model, "baseUrl");
   const api = member(model, "api");
-  if (typeof id !== "string" || typeof baseUrl !== "string") return null;
+  if (typeof id !== "string" || typeof baseUrl !== "string") return "the harness did not say which model and base URL the request is for";
   const registry = member(ctx, "modelRegistry");
   const resolve = member(registry, "getApiKeyAndHeaders");
   // The harness resolves the key, and any base URL or headers its credentials carry, as it does for the request.
@@ -121,8 +124,9 @@ async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<
     const [name, value] = keyHeader(requestApi, apiKey);
     if (!configured.has(name)) configured.set(name, value);
   }
-  const place = placeOf(typeof authBase === "string" ? authBase : baseUrl);
-  if (place === null) return null;
+  const written = typeof authBase === "string" ? authBase : baseUrl;
+  const place = placeOf(written);
+  if (place === null) return `the base URL ${JSON.stringify(written)} is not an absolute URL fetch can send to (one with credentials in it is not)`;
   return {
     target: { ...place.place, context: contextOf(configured) },
     unexact: place.unexact,
@@ -157,9 +161,10 @@ function wireOf(decision: Decision): string {
 }
 
 /** Shows a report: in the status line when nothing needs attention, as a notification as well otherwise. */
-function show(ui: UI | null, report: Report): void {
+function show(ui: UI | null, report: Report, subject: string | null): void {
   if (ui === null) return;
-  const text = describeReport(report);
+  // The status line outlives the request: it says which request it is about.
+  const text = subject === null ? describeReport(report) : `${describeReport(report)} (${subject})`;
   try {
     ui.setStatus(STATUS_KEY, text);
     if (!isQuiet(report)) ui.notify(text, report.kind === "refused" || report.kind === "blocked" ? "error" : "warning");
@@ -213,7 +218,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   const remember = (ctx: unknown): void => {
     ui = uiOf(ctx) ?? ui;
   };
-  const client = new RouteClient({ carriers: options.headerHook ? "header" : "suffix", env: options.env, onReport: (report) => show(ui, report) });
+  const client = new RouteClient({ carriers: options.headerHook ? "header" : "suffix", env: options.env, onReport: (report, subject) => show(ui, report, subject) });
   const stopWatching = addWatcher({ check: (outgoing) => client.check(outgoing), stopped: (reason) => client.blocked(reason) });
 
   /** Blocks with `reason`, telling the user if that can be done; never throws. */
@@ -309,6 +314,14 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
       held = { kind: "invalid", text: "(stored in the session)", detail: `it could not be read: ${reasonOf(error)}`, source: "session" };
     }
     client.held = held;
+    // A started or resumed session has heard of no result yet: the last one, and the status line that shows it,
+    // belong to the session before.
+    client.lastReport = null;
+    try {
+      ui?.setStatus(STATUS_KEY, undefined);
+    } catch {
+      // The line stays if the UI will not clear it; /route still says no result is known in this session.
+    }
   };
   for (const event of options.restoreEvents) api.on(event, restore);
   api.on("session_shutdown", () => {
@@ -334,8 +347,9 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         remember(ctx);
         const text = args.trim();
         if (text === "") {
+          // Resolved and read the one way a request's guard resolves and reads it.
           const request = await requestOf(ctx);
-          tell(await client.describe(request?.target ?? null), "info");
+          tell(await client.describe(typeof request === "string" ? { why: request } : request), "info");
         } else if (text === "clear") {
           api.appendEntry(ENTRY_TYPE, { policy: null });
           client.held = { kind: "none" };
@@ -370,8 +384,8 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         // The work decides and changes nothing; the headers change only if it finished in time.
         const work = async (): Promise<Guarded> => {
           const request = await requestOf(ctx, headers);
-          if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
-          return { request, prepared: await client.decide(request.target, request.modelId, request.configured, request.unexact) };
+          if (typeof request === "string") return blockWith(request);
+          return { request, prepared: await client.decide(request, request.modelId, request.configured) };
         };
         const { request, prepared } = await withDeadline(work, (why) => blockWith(`preparing the request's headers failed: ${why}`));
         if (request === null) throw new Error(prepared.decision.action === "block" ? prepared.decision.reason : "no request");
@@ -419,7 +433,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
           return blockWith("the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable");
         }
         const request = await requestOf(ctx);
-        if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
+        if (typeof request === "string") return blockWith(request);
         if (options.headerHook) return takePrepared(request, payload);
         const model = member(payload, "model");
         // A suffix the user typed into the selected model is a policy; a payload that names the model without it
@@ -427,7 +441,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (typeof model === "string" && splitModel(model).policy !== splitModel(request.modelId).policy) {
           return blockWith(`the request names the model "${model}" while "${request.modelId}" is selected; the policy typed into one is not in the other`);
         }
-        return { request, prepared: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured, request.unexact) };
+        return { request, prepared: await client.decide(request, typeof model === "string" ? model : request.modelId, request.configured) };
       };
       return apply(await withDeadline(work, (why) => blockWith(`the plugin failed: ${why}`)), payload);
     } catch (error) {

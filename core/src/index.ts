@@ -389,8 +389,16 @@ export function meets(route: { provider: string; facts: Facts }, policy: Policy)
     if (facts.region === null || !facts.region.every((country) => allowed.includes(country))) return false;
   }
   if (!policy.attest.every((item) => facts.attest.includes(item))) return false;
-  if (policy.only !== null && !policy.only.includes(provider)) return false;
-  return !policy.ignore.includes(provider);
+  return providerAllowed(provider, policy);
+}
+
+/**
+ * Whether the policy's provider-id requirements, `only` and `ignore`, admit this provider (S9). It needs no facts,
+ * so it can be decided for a provider nothing is published about; `meets` adds the requirements that need them.
+ */
+export function providerAllowed(provider: string, policy: Policy): boolean {
+  requirePolicy(policy);
+  return (policy.only === null || policy.only.includes(provider)) && !policy.ignore.includes(provider);
 }
 
 /**
@@ -693,7 +701,7 @@ export function readOutcome(headers: ResultHeaders, sent: Policy, routes: Readon
   }
 
   if (routes === null) {
-    const named = (sent.only === null || sent.only.includes(provider)) && !sent.ignore.includes(provider);
+    const named = providerAllowed(provider, sent);
     return named ? { outcome: "honored", provider, evidence, checked: false } : notHonored(`provider "${provider}" is excluded by the policy sent`);
   }
   const published = routes.get(provider);

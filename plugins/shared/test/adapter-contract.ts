@@ -157,6 +157,55 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     }
   });
 
+  test(`C14: ${name}: /route for a base URL that cannot be used as written, or that fetch cannot send to, reads nothing and shows no detection, as the request guard does`, async () => {
+    const harness = await make("zdr");
+    const origin = new URL(gateway().base).origin;
+    const before = gateway().requests.length;
+    harness.model.baseUrl = `${origin}/v1?tag=O'Brien`;
+    await harness.command("route", "");
+    const inexact = notices(harness).at(-1) ?? "";
+    assert.match(inexact, /: no detection \(the base URL ".*\?tag=O'Brien" cannot be used exactly as written: its query "\?tag=O'Brien" would be sent as "\?tag=O%27Brien"/);
+    assert.doesNotMatch(inexact, /detection valid|Key policy/);
+    assert.match((await harness.request()).error ?? "", /cannot be used exactly as written/);
+    harness.model.baseUrl = origin.replace("http://", "http://user:secret@") + "/v1";
+    await harness.command("route", "");
+    assert.match(notices(harness).at(-1) ?? "", /^Gateway: unknown, nothing was read \(the base URL ".*" is not an absolute URL fetch can send to \(one with credentials in it is not\)\)$/m);
+    assert.equal(gateway().requests.length, before, "neither /route nor the request read anything");
+  });
+
+  test(`C3, C5: ${name}: the status line and every notice about a response name the request they are about`, async () => {
+    const harness = await make("zdr");
+    const about = new RegExp(`\\(request for demo-model(\\+zdr)? to ${gateway().base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)$`);
+    await harness.request();
+    const status = harness.shown.filter((line) => line.method === "setStatus").at(-1)?.text ?? "";
+    assert.match(status, /^route policy honored: served by aurora/);
+    assert.match(status, about);
+    gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
+    await harness.request();
+    assert.match(notices(harness).at(-1) ?? "", /^route policy refused by the gateway: unsatisfiable \(request for /);
+    assert.match(notices(harness).at(-1) ?? "", about);
+  });
+
+  test(`C2, C14: ${name}: a policy of preferences alone is not sent to a base URL that cannot be used as written either`, async () => {
+    const harness = await make("sort=price");
+    harness.model.baseUrl = `${new URL(gateway().base).origin}/v1?tag=a b`;
+    const before = gateway().requests.length;
+    const result = await harness.request();
+    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: the base URL ".*" cannot be used exactly as written: its query "\?tag=a b" would be sent as "\?tag=a%20b"; a policy is not sent anywhere else$/);
+    assert.equal(gateway().requests.length, before);
+  });
+
+  test(`C3, C15: ${name}: a session started again after a result has heard of none: /route says so, and the status line is cleared`, async () => {
+    const harness = await make("zdr");
+    await harness.request();
+    await harness.command("route", "");
+    assert.match(notices(harness).at(-1) ?? "", /^Last result \(request for .*\): route policy honored/m);
+    await harness.emit("session_start", { type: "session_start", reason: "resume" });
+    assert.equal(harness.shown.filter((line) => line.method === "setStatus").at(-1)?.text, undefined, "the status line is cleared");
+    await harness.command("route", "");
+    assert.match(notices(harness).at(-1) ?? "", /^Last result: none yet in this session$/m);
+  });
+
   test(`C1, C14: ${name}: a configured header that is not a string is not read as context, so a transport that sends it anyway is stopped`, async () => {
     const harness = await make("zdr");
     Object.assign(harness.model, { headers: { "x-tenant": 7 } });
@@ -179,7 +228,7 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     await Promise.all([firstSent, second.request()]);
     const results = (harness: FakeHarness): string[] => notices(harness).filter((text) => /refused|honored/i.test(text));
     assert.deepEqual(results(first).map((text) => text.replace(/:.*/, "")), ["route policy NOT honored"], "the first session hears only its own not-honored result");
-    assert.deepEqual(results(second), ["route policy refused by the gateway: unsatisfiable"], "the second session hears only its own refusal");
+    assert.deepEqual(results(second).map((text) => text.replace(/ \(request for .*\)$/, "")), ["route policy refused by the gateway: unsatisfiable"], "the second session hears only its own refusal");
   });
 
   test(`C10: ${name}: a payload whose own toJSON names another model, or none, is blocked: what is checked is what would be sent`, async () => {

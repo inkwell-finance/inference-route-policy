@@ -54,7 +54,8 @@ export function describeReport(report: Report): string {
       return `route policy honored: served by ${report.provider}; ${facts}${evidence}`;
     }
     case "served":
-      return report.provider === null ? "no route policy on this request" : `no route policy on this request; served by ${report.provider}`;
+      // The client sent no policy; a key's own may still have applied, so nothing is said of one.
+      return report.provider === null ? "no route policy sent with this request" : `no route policy sent with this request; the gateway names ${report.provider} as its route`;
     case "refused":
       return report.reason === null
         ? "route policy refused by the gateway (its Route-Refused value could not be read)"

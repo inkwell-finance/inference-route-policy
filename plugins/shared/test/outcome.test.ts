@@ -101,6 +101,11 @@ test("C7: an honored result never presents a fact or evidence as verified", () =
   assert.match(describeReport(reports[3]!), /evidence at https:\/\/basalt\.example\/attestation, not verified by this client.*not compared: no model list was held|not compared: no model list was held.*evidence at https:\/\/basalt\.example\/attestation, not verified by this client/);
 });
 
+test("C3: a response to a request sent without a policy says only that none was sent, and names its route as the gateway's", () => {
+  assert.equal(describeReport({ kind: "served", provider: "aurora" }), "no route policy sent with this request; the gateway names aurora as its route");
+  assert.equal(describeReport({ kind: "served", provider: null }), "no route policy sent with this request");
+});
+
 test("C3: a policy that was not honored is shown, never reported as applied", () => {
   const report = interpret(headers(["provider=cobalt"]), protocol("zdr", MODEL_LIST));
   assert.equal(isQuiet(report), false);

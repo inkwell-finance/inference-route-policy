@@ -61,7 +61,7 @@ test("C3, C4: omp: an honored response is checked against the model list and sho
   assert.match(harness.shown.at(-1)?.text ?? "", /^route policy honored: served by aurora; its published facts meet the policy/);
   gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
   await harness.request();
-  assert.match(notices(harness).at(-1) ?? "", /^route policy NOT honored: route "cobalt" does not meet the policy sent$/);
+  assert.match(notices(harness).at(-1) ?? "", /^route policy NOT honored: route "cobalt" does not meet the policy sent \(request for demo-model\+zdr to http:\/\/127\.0\.0\.1:\d+\/v1\)$/);
 });
 
 test("C5, C11: omp: a refusal on a 400 response is shown with its reason and key", async () => {
@@ -70,7 +70,7 @@ test("C5, C11: omp: a refusal on a 400 response is shown with its reason and key
   const harness = await omp("notrain");
   const result = await harness.request();
   assert.equal(result.status, 400);
-  assert.equal(notices(harness).at(-1), "route policy refused by the gateway: unsupported (key bits)");
+  assert.equal(notices(harness).at(-1), `route policy refused by the gateway: unsupported (key bits) (request for demo-model+notrain to ${gateway.base})`);
 });
 
 test("C1: omp: a failure inside the plugin blocks the request instead of sending it without its policy", async () => {
@@ -123,7 +123,7 @@ test("C10: omp: /route sets, shows, and clears the policy; an invalid one change
   await harness.command("route", "zdr+zdr");
   assert.match(notices(harness).at(-1) ?? "", /^Not a valid policy, nothing changed/);
   await harness.command("route", "");
-  assert.match(notices(harness).at(-1) ?? "", /^Route policy: zdr \(set in this session\)\nGateway http:\/\/127\.0\.0\.1:\d+\/v1: detection valid/);
+  assert.match(notices(harness).at(-1) ?? "", /^Route policy: zdr \(set in this session\)\nGateway http:\/\/127\.0\.0\.1:\d+\/v1, read with the credential in authorization: detection valid/);
   await harness.command("route", "clear");
   await harness.request();
   assert.equal(JSON.parse(gateway.inference()[0]?.body ?? "{}").model, "demo-model", "a cleared policy is no longer sent");

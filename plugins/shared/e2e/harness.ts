@@ -332,7 +332,7 @@ const CASES: readonly Case[] = [
     name: "(b) refused by the gateway: only=nosuch with the model list withheld",
     provider: "withheld",
     policy: "only=nosuch",
-    check: (observed) => [...expectShown(observed, "notify", /^route policy refused by the gateway: unsatisfiable$/), ...expectNoProviderContent(observed)],
+    check: (observed) => [...expectShown(observed, "notify", /^route policy refused by the gateway: unsatisfiable \(request for demo-model(\+only=nosuch)? to http:\/\/127\.0\.0\.1:\d+\/v1\)$/), ...expectNoProviderContent(observed)],
   },
   {
     name: "(c) blocked: zdr against a base URL with no detection (the plain provider)",

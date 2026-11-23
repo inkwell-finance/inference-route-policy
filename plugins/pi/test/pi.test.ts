@@ -111,7 +111,7 @@ test("C5, C11: pi: a 503 refusal is shown with its reason", async () => {
   gateway.replies.inference = { status: 503, headers: { "route-refused": "reason=unavailable" }, body: {} };
   const harness = await pi("notrain");
   await harness.request();
-  assert.equal(notices(harness).at(-1), "route policy refused by the gateway: unavailable");
+  assert.equal(notices(harness).at(-1), `route policy refused by the gateway: unavailable (request for demo-model to ${gateway.base})`);
 });
 
 test("C1: pi: a payload naming another model than its headers were prepared for is blocked", async () => {

@@ -54,8 +54,12 @@ export function contextOf(headers: Headers): RequestContext {
  */
 const CREDENTIAL_HEADERS: readonly string[] = ["authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie", "proxy-authorization"];
 
+/** The names of the headers that carry a credential in a context, in order. */
+export const credentialNames = (context: RequestContext): string[] =>
+  context.flatMap(([name, value]) => (CREDENTIAL_HEADERS.includes(name) && value.trim() !== "" ? [name] : []));
+
 /** Whether a context carries a credential, as C6 means it. */
-export const credentialed = (context: RequestContext): boolean => context.some(([name, value]) => CREDENTIAL_HEADERS.includes(name) && value.trim() !== "");
+export const credentialed = (context: RequestContext): boolean => credentialNames(context).length > 0;
 
 export const contextKey = (context: RequestContext): string => JSON.stringify(context);
 
@@ -113,7 +117,7 @@ const DEFAULT_PORTS: Readonly<Record<string, string>> = { "http:": "80", "https:
  * (6.2.2.3). Anything else the parser rewrites, such as a character it percent-encodes, a backslash, a tab, a
  * non-ASCII host, or another spelling of an IP address, would send the request somewhere not written.
  */
-function rewritten(written: string, url: URL): string | null {
+function rewritten(written: string, url: URL, sentQuery: string): string | null {
   const parts = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#[\s\S]*)?$/.exec(written);
   if (parts === null) return "it is not written as scheme://host/path?query";
   const [, scheme = "", authority = "", path = "", query = "", fragment] = parts;
@@ -127,8 +131,9 @@ function rewritten(written: string, url: URL): string | null {
   if (port !== url.port && !(url.port === "" && port === DEFAULT_PORTS[url.protocol])) {
     differences.push(`its port ${JSON.stringify(port)} would be sent as ${JSON.stringify(url.port)}`);
   }
-  if (withoutDotSegments(path) !== url.pathname) differences.push(`its path ${JSON.stringify(path)} would be sent as ${JSON.stringify(url.pathname)}`);
-  if (query !== queryOf(url)) differences.push(`its query ${JSON.stringify(query)} would be sent as ${JSON.stringify(queryOf(url))}`);
+  // Dot segments are removed only to explain a path that differs; most are sent as written.
+  if (path !== url.pathname && withoutDotSegments(path) !== url.pathname) differences.push(`its path ${JSON.stringify(path)} would be sent as ${JSON.stringify(url.pathname)}`);
+  if (query !== sentQuery) differences.push(`its query ${JSON.stringify(query)} would be sent as ${JSON.stringify(sentQuery)}`);
   return differences.length === 0 ? null : differences.join(", and ");
 }
 
@@ -144,9 +149,10 @@ export function placeOf(baseUrl: string): { place: Place; unexact: string | null
     return null;
   }
   if (!sendable(url)) return null;
-  const difference = rewritten(baseUrl, url);
+  const query = queryOf(url);
+  const difference = rewritten(baseUrl, url, query);
   return {
-    place: { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: queryOf(url) },
+    place: { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query },
     unexact: difference === null ? null : `the base URL ${JSON.stringify(baseUrl)} cannot be used exactly as written: ${difference}; a policy is not sent anywhere else`,
   };
 }

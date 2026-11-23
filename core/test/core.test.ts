@@ -24,6 +24,7 @@ import {
   parsePolicy,
   parsePublishedFacts,
   parseRefused,
+  providerAllowed,
   publishedRoutes,
   readOutcome,
   readRefusal,
@@ -1433,4 +1434,21 @@ test("S1, S3, S16: fitsPolicyGrammar judges grammar and limits alone, so a later
   assert.equal(failed(pairs(17, "x")), null);
   assert.equal(fitsPolicyGrammar(pairs(16, "x")).ok, true);
   assert.equal(failed(`only=${"a".repeat(33)}`), "only");
+});
+
+test("S9: providerAllowed decides only and ignore from the provider id alone, as meets does with facts", () => {
+  const cases: [string, string, boolean][] = [
+    ["zdr+bits=8", "aurora", true],
+    ["only=aurora,basalt", "aurora", true],
+    ["only=aurora,basalt", "cobalt", false],
+    ["ignore=cobalt", "cobalt", false],
+    ["ignore=cobalt", "aurora", true],
+    ["only=aurora+ignore=aurora", "aurora", false],
+  ];
+  for (const [text, provider, expected] of cases) {
+    const sent = policy(text);
+    assert.equal(providerAllowed(provider, sent), expected, `${text} ${provider}`);
+    assert.equal(meets({ provider, facts: facts("zdr+notrain+bits=16") }, sent), expected, `meets ${text} ${provider}`);
+  }
+  assert.throws(() => providerAllowed("aurora", {} as never), TypeError);
 });

@@ -12,7 +12,7 @@ import { fetchDetection, fetchModelList, normalizeBase, type DetectionResult, ty
 import { describeHeld, heldFromEnv, holdPolicy, type Held } from "./held.ts";
 import { isOpenRouter } from "./openrouter.ts";
 import { describeReport, interpret, type Report, type Sent } from "./outcome.ts";
-import { contextKey, modelIn, type Completion, type Outgoing } from "./request.ts";
+import { contextKey, credentialNames, modelIn, type Completion, type Outgoing } from "./request.ts";
 
 export interface RouteClientOptions {
   carriers: Carriers;
@@ -24,8 +24,11 @@ export interface RouteClientOptions {
    * (omp does after 30 seconds), so the two reads before a request must finish well inside that.
    */
   timeoutMs?: number;
-  /** Called with the report for each response to a released request, and for each request blocked. */
-  onReport: (report: Report) => void;
+  /**
+   * Called with the report for each response to a released request, and for each request blocked. `subject`
+   * names the request the report is about (its model and base URL), null when the report carries its own.
+   */
+  onReport: (report: Report, subject: string | null) => void;
 }
 
 /** A decision, the target it was made for, and the detection generation it relied on. */
@@ -35,12 +38,22 @@ export interface Prepared {
   generation: number;
 }
 
+/**
+ * Where a request goes, as resolved from the harness: its target, and why its base URL cannot be used exactly as
+ * written (null when it can). Every read of a gateway's metadata takes one, so none reads a place not as written.
+ */
+export interface Located {
+  target: Target;
+  unexact: string | null;
+}
+
 /** Unused releases a session keeps. Past this the oldest is withdrawn, which can only stop it. */
 const RELEASE_LIMIT = 256;
 
 export class RouteClient {
   held: Held;
-  lastReport: Report | null = null;
+  /** The last report, with the request it is about. */
+  lastReport: { report: Report; subject: string | null } | null = null;
   readonly #options: RouteClientOptions;
   // In-flight and settled reads, by base URL and credential. A settled failure is not kept.
   readonly #detections = new Map<string, Promise<DetectionResult>>();
@@ -69,8 +82,12 @@ export class RouteClient {
 
   #key = (target: Target): string => `${normalizeBase(target.base)}\n${target.query}\n${contextKey(target.context)}`;
 
-  /** The detection result for a target, fetching it when none is held or in flight. */
-  #detection(target: Target): Promise<DetectionResult> {
+  /**
+   * The detection result for a place, fetching it when none is held or in flight. A base URL that cannot be used
+   * as written has none, and nothing is fetched for it (SPEC.md, Detection).
+   */
+  #detection({ target, unexact }: Located): Promise<DetectionResult> {
+    if (unexact !== null) return Promise.resolve({ ok: false, why: unexact });
     const key = this.#key(target);
     let pending = this.#detections.get(key);
     if (pending === undefined) {
@@ -87,7 +104,8 @@ export class RouteClient {
     return pending;
   }
 
-  #modelList(target: Target): Promise<{ list: unknown } | null> {
+  /** The model list for a place. Read only after a valid detection reply, which a place not as written never has. */
+  #modelList({ target }: Located): Promise<{ list: unknown } | null> {
     const key = this.#key(target);
     let pending = this.#lists.get(key);
     if (pending === undefined) {
@@ -117,10 +135,11 @@ export class RouteClient {
    * Decides one request. `model` is its `model` field and `configured` a `Route-Policy` value the harness sends
    * on its own. Reads the gateway first when the decision needs it: detection whenever a policy reaches the
    * request, the model list when a requirement does, the key's own included. A request no policy reaches fetches
-   * nothing, but is still judged against what is already held for its base URL and credential (C16). `unexact`
-   * says why the base URL cannot be used as written; a request a policy reaches is then blocked before any read.
+   * nothing, but is still judged against what is already held for its base URL and credential (C16). A place
+   * whose base URL cannot be used as written blocks a request a policy reaches, before any read.
    */
-  async decide(target: Target, model: string, configured: string | null, unexact: string | null = null): Promise<Prepared> {
+  async decide(located: Located, model: string, configured: string | null): Promise<Prepared> {
+    const { target, unexact } = located;
     const key = this.#key(target);
     // Taken before any read: a discard while this decision waits makes it stale.
     const generation = this.#generation(key);
@@ -136,16 +155,17 @@ export class RouteClient {
     let noDetection = "not fetched";
     let modelList: { list: unknown } | null = this.#heldLists.get(key) ?? null;
     if (anyPolicy(layers.value)) {
-      const result = await this.#detection(target);
+      const result = await this.#detection({ target, unexact });
       detection = result.ok ? result.detection : null;
       if (!result.ok) noDetection = result.why;
       const bound = detection?.keyPolicy == null ? null : parsePolicy(detection.keyPolicy, detection.support);
       const requirement = anyRequirement(layers.value) || (bound?.ok === true && hasRequirements(bound.value));
       if (detection !== null && requirement && !isOpenRouter(base)) {
-        modelList = await this.#modelList(target);
+        modelList = await this.#modelList({ target, unexact });
       }
     }
-    return prepared(decide(layers.value, this.#options.carriers, { base, detection, noDetection, modelList }));
+    // The decision names the place with its query: a base URL that differs in its query is another base URL.
+    return prepared(decide(layers.value, this.#options.carriers, { base: `${base}${target.query}`, detection, noDetection, modelList }));
   }
 
   /** Whether nothing a decision relied on has been discarded since it was made (C14). */
@@ -163,6 +183,7 @@ export class RouteClient {
     const cacheKey = this.#key(target);
     const sent: Sent = decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes };
     const requirement = decision.sent !== null && hasRequirements(decision.sent);
+    const subject = `request for ${decision.model} to ${target.base}${target.query}`;
     this.#bases.add(target.base);
     this.#withdrawals.push(
       addRelease({
@@ -174,7 +195,7 @@ export class RouteClient {
         body,
         current: () => this.isCurrent(prepared),
         stopped: (reason) => this.blocked(reason),
-        complete: (completion) => this.#complete(cacheKey, sent, requirement, completion),
+        complete: (completion) => this.#complete(cacheKey, sent, requirement, completion, subject),
       }),
     );
     // Withdrawing an old unused release can only stop it, never let anything through.
@@ -183,7 +204,7 @@ export class RouteClient {
 
   /** Reports a request the caller blocked: nothing of it was sent. */
   blocked(reason: string): void {
-    this.#report({ kind: "blocked", reason });
+    this.#report({ kind: "blocked", reason }, null);
   }
 
   /**
@@ -206,7 +227,7 @@ export class RouteClient {
    * whatever else holds; a translated request's result is unconfirmed whatever else holds; only then is a
    * redirect, which the plugin never follows, a policy not honored.
    */
-  #complete(cacheKey: string, sent: Sent, requirement: boolean, completion: Completion): void {
+  #complete(cacheKey: string, sent: Sent, requirement: boolean, completion: Completion, subject: string): void {
     const read = interpret(completion.result, sent);
     const redirected = completion.status >= 300 && completion.status < 400;
     const redirect = `the gateway answered with a redirect (status ${completion.status}), which the plugin does not follow with content`;
@@ -215,34 +236,44 @@ export class RouteClient {
     else if (redirected && read.kind !== "refused" && sent.kind === "protocol" && sent.policy !== null) report = { kind: "not-honored", why: redirect };
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
     if (report.kind === "not-honored" && requirement) this.#discardDetection(cacheKey);
-    this.#report(report);
+    this.#report(report, subject);
   }
 
-  #report(report: Report): void {
-    this.lastReport = report;
-    this.#options.onReport(report);
+  #report(report: Report, subject: string | null): void {
+    this.lastReport = { report, subject };
+    this.#options.onReport(report, subject);
   }
 
-  /** What `/route` shows: the held policy, the gateway's detection state and the key's own policy, and the last result. */
-  async describe(target: Target | null): Promise<string> {
+  /**
+   * What `/route` shows: the held policy; for the current model's place, read the one way a request's guard reads
+   * it, the gateway's detection state and the key's own policy; and the last result, with the request it was for.
+   * `located` is the place, or why the current model has none.
+   */
+  async describe(located: Located | { why: string }): Promise<string> {
     const lines = [`Route policy: ${describeHeld(this.held)}`];
-    if (target === null) {
-      lines.push("Gateway: the current model has no base URL to check");
+    if (!("target" in located)) {
+      lines.push(`Gateway: unknown, nothing was read (${located.why})`);
     } else {
-      const base = normalizeBase(target.base);
-      const result = await this.#detection(target);
+      const { target } = located;
+      const base = `${normalizeBase(target.base)}${target.query}`;
+      const credentials = credentialNames(target.context);
+      // Which credential the reply is for, by header name only: the values are keys.
+      const as = credentials.length === 0 ? "without a credential" : `with the credential in ${credentials.join(", ")}`;
+      const result = await this.#detection(located);
       if (!result.ok) {
-        lines.push(`Gateway ${base}: no detection (${result.why})${isOpenRouter(base) ? "; policies are translated into OpenRouter's own fields where it has a filter for them" : ""}`);
+        lines.push(`Gateway ${base}, read ${as}: no detection (${result.why})${isOpenRouter(target.base) ? "; policies are translated into OpenRouter's own fields where it has a filter for them" : ""}`);
       } else {
         const { support, keyPolicy } = result.detection;
-        lines.push(`Gateway ${base}: detection valid; accepts ${[...support.keys].join(", ")}`);
-        if (keyPolicy === null) lines.push("Key policy: none");
+        lines.push(`Gateway ${base}, read ${as}: detection valid; accepts ${[...support.keys].join(", ")}`);
+        // A reply to a request without a credential has no key_policy by definition (C6); it says nothing of a key.
+        if (keyPolicy === null) lines.push(credentials.length === 0 ? "Key policy: unknown, the request carries no credential" : "Key policy: none");
         else if (parsePolicy(keyPolicy, support).ok) lines.push(`Key policy (locked, applied by the gateway to every request with this key): ${keyPolicy}`);
         // C12, C13: shown as text, relied on for nothing.
         else lines.push(`Key policy (locked): "${keyPolicy}", which this client cannot interpret; shown as text and relied on for nothing`);
       }
     }
-    lines.push(`Last result: ${this.lastReport === null ? "none yet" : describeReport(this.lastReport)}`);
+    const last = this.lastReport;
+    lines.push(last === null ? "Last result: none yet in this session" : `Last result${last.subject === null ? "" : ` (${last.subject})`}: ${describeReport(last.report)}`);
     return lines.join("\n");
   }
 }
