@@ -26,7 +26,9 @@ function headersFor(target: Target): Record<string, string> {
 }
 
 async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs: number): Promise<{ status: number; body: unknown }> {
-  const response = await fetchImpl(url, { headers: headersFor(target), signal: AbortSignal.timeout(timeoutMs) });
+  // A reply belongs to the base URL it was fetched from (C14). Following a redirect would let another origin's
+  // reply speak for this one, so a 3xx comes back as itself and reads as no reply.
+  const response = await fetchImpl(url, { headers: headersFor(target), redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
   const text = await response.text();
   let body: unknown;
   try {

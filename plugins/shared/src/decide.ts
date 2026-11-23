@@ -122,9 +122,8 @@ function parsed(text: string): Policy {
 /** The decision for one request. `carriers` says whether the harness lets the plugin set a header. */
 export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState): Decision {
   const { model, typed, configured, held } = layers;
-  if (!anyPolicy(layers)) return { action: "send", model, header: null, sent: null, routes: null };
 
-  if (gateway.detection === null && isOpenRouter(gateway.base)) {
+  if (anyPolicy(layers) && gateway.detection === null && isOpenRouter(gateway.base)) {
     // Translation sends no carrier of this protocol (SPEC.md, Clients, Translation): every layer combines into
     // the gateway's own fields, a typed suffix the most specific.
     if (configured !== null && carriers === "suffix") return block("a Route-Policy header is configured for this provider, and this harness gives the plugin no way to remove it from a translated request");
@@ -162,15 +161,16 @@ export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState
     );
   }
 
-  const sent = layered(null, onHeader, onSuffix);
+  const sent = carried.length === 0 ? null : layered(null, onHeader, onSuffix);
   const routes = gateway.modelList === null ? null : publishedRoutes(gateway.modelList.list, wireModel);
   if (routes !== null) {
-    // C16. The key's bound policy counts only when this client can interpret it (C12).
+    // C16. The key's bound policy counts only when this client can interpret it (C12), and it counts whatever
+    // the request carries, nothing included: the gateway applies it to every request with this key.
     const keyPolicy = gateway.detection?.keyPolicy ?? null;
     const bound = keyPolicy === null || gateway.detection === null ? null : parsePolicy(keyPolicy, gateway.detection.support);
     const all = bound?.ok ? layered(bound.value, onHeader, onSuffix) : sent;
-    if (hasRequirements(all) && !someRouteMeets(routes, all)) {
-      return block(`no route the model list publishes for ${splitModel(wireModel).id} meets the policy${bound?.ok ? " combined with the key's own" : ""}, so the gateway would refuse it only after receiving the content`);
+    if (all !== null && hasRequirements(all) && !someRouteMeets(routes, all)) {
+      return block(`no route the model list publishes for ${splitModel(wireModel).id} meets the ${sent === null ? "key's own policy" : bound?.ok ? "policy combined with the key's own" : "policy"}, so the gateway would refuse it only after receiving the content`);
     }
   }
   return { action: "send", model: wireModel, header, sent, routes };

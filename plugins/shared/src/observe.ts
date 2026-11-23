@@ -14,8 +14,10 @@ import type { ResultHeaders } from "../../../core/src/index.ts";
 export interface Exchange {
   url: string;
   method: string;
-  /** The request body's top-level `model`, when the body is JSON text that has a string one. */
-  model: string | null;
+  /** The request body as sent, when it was text; null for a stream or bytes this reader cannot compare. */
+  body: string | null;
+  /** The key the request carried, as a bearer token or an `x-api-key`; null when it carried none. */
+  credential: string | null;
   routePolicy: string | null;
   status: number;
   result: ResultHeaders;
@@ -35,18 +37,15 @@ function isRegistry(value: unknown): value is Registry {
   return typeof value === "object" && value !== null && "listeners" in value && value.listeners instanceof Set;
 }
 
-function bodyModel(body: unknown): string | null {
-  if (typeof body !== "string") return null;
-  try {
-    const parsed: unknown = JSON.parse(body);
-    return typeof parsed === "object" && parsed !== null && "model" in parsed && typeof parsed.model === "string" ? parsed.model : null;
-  } catch {
-    return null;
-  }
+/** The key a request carried: a bearer token, or an `x-api-key` as the Messages API sends it. */
+function credentialOf(headers: Headers): string | null {
+  const bearer = /^Bearer (.+)$/i.exec(headers.get("authorization") ?? "")?.[1];
+  return bearer ?? headers.get("x-api-key");
 }
 
 function exchangeOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined, response: Response): Exchange {
   const request = input instanceof Request ? input : null;
+  const headers = new Headers(init?.headers ?? request?.headers);
   const values = (name: string): string[] => {
     const value = response.headers.get(name);
     return value === null ? [] : [value];
@@ -54,8 +53,9 @@ function exchangeOf(input: Parameters<typeof fetch>[0], init: RequestInit | unde
   return {
     url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
     method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
-    model: bodyModel(init?.body),
-    routePolicy: new Headers(init?.headers ?? request?.headers).get("route-policy"),
+    body: typeof init?.body === "string" ? init.body : null,
+    credential: credentialOf(headers),
+    routePolicy: headers.get("route-policy"),
     status: response.status,
     // Headers.get joins repeated field lines into one value, which the core's readers then reject as a whole:
     // the spec's test for a client that sees only joined values.

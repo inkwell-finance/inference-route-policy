@@ -30,13 +30,13 @@ await runRealHarness(
       writeFileSync(path, `providers:\n${entries.join("")}`);
       return path;
     },
-    launch: (provider) => ({
+    launch: (provider, plugin) => ({
       command: omp,
       args: [
         "--mode", "rpc",
         "--model", `${provider}/demo-model`,
         // Only this plugin: no discovered extensions, skills, rules, or context files, no tools, no title request.
-        "--no-extensions", "-e", join(REPO, "plugins/omp/src/index.ts"),
+        "--no-extensions", "-e", join(REPO, plugin === "shipped" ? "plugins/omp/src/index.ts" : "plugins/omp/e2e/faulty-plugin.ts"),
         "--no-skills", "--no-rules", "--no-context-files", "--no-tools", "--no-title", "--no-session",
       ],
     }),

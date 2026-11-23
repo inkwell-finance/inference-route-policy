@@ -14,7 +14,7 @@ after(async () => {
 
 /** What a harness transport does: POST a JSON body with headers through the global fetch. */
 async function post(body: unknown, headers: Record<string, string> = {}): Promise<Response> {
-  return fetch(`${gateway.base}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  return fetch(`${gateway.base}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer demo-key", ...headers }, body: JSON.stringify(body) });
 }
 
 test("C5: the result headers of a 400 refusal are read, though both harnesses' response hooks skip non-2xx responses", async () => {
@@ -28,8 +28,15 @@ test("C5: the result headers of a 400 refusal are read, though both harnesses' r
   assert.equal(seen.length, 1);
   const [exchange] = seen;
   assert.deepEqual(
-    { method: exchange?.method, model: exchange?.model, routePolicy: exchange?.routePolicy, status: exchange?.status, result: exchange?.result },
-    { method: "POST", model: "demo-model+only=nosuch", routePolicy: "zdr", status: 400, result: { applied: [], refused: ["reason=unsatisfiable"], evidence: [] } },
+    { method: exchange?.method, body: exchange?.body, credential: exchange?.credential, routePolicy: exchange?.routePolicy, status: exchange?.status, result: exchange?.result },
+    {
+      method: "POST",
+      body: JSON.stringify({ model: "demo-model+only=nosuch", messages: [] }),
+      credential: "demo-key",
+      routePolicy: "zdr",
+      status: 400,
+      result: { applied: [], refused: ["reason=unsatisfiable"], evidence: [] },
+    },
   );
 });
 
@@ -65,10 +72,10 @@ test("C1: observing never changes or blocks a request, even when a listener thro
   assert.equal(seen.length, 1, "a stopped listener hears nothing more");
 });
 
-test("C3: a request body that is not JSON text is observed with no model, so no sent request can match it", async () => {
+test("C3: a request body that is not text is observed with no body, so no request the plugin sent can match it", async () => {
   const seen: Exchange[] = [];
   const stop = observeExchanges((exchange) => seen.push(exchange));
-  await (await fetch(`${gateway.base}/chat/completions`, { method: "POST", body: new TextEncoder().encode("{\"model\":\"demo-model\"}") })).text();
+  await (await fetch(`${gateway.base}/chat/completions`, { method: "POST", headers: { "x-api-key": "anthropic-style" }, body: new TextEncoder().encode("{\"model\":\"demo-model\"}") })).text();
   stop();
-  assert.equal(seen[0]?.model, null);
+  assert.deepEqual([seen[0]?.body, seen[0]?.credential], [null, "anthropic-style"]);
 });

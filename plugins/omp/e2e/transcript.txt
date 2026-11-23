@@ -1,15 +1,15 @@
-Inference Route Policy: real omp against the demo stack (2026-11-23T17:41:00.854Z)
+Inference Route Policy: real omp against the demo stack (2026-11-23T18:30:50.766Z)
 $ node gateway/src/demo.ts --port 0
-demo stack: gateway http://127.0.0.1:63466/v1; plain provider http://127.0.0.1:63466/plain/v1; gateway with its model list withheld http://127.0.0.1:63472/v1
-isolated config: C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\agent\models.yml (providers gateway, withheld, plain; key demo-key-zdr carries the key policy zdr)
+demo stack: gateway http://127.0.0.1:51805/v1; plain provider http://127.0.0.1:51805/plain/v1; gateway with its model list withheld http://127.0.0.1:51806/v1
+isolated config: C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\agent\models.yml (providers gateway, withheld, plain; key demo-key-zdr carries the key policy zdr)
 
 == (a) honored: zdr through the gateway, checked against the model list
-$ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN)
+$ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63466/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:51805/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet
   -> {"id":"ask","type":"prompt","message":"Say hello."}
@@ -19,12 +19,12 @@ $ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-rout
   PASS
 
 == (b) refused before sending: only=nosuch with the model list held (C16)
-$ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN)
+$ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3)
   -> {"id":"set","type":"prompt","message":"/route only=nosuch"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- notify: Route policy set: only=nosuch
   <- notify: Route policy: only=nosuch (set in this session)
-     Gateway http://127.0.0.1:63466/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:51805/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet
   -> {"id":"ask","type":"prompt","message":"Say hello."}
@@ -35,34 +35,50 @@ $ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-rout
   PASS
 
 == (b) refused by the gateway: only=nosuch with the model list withheld
-$ omp --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN)
+$ omp --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3)
   -> {"id":"set","type":"prompt","message":"/route only=nosuch"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- notify: Route policy set: only=nosuch
   <- notify: Route policy: only=nosuch (set in this session)
-     Gateway http://127.0.0.1:63472/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:51806/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet
   -> {"id":"ask","type":"prompt","message":"Say hello."}
   turn ended; last assistant message: error: 400 Route policy unsatisfiable (type=invalid_request_error)
-raw-http-request=C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\home\.omp\logs\http-400-requests\1795455681904-3tvtd8o9z53xt.json
+raw-http-request=C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\home\.omp\logs\http-400-requests\1795458663655-29d5sd7cq6n21.json
   <- setStatus: route policy refused by the gateway: unsatisfiable
   <- notify: route policy refused by the gateway: unsatisfiable
   GET /__demo/requests: []
   PASS
 
 == (c) blocked: zdr against a base URL with no detection (the plain provider)
-$ omp --mode rpc --model plain/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-M9sTAN)
+$ omp --mode rpc --model plain/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\src\index.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63466/plain/v1: no detection (detection reply is not valid: status is 404, not 200)
+     Gateway http://127.0.0.1:51805/plain/v1: no detection (detection reply is not valid: status is 404, not 200)
      Last result: none yet
   -> {"id":"ask","type":"prompt","message":"Say hello."}
-  turn ended; last assistant message: error: Blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63466/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
-  <- setStatus: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63466/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
-  <- notify: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63466/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  turn ended; last assistant message: error: Blocked by the route policy plugin, nothing was sent: http://127.0.0.1:51805/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  <- setStatus: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:51805/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  <- notify: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:51805/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  GET /__demo/requests: []
+  PASS
+
+== (d) blocked: zdr through the gateway when the plugin fails inside its guard (its context's model accessor throws)
+$ omp --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\omp\e2e\faulty-plugin.ts --no-skills --no-rules --no-context-files --no-tools --no-title --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-omp-uH9RS3)
+  -> {"id":"set","type":"prompt","message":"/route zdr"}
+  -> {"id":"show","type":"prompt","message":"/route"}
+  <- notify: Route policy set: zdr
+  <- notify: Route policy: zdr (set in this session)
+     Gateway http://127.0.0.1:51805/v1: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Key policy (locked, applied by the gateway to every request with this key): zdr
+     Last result: none yet
+  -> {"id":"ask","type":"prompt","message":"Say hello."}
+  turn ended; last assistant message: error: Blocked by the route policy plugin, nothing was sent: the plugin failed: model unavailable (injected by the e2e runner)
+  <- setStatus: request blocked by the route policy plugin, nothing was sent: the plugin failed: model unavailable (injected by the e2e runner)
+  <- notify: request blocked by the route policy plugin, nothing was sent: the plugin failed: model unavailable (injected by the e2e runner)
   GET /__demo/requests: []
   PASS
 

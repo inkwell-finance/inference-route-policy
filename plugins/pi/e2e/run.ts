@@ -48,14 +48,14 @@ await runRealHarness(
       writeFileSync(path, `${JSON.stringify({ providers: Object.fromEntries(entries) }, null, 2)}\n`);
       return path;
     },
-    launch: (provider) => ({
+    launch: (provider, plugin) => ({
       command: process.execPath,
       args: [
         cli,
         "--mode", "rpc",
         "--model", `${provider}/demo-model`,
         // Only this plugin: no discovered extensions, skills, templates, or context files, no tools, no project trust.
-        "--no-extensions", "-e", join(REPO, "plugins/pi/src/index.ts"),
+        "--no-extensions", "-e", join(REPO, plugin === "shipped" ? "plugins/pi/src/index.ts" : "plugins/pi/e2e/faulty-plugin.ts"),
         "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-tools", "--no-approve", "--no-session",
       ],
     }),

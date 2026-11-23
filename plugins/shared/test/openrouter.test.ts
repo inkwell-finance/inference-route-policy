@@ -10,35 +10,34 @@ const provider = (text: string): Record<string, unknown> => {
   return translation.provider;
 };
 
-test("C9: notrain, only, and ignore map to the documented filters, and sort and order to the documented preferences", () => {
-  assert.deepEqual(provider("notrain"), { data_collection: "deny" });
+function refused(text: string, why: RegExp): void {
+  const translation = translateToOpenRouter(policy(text));
+  assert.ok(!translation.ok, `${text} should not translate`);
+  assert.match(translation.why, why);
+}
+
+test("C9: only and ignore map to the documented provider filters, and sort and order to the documented preferences", () => {
   assert.deepEqual(provider("only=aurora,basalt"), { only: ["aurora", "basalt"] });
   assert.deepEqual(provider("ignore=cobalt"), { ignore: ["cobalt"] });
   assert.deepEqual(provider("sort=throughput+order=basalt,aurora"), { sort: "throughput", order: ["basalt", "aurora"] });
+  assert.deepEqual(provider("only=aurora+ignore=cobalt+sort=price"), { only: ["aurora"], ignore: ["cobalt"], sort: "price" });
 });
 
-test("C9: bits maps to every documented quantization level at or above the floor, and unknown precision never qualifies", () => {
-  assert.deepEqual(provider("bits=8"), { quantizations: ["int8", "fp8", "mxfp8", "fp16", "bf16", "fp32"] });
-  assert.deepEqual(provider("bits=5"), { quantizations: ["int8", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32"] });
-  assert.deepEqual(provider("bits=32"), { quantizations: ["fp32"] });
-  assert.ok(!JSON.stringify(provider("bits=1")["quantizations"]).includes("unknown"));
-  const above = translateToOpenRouter(policy("bits=33"));
-  assert.equal(above.ok, false, "no level qualifies, and an empty list must not reach the wire");
-});
-
-test("C9: zdr, region, and attest have no hard filter there, so the whole policy is refused", () => {
-  for (const text of ["zdr", "notrain+zdr", "region=us", "attest=weights", "only=aurora+attest=prompt"]) {
-    const translation = translateToOpenRouter(policy(text));
-    assert.equal(translation.ok, false, text);
-  }
-  const zdr = translateToOpenRouter(policy("zdr"));
-  assert.ok(!zdr.ok);
-  assert.match(zdr.why, /Safety Retention/);
+test("C9: each requirement with no documented hard filter refuses the whole policy, for its own reason", () => {
+  refused("zdr", /zdr has no hard filter there \(its zdr field still admits Safety Retention endpoints\)/);
+  refused("notrain", /notrain has no hard filter there \(data_collection covers the model providers, not OpenRouter itself\)/);
+  refused("bits=8", /bits has no hard filter there \(quantizations names levels, not a floor on every weight\)/);
+  refused("region=us", /region has no request field there/);
+  refused("attest=weights", /attest has no counterpart there/);
+  // One unmappable requirement refuses a policy whose other parts map.
+  refused("only=aurora+notrain", /notrain has no hard filter/);
 });
 
 test("C9: an only list that combined to empty is refused rather than sent as an empty filter", () => {
   const empty = combinePolicies({ header: policy("only=aurora"), suffix: policy("only=basalt") });
-  assert.equal(translateToOpenRouter(empty).ok, false);
+  const translation = translateToOpenRouter(empty);
+  assert.ok(!translation.ok);
+  assert.match(translation.why, /only combines to an empty list/);
 });
 
 test("C9: translation applies only to OpenRouter's documented base URL", () => {

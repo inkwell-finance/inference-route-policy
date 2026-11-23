@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 12.
+Draft 13.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -634,8 +634,8 @@ adopted this protocol, by [translation](#clients).
 | -------- | ---- |
 | [OpenRouter](https://openrouter.ai/docs/features/provider-routing) `provider.only`, `ignore`, `order`, `sort` | `only`, `ignore`, `order`, `sort` |
 | OpenRouter `provider.zdr` | Not `zdr`: it admits endpoints that keep prompts for abuse review, which `zdr` counts as retention. |
-| OpenRouter `provider.data_collection: "deny"` | `notrain`, and `zdr` where retention is meant |
-| OpenRouter `provider.quantizations` | `bits`, as a floor instead of a vocabulary |
+| OpenRouter `provider.data_collection: "deny"` | Not `notrain` or `zdr`: it filters the model providers, and says nothing of what the gateway itself does with content. |
+| OpenRouter `provider.quantizations` | Near `bits`, but a list of named levels, not a floor on every weight as served. |
 | OpenRouter `provider.allow_fallbacks: false` with `order` | `only` with `order` |
 | OpenRouter `:nitro`, `:floor` | `+sort=throughput`, `+sort=price` |
 | OpenRouter regional hostnames | `region` |

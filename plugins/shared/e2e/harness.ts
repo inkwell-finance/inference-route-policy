@@ -245,8 +245,11 @@ export interface HarnessSpec {
   realConfig: readonly string[];
   /** Writes one provider per entry, each serving `demo-model`; returns the path written. */
   writeProviders(agentDir: string, providers: Readonly<Record<string, { baseUrl: string; apiKey: string }>>): string;
-  /** The command that starts the harness in RPC mode on `<provider>/demo-model` with the plugin loaded. */
-  launch(provider: string): { command: string; args: string[] };
+  /**
+   * The command that starts the harness in RPC mode on `<provider>/demo-model` with the plugin loaded: as shipped,
+   * or through `e2e/faulty-plugin.ts`, whose request hooks get a context that fails on `model`.
+   */
+  launch(provider: string, plugin: "shipped" | "faulty"): { command: string; args: string[] };
 }
 
 const ui = (line: RpcLine, method: string): boolean => line["type"] === "extension_ui_request" && line["method"] === method;
@@ -262,6 +265,7 @@ interface Case {
   name: string;
   provider: string;
   policy: string;
+  plugin?: "faulty";
   /** Checks what was observed; returns the failures. */
   check(observed: Observed): string[];
 }
@@ -315,11 +319,21 @@ const CASES: readonly Case[] = [
       ...expectNoProviderContent(observed),
     ],
   },
+  {
+    name: "(d) blocked: zdr through the gateway when the plugin fails inside its guard (its context's model accessor throws)",
+    provider: "gateway",
+    policy: "zdr",
+    plugin: "faulty",
+    check: (observed) => [
+      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: .*(model unavailable \(injected by the e2e runner\)|could not prepare the headers)/),
+      ...expectNoProviderContent(observed),
+    ],
+  },
 ];
 
 async function runCase(spec: HarnessSpec, sandbox: Sandbox, stack: DemoStack, transcript: Transcript, test: Case): Promise<string[]> {
   transcript.log(`\n== ${test.name}`);
-  const { command, args } = spec.launch(test.provider);
+  const { command, args } = spec.launch(test.provider, test.plugin ?? "shipped");
   const session = new RpcSession(command, args, sandbox, transcript);
   const shownFrom = (from: number): RpcLine[] => session.lines.slice(from).filter((line) => ui(line, "notify") || ui(line, "setStatus"));
   const log = (lines: RpcLine[]): void => {

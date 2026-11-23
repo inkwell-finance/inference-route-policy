@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { after, before, beforeEach, test } from "node:test";
+import { after, before, beforeEach, mock, test } from "node:test";
+import { adapterContract } from "../../shared/test/adapter-contract.ts";
 import { FakeHarness } from "../../shared/test/fake-harness.ts";
 import { fakeGateway, routeOpenRouterTo, type FakeGateway } from "../../shared/test/fixtures.ts";
-import { OPENROUTER_BASE } from "../../shared/src/openrouter.ts";
 import routePolicy from "../src/index.ts";
 
 delete process.env["ROUTE_POLICY"];
@@ -80,9 +80,30 @@ test("C1: pi: a failure inside the plugin blocks the request instead of sending 
   harness.resolveAuth = async () => {
     throw new Error("keychain locked");
   };
-  assert.equal((await harness.request()).sent, false);
+  // The header hook fails first, so the payload is blocked as one whose headers could not be prepared.
+  assert.match((await harness.request()).error ?? "", /could not prepare the headers of a request in flight/);
   assert.equal(gateway.inference().length, 0);
   assert.deepEqual(harness.handlerErrors, []);
+});
+
+test("C1: pi: header preparation that never finishes is bounded, and its request is blocked, not given an earlier preparation", async () => {
+  const harness = await pi("zdr");
+  // A request whose headers were prepared, but whose payload never came, leaves a send decision waiting.
+  await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: {} });
+  let calls = 0;
+  harness.resolveAuth = () => (calls++ === 0 ? new Promise(() => {}) : Promise.resolve({ ok: true, apiKey: "demo-key" }));
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const pending = harness.request();
+    await new Promise((resolve) => setImmediate(resolve));
+    mock.timers.tick(20_000);
+    const result = await pending;
+    assert.equal(result.sent, false);
+    assert.match(result.error ?? "", /could not prepare the headers of a request in flight/);
+  } finally {
+    mock.timers.reset();
+  }
+  assert.equal(gateway.inference().length, 0);
 });
 
 test("C5, C11: pi: a 503 refusal is shown with its reason", async () => {
@@ -92,20 +113,13 @@ test("C5, C11: pi: a 503 refusal is shown with its reason", async () => {
   assert.equal(notices(harness).at(-1), "route policy refused by the gateway: unavailable");
 });
 
-test("C8, C9: pi: for OpenRouter the policy is translated into its provider field, the suffix removed, and the result unconfirmed", async () => {
-  gateway.replies.detection = { status: 404 };
-  const harness = await pi("notrain+only=aurora");
-  harness.model = { id: "vendor/model+sort=price", baseUrl: OPENROUTER_BASE };
-  assert.ok((await harness.request({ model: harness.model.id, messages: [] })).sent);
-  assert.deepEqual(sentBody(), { model: "vendor/model", messages: [], provider: { data_collection: "deny", only: ["aurora"], sort: "price" } });
-  assert.equal(gateway.inference()[0]?.headers["route-policy"], undefined);
-  assert.match(notices(harness).at(-1) ?? "", /unconfirmed, not applied/);
-
-  await harness.command("route", "zdr");
-  assert.equal((await harness.request({ model: "vendor/model", messages: [] })).sent, false, "zdr has no hard filter there");
-  await harness.command("route", "notrain");
-  assert.equal((await harness.request({ model: "vendor/model", prompt: "x" })).sent, false, "only Chat Completions and Responses document the field");
+test("C1: pi: a payload naming another model than its headers were prepared for is blocked", async () => {
+  const harness = await pi("zdr");
+  const result = await harness.request({ model: "other-model", messages: [] });
+  assert.match(result.error ?? "", /the request's model is not the one its headers were prepared for/);
 });
+
+adapterContract("pi", pi, () => gateway);
 
 test("C10: pi: the held policy survives a session resume", async () => {
   const first = await pi("notrain");

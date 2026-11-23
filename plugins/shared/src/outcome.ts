@@ -17,6 +17,8 @@ export type Report =
   | { kind: "refused"; reason: RefusalReason | null; key: string | null }
   | { kind: "not-honored"; why: string }
   | { kind: "unconfirmed" }
+  /** A response from `base` that matches no request this client let through there, so nothing about it is known. */
+  | { kind: "untied"; base: string }
   | { kind: "blocked"; reason: string };
 
 /** Reads a response's result headers against what was sent (C3, C4, C5, C8). */
@@ -64,6 +66,8 @@ export function describeReport(report: Report): string {
       return `route policy NOT honored: ${report.why}`;
     case "unconfirmed":
       return "route policy translated into the gateway's own fields; the result is unconfirmed, not applied";
+    case "untied":
+      return `a response from ${report.base} could not be tied to the request it answers; nothing about it is confirmed, and that gateway's detection reply will be fetched again`;
     case "blocked":
       return `request blocked by the route policy plugin, nothing was sent: ${report.reason}`;
   }

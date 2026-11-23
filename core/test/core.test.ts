@@ -420,7 +420,11 @@ test("G13: no layer removes or weakens a requirement of another", () => {
 test("S13: a reader lets through fact keys and attest items it does not know, and they change nothing it matches", () => {
   assert.deepEqual(facts(""), { zdr: false, notrain: false, bits: null, region: null, attest: [] });
   const read = facts("zdr+bits=8+region=us,de+attest=weights,later+later+newkey=x,y+provider=p+constructor=x");
-  assert.deepEqual(read, { zdr: true, notrain: false, bits: 8, region: ["us", "de"], attest: ["weights", "later"] });
+  assert.deepEqual(read, { zdr: true, notrain: false, bits: 8, region: ["us", "de"], attest: ["weights"] });
+  // An unknown item is ignored, not kept: the facts read the same with or without it.
+  assert.deepEqual(facts("attest=prompt,next"), facts("attest=prompt"));
+  assert.deepEqual(facts("attest=next").attest, []);
+  assert.deepEqual(facts("attest=next,later"), facts(""));
   const route = { provider: "a", facts: read };
   assert.equal(meets(route, policy("zdr+bits=8+region=us,de+attest=weights")), true);
   assert.equal(meets(route, policy("notrain")), false);
@@ -867,7 +871,7 @@ test("G23, C4: a model's published routes are read by provider, and a repeated o
   assert.equal(routes.get("twice"), null);
   assert.deepEqual(routes.get("badevidence"), { facts: facts("attest=weights"), evidence: null });
   // A row from a gateway on a later revision is read as a client reads facts, not as a gateway publishes them.
-  assert.deepEqual(routes.get("newer"), { facts: facts("zdr+attest=weights,later"), evidence: null });
+  assert.deepEqual(routes.get("newer"), { facts: facts("zdr+attest=weights"), evidence: null });
 
   // Three occurrences are still not one, and inherited members are not the entry's own.
   assert.equal(parseRoutes([{ provider: "p", facts: "zdr" }, { provider: "p", facts: "zdr" }, { provider: "p", facts: "zdr" }]).get("p"), null);

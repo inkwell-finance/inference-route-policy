@@ -17,8 +17,6 @@ const BASELINE_SORT: readonly string[] = ["price", "latency", "throughput"];
 
 /** Keys whose presence restricts which routes qualify. `sort` and `order` only order them. */
 const REQUIREMENT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore"];
-/** The keys a route's facts may carry. */
-const FACT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest"];
 /** Keys a route's facts may never carry, because they are not facts. */
 const NOT_FACTS: readonly string[] = ["only", "ignore", "sort", "order"];
 
@@ -71,7 +69,7 @@ interface FactsFields {
   readonly notrain: boolean;
   readonly bits: number | null;
   readonly region: readonly string[] | null;
-  /** May hold items this revision does not define, read from a gateway on a later one. They match nothing here. */
+  /** Only items this revision defines. One it does not define, read from a gateway on a later revision, is ignored. */
   readonly attest: readonly string[];
 }
 
@@ -349,7 +347,7 @@ function readFacts(text: string, publishing: boolean): Result<Facts> {
       case "attest":
         if (value === true) return fail(key, "takes a list");
         if (publishing && !value.every((item) => BASELINE_ATTEST.includes(item))) return fail(key, "holds an attest value this revision does not define");
-        facts.attest = value;
+        facts.attest = value.filter((item) => BASELINE_ATTEST.includes(item));
         return null;
       default:
         return NOT_FACTS.includes(key) || publishing ? fail(key, "is not a fact") : null;

@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer, request, type Server } from "node:http";
 import { test, type TestContext } from "node:test";
-import { createGateway, ENDPOINTS, type Endpoint, type Route } from "../src/gateway.ts";
+import { createGateway, ENDPOINTS, type Route } from "../src/gateway.ts";
 import { serve } from "../src/serve.ts";
 import { startDemo } from "../src/demo.ts";
 
 const model = "demo-model";
 const route = (provider: string, url: string): Route => ({ provider, url, facts: "zdr", price: 1, latencyMs: 1, throughput: 1 });
-const target = (id: string, endpoint: Endpoint = "chat/completions", streaming = false) => ({ method: "POST", body: JSON.stringify({ model: id, stream: streaming }), headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(3000) });
+const target = (id: string, streaming = false) => ({ method: "POST", body: JSON.stringify({ model: id, stream: streaming }), headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(3000) });
 async function listening(t: TestContext, server: Server): Promise<string> {
   t.after(() => { server.closeAllConnections(); server.close(); });
   if (!server.listening) await once(server, "listening");
@@ -50,7 +50,7 @@ for (const endpoint of ENDPOINTS) {
       return new Response(new ReadableStream<Uint8Array>({ start: (controller) => ready(controller) }), { headers: { "content-type": "text/event-stream" } });
     } });
     const base = await listening(t, serve(handler, 0));
-    const pending = fetch(`${base}/v1/${endpoint}`, target(`${model}+zdr`, endpoint, true));
+    const pending = fetch(`${base}/v1/${endpoint}`, target(`${model}+zdr`, true));
     const controller = await controllerReady;
     const response = await pending;
     assert.equal(response.status, 200);
@@ -102,7 +102,7 @@ test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, a
   ] }] });
   for (const endpoint of ENDPOINTS) {
     for (const stream of [false, true]) {
-      const init = target(`${model}+attest=weights`, endpoint, stream);
+      const init = target(`${model}+attest=weights`, stream);
       const response = await fetch(`${base}/v1/${endpoint}`, { ...init, headers: { ...init.headers, [endpoint === "messages" ? "x-api-key" : "authorization"]: endpoint === "messages" ? "demo-key" : "Bearer demo-key", "Route-Policy": "bits=16" } });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("route-evidence"), "https://basalt.example/attestation");

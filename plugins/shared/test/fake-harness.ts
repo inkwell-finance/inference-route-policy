@@ -26,7 +26,7 @@ export class FakeHarness {
   readonly shown: Shown[] = [];
   /** Errors the runtime caught from handlers, as it would report them. */
   readonly handlerErrors: string[] = [];
-  model: { id: string; baseUrl: string; headers?: Record<string, string> };
+  model: { id: string; baseUrl: string; api: string; headers?: Record<string, string> };
   /** What `modelRegistry.getApiKeyAndHeaders` does; tests replace it to make the plugin fail. */
   resolveAuth: () => Promise<unknown> = async () => ({ ok: true, apiKey: "demo-key" });
   uiThrows = false;
@@ -41,7 +41,7 @@ export class FakeHarness {
   };
 
   constructor(baseUrl: string, options: { headerHook: boolean }) {
-    this.model = { id: "demo-model", baseUrl };
+    this.model = { id: "demo-model", baseUrl, api: "openai-completions" };
     this.headerHook = options.headerHook;
   }
 

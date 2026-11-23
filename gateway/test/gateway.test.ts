@@ -140,7 +140,7 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(calls.map((row) => row.provider), ["basalt", "basalt"]);
   });
 
-  test(`G5 G16 G26 G33 G34 G35 G37 ${mode}: retry eligible 429, network and 5xx; do not turn ordinary errors into refusals`, async () => {
+  test(`G5 G16 G26 G33 G34 G35 G37 G39 ${mode}: retry eligible failures; without policy keep the relayed status and omit refusal and evidence`, async () => {
     const { gateway, calls } = setup(({ provider }) => {
       if (provider === "aurora") return new Response("do not relay 429", { status: 429 });
       if (provider === "basalt") throw new TypeError("network error");
@@ -156,13 +156,15 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.equal(await relayed.text(), "upstream result");
     assert.deepEqual(calls.splice(0).map((row) => row.provider), ["basalt", "cobalt"]);
     const plain = await gateway(call());
-    noHeaders(plain);
+    assert.equal(plain.headers.get("route-refused"), null);
+    assert.equal(plain.headers.get("route-evidence"), null);
     assert.equal(plain.status, 418);
     assert.equal(await plain.text(), "upstream result");
     assert.deepEqual(calls.splice(0).map((row) => row.provider), ["aurora", "basalt", "cobalt"]);
     const allFail = setup(() => new Response("private provider error", { status: 502 }));
     const failure = await allFail.gateway(call());
-    noHeaders(failure);
+    assert.equal(failure.headers.get("route-refused"), null);
+    assert.equal(failure.headers.get("route-evidence"), null);
     assert.equal(failure.status, 503);
     assert.doesNotMatch(await failure.text(), /private provider error/);
     const qualified = await allFail.gateway(call(model, "open", "only=basalt"));

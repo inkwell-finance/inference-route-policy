@@ -1,7 +1,7 @@
 /**
  * The plugin's state for one harness session: the held policy, what it has fetched from each gateway, and the
  * requests it let through, so it can read their results. Detection replies and model lists live only in this
- * object, keyed by base URL and credential (C14), and are never written anywhere (C15).
+ * object, keyed by base URL and credential together (C14), and are never written anywhere (C15).
  */
 
 import { hasRequirements, parsePolicy, type Detection } from "../../../core/src/index.ts";
@@ -26,11 +26,13 @@ export interface RouteClientOptions {
   onReport: (report: Report) => void;
 }
 
-/** A request this client let through, as it will appear on the wire, and what to read its response against. */
+/** A request this client let through, exactly as it went on the wire, and what to read its response against. */
 interface Pending {
   base: string;
+  credential: string | null;
   cacheKey: string;
-  model: string;
+  /** The serialized body, which ties a response to this request and no other. */
+  body: string;
   header: string | null;
   sent: Sent;
   requirement: boolean;
@@ -43,8 +45,12 @@ export class RouteClient {
   held: Held;
   lastReport: Report | null = null;
   readonly #options: RouteClientOptions;
+  // In-flight and settled reads, by base URL and credential. A settled failure is not kept.
   readonly #detections = new Map<string, Promise<DetectionResult>>();
   readonly #lists = new Map<string, Promise<unknown>>();
+  // What is held now, for a request that may use what is held but would not fetch anything itself.
+  readonly #heldDetections = new Map<string, Detection>();
+  readonly #heldLists = new Map<string, unknown>();
   readonly #pending: Pending[] = [];
 
   constructor(options: RouteClientOptions) {
@@ -62,15 +68,19 @@ export class RouteClient {
 
   #key = (target: Target): string => `${normalizeBase(target.base)}\n${target.credential ?? ""}`;
 
-  /** The cached detection result for a target, fetching it when there is none. Failures are not cached. */
+  /** The detection result for a target, fetching it when none is held or in flight. */
   #detection(target: Target): Promise<DetectionResult> {
     const key = this.#key(target);
     let pending = this.#detections.get(key);
     if (pending === undefined) {
-      pending = fetchDetection(this.#fetch, target, this.#options.timeoutMs ?? 5000);
-      this.#detections.set(key, pending);
-      void pending.then((result) => {
-        if (!result.ok && this.#detections.get(key) === pending) this.#detections.delete(key);
+      const read = fetchDetection(this.#fetch, target, this.#options.timeoutMs ?? 5000);
+      pending = read;
+      this.#detections.set(key, read);
+      void read.then((result) => {
+        // A discard while the read was in flight wins: the result is dropped with it.
+        if (this.#detections.get(key) !== read) return;
+        if (result.ok) this.#heldDetections.set(key, result.detection);
+        else this.#detections.delete(key);
       });
     }
     return pending;
@@ -80,45 +90,59 @@ export class RouteClient {
     const key = this.#key(target);
     let pending = this.#lists.get(key);
     if (pending === undefined) {
-      pending = fetchModelList(this.#fetch, target, this.#options.timeoutMs ?? 5000);
-      this.#lists.set(key, pending);
-      void pending.then((list) => {
-        if (list === null && this.#lists.get(key) === pending) this.#lists.delete(key);
+      const read = fetchModelList(this.#fetch, target, this.#options.timeoutMs ?? 5000);
+      pending = read;
+      this.#lists.set(key, read);
+      void read.then((list) => {
+        if (this.#lists.get(key) !== read) return;
+        if (list === null) this.#lists.delete(key);
+        else this.#heldLists.set(key, list);
       });
     }
     return pending;
   }
 
+  /** C14: the detection reply for this base URL and credential can no longer be trusted. */
+  #discardDetection(cacheKey: string): void {
+    this.#detections.delete(cacheKey);
+    this.#heldDetections.delete(cacheKey);
+  }
+
   /**
    * Decides one request. `model` is its `model` field and `configured` a `Route-Policy` value the harness sends
    * on its own. Reads the gateway first when the decision needs it: detection whenever a policy reaches the
-   * request, the model list when one of them has a requirement and the gateway speaks this protocol.
+   * request, the model list when a requirement does, the key's own included. A request no policy reaches fetches
+   * nothing, but is still judged against what is already held for its base URL and credential (C16).
    */
   async decide(target: Target, model: string, configured: string | null): Promise<Decision> {
     const layers = readLayers(this.held, model, configured);
     if (!layers.ok) return { action: "block", reason: layers.reason };
     const base = normalizeBase(target.base);
-    let detection: Detection | null = null;
+    const key = this.#key(target);
+    let detection: Detection | null = this.#heldDetections.get(key) ?? null;
     let noDetection = "not fetched";
-    let modelList: { list: unknown } | null = null;
+    let modelList: { list: unknown } | null = this.#heldLists.has(key) ? { list: this.#heldLists.get(key) } : null;
     if (anyPolicy(layers.value)) {
       const result = await this.#detection(target);
-      if (result.ok) detection = result.detection;
-      else noDetection = result.why;
-      if (detection !== null && anyRequirement(layers.value) && !isOpenRouter(base)) {
+      detection = result.ok ? result.detection : null;
+      if (!result.ok) noDetection = result.why;
+      const bound = detection?.keyPolicy == null ? null : parsePolicy(detection.keyPolicy, detection.support);
+      const requirement = anyRequirement(layers.value) || (bound?.ok === true && hasRequirements(bound.value));
+      if (detection !== null && requirement && !isOpenRouter(base)) {
         const list = await this.#modelList(target);
-        if (list !== null) modelList = { list };
+        modelList = list === null ? null : { list };
       }
     }
     return decide(layers.value, this.#options.carriers, { base, detection, noDetection, modelList });
   }
 
-  /** Records a request the caller is about to let through with this decision, so its response can be read. */
-  sending(target: Target, decision: Exclude<Decision, { action: "block" }>): void {
+  /** Records a request the caller is about to let through, with the exact body it will send. */
+  sending(target: Target, decision: Exclude<Decision, { action: "block" }>, body: string): void {
     this.#pending.push({
       base: normalizeBase(target.base),
+      credential: target.credential,
       cacheKey: this.#key(target),
-      model: decision.model,
+      body,
       header: decision.action === "send" ? decision.header : null,
       sent: decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes },
       requirement: decision.sent !== null && hasRequirements(decision.sent),
@@ -131,17 +155,28 @@ export class RouteClient {
     this.#report({ kind: "blocked", reason });
   }
 
-  /** Reads a response if it answers a request this client let through. */
+  /**
+   * Reads a response if it answers a request this client let through: same base URL, same credential, same
+   * body, same `Route-Policy`. A response to this base URL and credential that matches none while a request with
+   * a requirement is outstanding there cannot be tied to its request: nothing about it is confirmed, and the
+   * detection reply it might have answered is no longer trusted.
+   */
   observe(exchange: Exchange): void {
     if (exchange.method !== "POST") return;
-    const index = this.#pending.findIndex(
-      (p) => exchange.url.startsWith(`${p.base}/`) && exchange.model === p.model && exchange.routePolicy === p.header,
-    );
-    if (index < 0) return;
+    const here = this.#pending.filter((p) => exchange.url.startsWith(`${p.base}/`) && exchange.credential === p.credential);
+    if (here.length === 0) return;
+    const index = this.#pending.findIndex((p) => here.includes(p) && exchange.body === p.body && exchange.routePolicy === p.header);
+    if (index < 0) {
+      const outstanding = here.filter((p) => p.requirement);
+      if (outstanding.length === 0) return;
+      for (const p of outstanding) this.#discardDetection(p.cacheKey);
+      this.#report({ kind: "untied", base: outstanding[0]!.base });
+      return;
+    }
     const [pending] = this.#pending.splice(index, 1);
     const report = interpret(exchange.result, pending!.sent);
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
-    if (report.kind === "not-honored" && pending!.requirement) this.#detections.delete(pending!.cacheKey);
+    if (report.kind === "not-honored" && pending!.requirement) this.#discardDetection(pending!.cacheKey);
     this.#report(report);
   }
 
@@ -159,7 +194,7 @@ export class RouteClient {
       const base = normalizeBase(target.base);
       const result = await this.#detection(target);
       if (!result.ok) {
-        lines.push(`Gateway ${base}: no detection (${result.why})${isOpenRouter(base) ? "; policies are translated into OpenRouter's own fields" : ""}`);
+        lines.push(`Gateway ${base}: no detection (${result.why})${isOpenRouter(base) ? "; policies are translated into OpenRouter's own fields where it has a filter for them" : ""}`);
       } else {
         const { support, keyPolicy } = result.detection;
         lines.push(`Gateway ${base}: detection valid; accepts ${[...support.keys].join(", ")}`);

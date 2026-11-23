@@ -2,17 +2,23 @@ import { request as http } from "node:http";
 import { request as https } from "node:https";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 
+export interface Credential {
+  key: string;
+  header: "authorization" | "x-api-key";
+}
+
 export interface Probe {
   path: string;
-  key?: string;
-  omitKey?: boolean;
+  credential?: Credential;
   raw?: string;
   policies?: readonly string[];
+  mixedCasePolicy?: boolean;
 }
 
 export interface Observation {
   status: number;
   body: unknown;
+  hasBody: boolean;
   contentType: string | undefined;
   applied: string[];
   refused: string[];
@@ -20,16 +26,19 @@ export interface Observation {
   received: string;
 }
 
-export async function request(base: string, probe: Probe, key: string | undefined, timeoutMs: number): Promise<Observation> {
+const policyHeader = (index: number, mixedFirst = false): string => (index % 2 === 0) !== mixedFirst ? "Route-Policy" : "rOuTe-PoLiCy";
+
+export async function request(base: string, probe: Probe, timeoutMs: number): Promise<Observation> {
   const target = new URL(`${base}/${probe.path}`);
   const headers = ["host", target.host, "accept-encoding", "identity"];
-  if (key !== undefined) {
-    if (probe.path === "messages") headers.push("x-api-key", key, "anthropic-version", "2023-06-01");
-    else headers.push("authorization", `Bearer ${key}`);
-  } else if (probe.path === "messages") headers.push("anthropic-version", "2023-06-01");
+  if (probe.credential !== undefined) {
+    const { key, header } = probe.credential;
+    headers.push(header, header === "authorization" ? `Bearer ${key}` : key);
+  }
+  if (probe.path === "messages") headers.push("anthropic-version", "2023-06-01");
   const post = probe.raw !== undefined;
   if (post) headers.push("content-type", "application/json", "content-length", String(Buffer.byteLength(probe.raw!)));
-  for (const [i, value] of (probe.policies ?? []).entries()) headers.push(i % 2 === 0 ? "Route-Policy" : "rOuTe-PoLiCy", value);
+  for (const [i, value] of (probe.policies ?? []).entries()) headers.push(policyHeader(i, probe.mixedCasePolicy), value);
 
   return new Promise((resolve, reject) => {
     const req = (target.protocol === "https:" ? https : http)(target, {
@@ -51,7 +60,7 @@ export async function request(base: string, probe: Probe, key: string | undefine
         // No conformance check requires the contents of a streaming relay.
         reply.on("error", () => {});
         reply.destroy();
-        resolve({ ...result, body: undefined, received: JSON.stringify({ ...result, body: "<event stream>" }) });
+        resolve({ ...result, body: undefined, hasBody: false, received: JSON.stringify({ ...result, body: "<event stream>" }) });
         return;
       }
       const chunks: Buffer[] = [];
@@ -70,7 +79,7 @@ export async function request(base: string, probe: Probe, key: string | undefine
           const text = bytes.toString("utf8");
           let body: unknown;
           try { body = JSON.parse(text); } catch { body = undefined; }
-          resolve({ ...result, body, received: JSON.stringify({ ...result, body: text.length <= 512 ? text : `${text.slice(0, 512)}…` }) });
+          resolve({ ...result, body, hasBody: text.trim().length !== 0, received: JSON.stringify({ ...result, body: text.length <= 512 ? text : `${text.slice(0, 512)}…` }) });
         } catch (error) { reject(error); }
       });
     });
@@ -79,7 +88,7 @@ export async function request(base: string, probe: Probe, key: string | undefine
   });
 }
 
-export function sent(probe: Probe, key: string | undefined): string {
-  const fields = probe.policies?.map((value) => value.length <= 560 ? value : `${value.slice(0, 560)}…`);
-  return JSON.stringify({ method: probe.raw === undefined ? "GET" : "POST", path: `/${probe.path}`, credentialed: key !== undefined, routePolicyLines: fields, body: probe.raw });
+export function sent(probe: Probe): string {
+  const fields = probe.policies?.map((value, i) => [policyHeader(i, probe.mixedCasePolicy), value.length <= 560 ? value : `${value.slice(0, 560)}…`]);
+  return JSON.stringify({ method: probe.raw === undefined ? "GET" : "POST", path: `/${probe.path}`, credentialHeader: probe.credential?.header ?? null, routePolicyLines: fields, body: probe.raw });
 }

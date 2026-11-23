@@ -5,7 +5,7 @@ import { formatApplied, formatRefused, splitModel } from "../../core/src/index.t
 import { startDemo } from "../../gateway/src/demo.ts";
 import { createGateway, type RequestHandler, type Route } from "../../gateway/src/gateway.ts";
 import { serve } from "../../gateway/src/serve.ts";
-import { INFERENCE_ENDPOINTS, runConformance } from "../src/suite.ts";
+import { INFERENCE_ENDPOINTS, runConformance, type Endpoint } from "../src/suite.ts";
 
 const key = "probe-key";
 const policyKey = "probe-policy-key";
@@ -131,13 +131,13 @@ const faults: Record<Id, Mutation> = {
   },
 };
 
-async function run(t: TestContext, handler: RequestHandler) {
+async function run(t: TestContext, handler: RequestHandler, endpoints: readonly Endpoint[] = ["chat/completions"]) {
   const server = serve(handler, 0);
   t.after(() => { server.closeAllConnections(); server.close(); });
   await once(server, "listening");
   const address = server.address();
   assert.ok(address !== null && typeof address !== "string");
-  return runConformance({ base: `http://127.0.0.1:${address.port}/v1`, key, policyKey, endpoints: ["chat/completions"] });
+  return runConformance({ base: `http://127.0.0.1:${address.port}/v1`, key, policyKey, endpoints });
 }
 
 test(`${idList.join(" ")}: the reference implementation passes every black-box check without model or provider assumptions`, async (t) => {
@@ -154,6 +154,117 @@ for (const id of idList) test(`${id}: conformance rejects the gateway that break
   assert.equal(failure.status, "FAIL", JSON.stringify(report.checks.filter((check) => check.status !== "PASS")));
   assert.match(failure.detail, /sent \{.*; received .*; required:/);
   assert.ok(report.failed > 0);
+});
+
+test("G10 G13 G23: each credential's own catalog determines its model and matching routes", async (t) => {
+  const catalogReads: string[] = [];
+  const scopedGateways = new Map<string, RequestHandler>();
+  for (const carrier of ["bearer", "api"] as const) {
+    for (const role of ["ordinary", "bound"] as const) {
+      const id = `${carrier}/${role}-model`;
+      const localRoutes = routes.map((route, i) => ({ ...route, provider: `${carrier}-${role}-${i}` })).reverse();
+      scopedGateways.set(id, createGateway({
+        models: { [id]: localRoutes, [`${id}-aux`]: [{ ...routes[0]!, provider: "routeprobe0" }] },
+        keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+        fetch: () => Response.json({ output: "served" }),
+      }));
+    }
+  }
+  const report = await run(t, (request, transport) => {
+    const bearer = request.headers.get("authorization");
+    const apiKey = request.headers.get("x-api-key");
+    const carrier = apiKey === null ? "bearer" : "api";
+    const role = apiKey === policyKey || bearer === `Bearer ${policyKey}` ? "bound" : "ordinary";
+    const id = `${carrier}/${role}-model`;
+    if (new URL(request.url).pathname === "/v1/models") catalogReads.push(id);
+    const handler = scopedGateways.get(id);
+    assert.ok(handler);
+    return handler(request, transport);
+  }, INFERENCE_ENDPOINTS);
+  assert.deepEqual(catalogReads.sort(), [...scopedGateways.keys()].sort());
+  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+});
+
+function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "nested-type" | "array-member-type" | "empty-body"): RequestHandler {
+  return async (request, transport) => {
+    const reply = await good(request, transport);
+    if (request.method !== "POST" || reply.status < 400) return reply;
+    const body: unknown = await reply.json();
+    assert.ok(body !== null && typeof body === "object" && "error" in body && body.error !== null && typeof body.error === "object");
+    const refused = reply.headers.has(refusal);
+    const error = {
+      ...body.error,
+      code: refused ? "policy_refusal" : "bad_request",
+      details: { retryable: defect === "nested-type" && refused ? "no" : false },
+    };
+    if (defect === "missing-envelope" && refused) return change(reply, { body: JSON.stringify({ error }) });
+    if (defect === "empty-body" && refused) return change(reply, { body: "" });
+    const issues = refused ? [{ severity: 1 }] : [{ severity: 1 }, { severity: 2 }];
+    const envelope = {
+      ...body, error,
+      problem: {
+        issues: defect === "array-member-type" && refused ? [...issues, { severity: "low" }] : issues,
+        category: refused ? "policy" : "input",
+      },
+      request_id: refused ? "second" : "first",
+    };
+    return change(reply, { body: JSON.stringify(envelope) });
+  };
+}
+
+test("G34: matching nested envelopes may have different codes, messages, and list lengths", async (t) => {
+  const report = await run(t, gatewayWithEnrichedErrors());
+  assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
+});
+
+for (const defect of ["missing-envelope", "nested-type", "array-member-type", "empty-body"] as const) {
+  test(`G34: conformance rejects ${defect} in a refusal against an endpoint with enriched errors`, async (t) => {
+    const report = await run(t, gatewayWithEnrichedErrors(defect));
+    assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS").map(({ id, status }) => [id, status]), [["G34", "FAIL"]]);
+  });
+}
+
+test("G25: a model not published in the catalog can still resolve", async (t) => {
+  let undisclosedRequests = 0;
+  const report = await run(t, fixture(({ id, next, request, transport, suffix, body }) => {
+    if (!id.startsWith("route-conformance-unknown-")) return next();
+    undisclosedRequests++;
+    const resolved = suffix === null ? model : `${model}+${suffix}`;
+    return good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model: resolved }) }), transport);
+  }));
+  assert.equal(undisclosedRequests, 1);
+  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+});
+
+test("G6: pinning a second provider catches a gateway that always uses the first one for only", async (t) => {
+  const report = await run(t, fixture(({ header, next, rewrite }) => header === "only=basalt" ? rewrite({ header: "only=aurora" }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
+});
+
+test("G9: rejecting raw duplicates does not excuse ignoring an unsatisfiable single header", async (t) => {
+  const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "bits=64" && suffix === null ? rewrite({ header: null }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G9")?.status, "FAIL");
+});
+
+test("G17: attest in the bound policy requires evidence even with no explicit carrier", async (t) => {
+  const target = createGateway({
+    models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "attest=weights" } },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, async (request, transport) => {
+    const reply = await target(request, transport);
+    if (request.method !== "POST" || request.headers.get("authorization") !== `Bearer ${policyKey}` || request.headers.has("route-policy")) return reply;
+    return change(reply, { replace: { [evidence]: null } });
+  });
+  assert.equal(report.checks.find(({ id }) => id === "G17")?.status, "FAIL");
+});
+
+test("G21: an applied header does not mask rejection of a valid listed value", async (t) => {
+  const report = await run(t, fixture(async ({ header, next }) => {
+    const reply = await next();
+    return header === "bits=32" ? change(reply, { replace: { [applied]: formatApplied("aurora"), [refusal]: formatRefused("unsupported", "bits") } }) : reply;
+  }));
+  assert.equal(report.checks.find(({ id }) => id === "G21")?.status, "FAIL");
 });
 
 test("G9 G15 G17 G25 G34: the real demo passes on all requested endpoints with zero skips", async (t) => {

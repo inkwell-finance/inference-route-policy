@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, mock, test } from "node:test";
+import { adapterContract } from "../../shared/test/adapter-contract.ts";
 import { FakeHarness } from "../../shared/test/fake-harness.ts";
-import { fakeGateway, type FakeGateway } from "../../shared/test/fixtures.ts";
+import { fakeGateway, routeOpenRouterTo, type FakeGateway } from "../../shared/test/fixtures.ts";
 import routePolicy from "../src/index.ts";
 
 delete process.env["ROUTE_POLICY"];
+routeOpenRouterTo(() => gateway.base);
 
 let gateway: FakeGateway;
 before(async () => {
@@ -142,4 +144,13 @@ test("C15: omp: the session records the held policy and nothing a gateway said",
   await harness.request();
   await harness.command("route", "");
   assert.deepEqual(harness.entries.map((e) => [e.customType, e.data]), [["inference-route-policy", { policy: "zdr" }]]);
+});
+
+adapterContract("omp", omp, () => gateway);
+
+test("C10: omp: a request with no model field to carry the policy in is blocked", async () => {
+  const harness = await omp("zdr");
+  const result = await harness.request({ messages: [] });
+  assert.match(result.error ?? "", /the request has no model field to carry the policy/);
+  assert.equal(gateway.inference().length, 0);
 });
