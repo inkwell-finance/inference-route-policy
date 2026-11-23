@@ -25,6 +25,7 @@ import {
   parseRefused,
   publishedRoutes,
   readOutcome,
+  readRefusal,
   someRouteMeets,
   splitModel,
   supports,
@@ -1226,6 +1227,16 @@ test("G35: explicit order beats rank for the providers it names", () => {
   assert.equal(ids("order=a,c+sort=price"), "acb");
   assert.equal(ids("order=c,b,a"), "cba");
   assert.equal(ids("sort=price"), "bca");
+});
+
+test("C5: readRefusal reports a refusal for any Route-Refused, readable or not, and none without one", () => {
+  const headers = (refused: string[]) => ({ applied: ["provider=aurora"], refused, evidence: [] });
+  assert.equal(readRefusal(headers([])), null);
+  assert.deepEqual(readRefusal(headers(["reason=unsupported+key=tier"])), { reason: "unsupported", key: "tier" });
+  assert.deepEqual(readRefusal(headers(["reason=unsatisfiable"])), { reason: "unsatisfiable", key: null });
+  assert.deepEqual(readRefusal(headers(["nonsense"])), { reason: null, key: null });
+  assert.deepEqual(readRefusal(headers([""])), { reason: null, key: null });
+  assert.deepEqual(readRefusal(headers(["reason=unsatisfiable", "reason=unsatisfiable"])), { reason: null, key: null });
 });
 
 test("C5: a refusal of an attest policy is a refusal, although it carries no evidence", () => {

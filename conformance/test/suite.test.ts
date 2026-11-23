@@ -161,6 +161,137 @@ for (const id of idList) test(`${id}: conformance rejects the gateway that break
   assert.ok(report.failed > 0);
 });
 
+test("G20 G22: an anonymous key_policy makes the full detection reply invalid", async (t) => {
+  const report = await run(t, fixture(faults.G22));
+  for (const id of ["G20", "G22"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+});
+
+test("G20 G22: a credentialed key_policy must use its own complete advertised support", async (t) => {
+  const report = await run(t, fixture(({ path, auth, next }) => path === "/v1/route-policy" && auth === `Bearer ${policyKey}`
+    ? Response.json({ route_policy: "1", keys: ["sort"], sort: ["price"], key_policy: "sort=latency" })
+    : next()));
+  for (const id of ["G20", "G22"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+});
+
+test("G23: a catalog cannot substitute a display alias for its base entry", async (t) => {
+  const report = await run(t, fixture(({ path, next }) => path === "/v1/models"
+    ? Response.json({ data: [{ id: `${model}+zdr`, routes: published }, { id: `${model}-other`, routes: published }] })
+    : next()));
+  const verdict = report.checks.find(({ id }) => id === "G23");
+  assert.equal(verdict?.status, "FAIL");
+  assert.match(verdict.detail, /display alias .* has no base model/);
+});
+
+test("G23: a display alias may appear before its base entry", async (t) => {
+  const report = await run(t, fixture(({ path, next }) => path === "/v1/models"
+    ? Response.json({ data: [{ id: `${model}+zdr`, routes: published }, { id: model, routes: published }] })
+    : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G23")?.status, "PASS");
+  assert.equal(report.failed, 0);
+});
+
+test("G1 G29: an unlisted preference cannot turn into unavailable on an advertisement probe", async (t) => {
+  const report = await run(t, fixture(async ({ header, next }) => {
+    const reply = await next();
+    return header === "sort=probe0" ? change(reply, { status: 503, replace: { [refusal]: formatRefused("unavailable") } }) : reply;
+  }));
+  for (const id of ["G1", "G29"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+});
+
+test("G2: unsupported key attribution is also checked on advertisement probes", async (t) => {
+  const report = await run(t, fixture(async ({ header, next }) => {
+    const reply = await next();
+    return header === "sort=probe0" ? change(reply, { replace: { [refusal]: formatRefused("unsupported") } }) : reply;
+  }));
+  assert.equal(report.checks.find(({ id }) => id === "G2")?.status, "FAIL");
+});
+
+test("G3: an unsatisfiable reply with a forbidden applied header is not a passing refusal", async (t) => {
+  const report = await run(t, fixture(async ({ header, next }) => {
+    const reply = await next();
+    return header === "bits=64" ? change(reply, { replace: { [applied]: formatApplied("aurora") } }) : reply;
+  }));
+  assert.equal(report.checks.find(({ id }) => id === "G3")?.status, "FAIL");
+});
+
+test("G6: a suffix relay without a provider cannot prove the combined policy was met", async (t) => {
+  const report = await run(t, fixture(async ({ suffix, header, next }) => {
+    const reply = await next();
+    return suffix === "zdr" && header === null ? change(reply, { replace: { [applied]: null } }) : reply;
+  }));
+  assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
+});
+
+test("G10: a matching model does not hide a lost key default on a second model", async (t) => {
+  const second = `${model}-second`;
+  const target = createGateway({
+    models: { [model]: routes, [second]: [routes[2]!] }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, async (request, transport) => {
+    if (request.method === "POST" && request.headers.get("authorization") === `Bearer ${policyKey}` && !request.headers.has("route-policy")) {
+      const body: unknown = await request.clone().json().catch(() => null);
+      if (body !== null && typeof body === "object" && "model" in body && body.model === second) {
+        const headers = new Headers(request.headers);
+        headers.set("authorization", `Bearer ${key}`);
+        return target(new Request(request, { headers }), transport);
+      }
+    }
+    return target(request, transport);
+  });
+  assert.equal(report.checks.find(({ id }) => id === "G10")?.status, "FAIL");
+});
+
+test("G11: a valid pair repeated across carriers must not be rejected as a duplicate", async (t) => {
+  const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "zdr" && suffix === header
+    ? rewrite({ header: "zdr+zdr", suffix: null }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G11")?.status, "FAIL");
+});
+
+test("G12: a region intersection must be empty in both carrier orientations", async (t) => {
+  const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "region=de" && suffix === "region=us"
+    ? rewrite({ header: "region=us,de", suffix: null }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G12")?.status, "FAIL");
+});
+
+test("G21: a bound credential cannot ignore a disallowed item beside an accepted attest item", async (t) => {
+  const report = await run(t, fixture(({ auth, header, next, rewrite }) => auth === `Bearer ${policyKey}` && header === "attest=weights,probe0"
+    ? rewrite({ header: "attest=weights" }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G21")?.status, "FAIL");
+});
+
+test("G7: a preference in the suffix cannot exclude a route that meets the header requirement", async (t) => {
+  const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "zdr" && suffix === "order=basalt"
+    ? rewrite({ header: "only=routeprobe0", suffix: null }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G7")?.status, "FAIL");
+});
+
+test("G13: proper narrowing on one model does not hide a widened default on another", async (t) => {
+  const second = `${model}-second`;
+  const target = createGateway({
+    models: { [model]: routes, [second]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, async (request, transport) => {
+    if (request.method === "POST" && request.headers.get("authorization") === `Bearer ${policyKey}` && request.headers.get("route-policy") === "bits=9") {
+      const body: unknown = await request.clone().json().catch(() => null);
+      if (body !== null && typeof body === "object" && "model" in body && body.model === second) {
+        const headers = new Headers(request.headers);
+        headers.set("authorization", `Bearer ${key}`);
+        return target(new Request(request, { headers }), transport);
+      }
+    }
+    return target(request, transport);
+  });
+  assert.equal(report.checks.find(({ id }) => id === "G13")?.status, "FAIL");
+});
+
+test("G24: an unknown provider does not invalidate a list that also names a qualifying provider", async (t) => {
+  const report = await run(t, fixture(({ header, next, rewrite }) => header === "only=routeprobe0,aurora"
+    ? rewrite({ header: "only=routeprobe0" }) : next()));
+  assert.equal(report.checks.find(({ id }) => id === "G24")?.status, "FAIL");
+});
+
 test("G10 G13 G23: each credential's own catalog determines its model and matching routes", async (t) => {
   const catalogReads: string[] = [];
   const scopedGateways = new Map<string, RequestHandler>();

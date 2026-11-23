@@ -1,43 +1,62 @@
 /**
- * The identity of one outgoing request: where it goes, with which key, for which model, with which policy
- * header. The plugin makes it once, when it releases a request, from exactly what it hands the harness; the
- * fetch gate reads the same four values off the request as it leaves, and the request goes only if they match.
+ * What a request is, as far as a policy decision depends on it, read the same way where the plugin decides and
+ * where the request leaves: its authentication context, its policy header, and its body as serialized.
  */
 
 import type { ResultHeaders } from "../../../core/src/index.ts";
 
-export interface RequestIdentity {
-  /** The base URL, with no trailing slash; the request's URL starts with it and a slash. */
-  base: string;
-  /** The key the request carries; null when it carries none. */
-  credential: string | null;
-  /** The body's top-level `model`; null when the body names none (some APIs name it in the URL). */
-  model: string | null;
-  /** The `Route-Policy` value; null when there is none. */
-  header: string | null;
+/**
+ * Every header a gateway may take a key from. The authentication context is all of them, not one picked out:
+ * which one a gateway honors is its business, so metadata is read with the same set the request will carry.
+ */
+const CREDENTIAL_HEADERS: readonly string[] = ["api-key", "authorization", "x-api-key", "x-goog-api-key"];
+
+/** A request's credential headers, by lowercase name, in a fixed order. Empty when it carries none. */
+export type AuthContext = readonly (readonly [string, string])[];
+
+export function authOf(headers: Headers): AuthContext {
+  const auth: [string, string][] = [];
+  for (const name of CREDENTIAL_HEADERS) {
+    const value = headers.get(name);
+    if (value !== null) auth.push([name, value]);
+  }
+  return auth;
 }
 
-export const identityKey = (identity: RequestIdentity): string => JSON.stringify([identity.base, identity.credential, identity.model, identity.header]);
+export const authKey = (auth: AuthContext): string => JSON.stringify(auth);
+
+/** Whether a header name is one a credential travels in. */
+export const isCredentialHeader = (name: string): boolean => CREDENTIAL_HEADERS.includes(name.toLowerCase());
 
 /** A request as it leaves through `fetch`, before anything is sent. */
 export interface Outgoing {
   url: string;
   method: string;
-  credential: string | null;
-  /** The body's top-level `model`: null when the body names none, undefined when the body cannot be read. */
-  model: string | null | undefined;
+  auth: AuthContext;
+  /** The `Route-Policy` value as it will be sent: repeated lines are joined, and so never equal one released value. */
   header: string | null;
+  /** The body as it will be sent, when it is text; null when it is bytes or a stream this reader cannot compare. */
+  body: string | null;
 }
 
-/** The key a set of headers carries: a bearer token, or an `x-api-key` as the Messages API sends it. */
-export function credentialOf(headers: Headers): string | null {
-  return /^Bearer (.+)$/i.exec(headers.get("authorization") ?? "")?.[1] ?? headers.get("x-api-key");
+/** Reads a request as it leaves. `init` overrides a `Request` input's headers and body, as `fetch` does. */
+export function outgoingOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): Outgoing {
+  const request = input instanceof Request ? input : null;
+  const headers = new Headers(init?.headers ?? request?.headers);
+  const body = init !== undefined && "body" in init ? init.body : request?.body;
+  return {
+    url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+    method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
+    auth: authOf(headers),
+    header: headers.get("route-policy"),
+    body: typeof body === "string" ? body : body === undefined || body === null ? "" : null,
+  };
 }
 
 /** The body's top-level `model`: null when it names none, undefined when the body cannot be read. */
-function modelOf(body: unknown): string | null | undefined {
-  if (body === undefined || body === null) return null;
-  if (typeof body !== "string") return undefined;
+export function modelIn(body: string | null): string | null | undefined {
+  if (body === null) return undefined;
+  if (body === "") return null;
   try {
     const parsed: unknown = JSON.parse(body);
     if (typeof parsed !== "object" || parsed === null || !("model" in parsed)) return null;
@@ -45,20 +64,6 @@ function modelOf(body: unknown): string | null | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** Reads the four identity values off a request as it leaves. */
-export function outgoingOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): Outgoing {
-  const request = input instanceof Request ? input : null;
-  const headers = new Headers(init?.headers ?? request?.headers);
-  return {
-    url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
-    method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
-    credential: credentialOf(headers),
-    // A Request object's own body is a stream: not readable here without consuming it.
-    model: init?.body !== undefined ? modelOf(init.body) : request?.body ? undefined : null,
-    header: headers.get("route-policy"),
-  };
 }
 
 /** The status and result headers of the response to one request. */

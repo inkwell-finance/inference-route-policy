@@ -32,6 +32,8 @@ export class FakeHarness {
   uiThrows = false;
   /** The key the transport puts on the wire; a harness can send another than the registry reported. */
   wireKey = "demo-key";
+  /** Headers the transport adds on its own, after the configured ones would be: a transport the plugin cannot see into. */
+  extraWireHeaders: Record<string, string> = {};
   /** Replaces `ctx.model`, to hand the plugin a model the harness would never describe that way. */
   contextModel: unknown = undefined;
   readonly headerHook: boolean;
@@ -42,7 +44,16 @@ export class FakeHarness {
     appendEntry: (customType, data) => this.entries.push({ type: "custom", customType, data }),
   };
 
+  /** Every fake made in this process, so a test can end their sessions as a harness would. */
+  static readonly made: FakeHarness[] = [];
+
+  /** Ends every fake session made so far: each plugin withdraws its unused releases and stops watching. */
+  static async endAll(): Promise<void> {
+    for (const harness of FakeHarness.made.splice(0)) await harness.emit("session_shutdown", { type: "session_shutdown" });
+  }
+
   constructor(baseUrl: string, options: { headerHook: boolean }) {
+    FakeHarness.made.push(this);
     this.model = { id: "demo-model", baseUrl, api: "openai-completions" };
     this.headerHook = options.headerHook;
   }
@@ -91,7 +102,11 @@ export class FakeHarness {
     } catch (error) {
       return { sent: false, error: error instanceof Error ? error.message : String(error), status: null };
     }
-    const wire = new Headers({ "content-type": "application/json", authorization: `Bearer ${this.wireKey}` });
+    // The registry's key goes where this API's transport puts it; configured headers then replace or add to it.
+    const wire = new Headers({ "content-type": "application/json" });
+    if (this.model.api === "anthropic-messages") wire.set("x-api-key", this.wireKey);
+    else wire.set("authorization", `Bearer ${this.wireKey}`);
+    for (const [name, value] of Object.entries(this.extraWireHeaders)) wire.set(name, value);
     for (const [name, value] of Object.entries(headers)) if (value !== null) wire.set(name, value);
     let response: Response;
     try {

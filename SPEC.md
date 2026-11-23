@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 13.
+Draft 14.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -637,7 +637,7 @@ adopted this protocol, by [translation](#clients).
 | OpenRouter `provider.data_collection: "deny"` | Not `notrain` or `zdr`: it filters the model providers, and says nothing of what the gateway itself does with content. |
 | OpenRouter `provider.quantizations` | Near `bits`, but a list of named levels, not a floor on every weight as served. |
 | OpenRouter `provider.allow_fallbacks: false` with `order` | `only` with `order` |
-| OpenRouter `:nitro`, `:floor` | `+sort=throughput`, `+sort=price` |
+| OpenRouter `:nitro`, `:floor` | In part `+sort=throughput`, `+sort=price`. Each shortcut also changes which service tiers are eligible, which no key here does. |
 | OpenRouter regional hostnames | `region` |
 | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway/models-and-providers/provider-options) `providerOptions.gateway.only`, `order`, `sort: cost \| ttft \| tps` | `only`, `order`, `sort=price \| latency \| throughput` |
 | Body fields in general | Tied to one API surface's schema and unreachable from a harness that does not know them. A gateway MAY keep its own and map them here. |

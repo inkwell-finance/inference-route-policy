@@ -1,103 +1,130 @@
 /**
  * The last check before a request leaves the process, and the only place its response is read.
  *
- * Both harnesses send provider requests through the process's `fetch`. This wraps it once per process. For each
- * POST, every registered gate says whether the request is one it released, one it must stop, or none of its
- * business. A request a gate released goes through unchanged, and that gate reads the response to that very
- * call; a request any gate must stop, and no gate released, fails before a byte is written, with the error the
- * harness then reports as the turn's failure. Everything else goes through untouched.
+ * Both harnesses send provider requests through the process's `fetch`, which this wraps once per process. One
+ * release table serves every plugin session in the process. A session releases a request by its exact bytes:
+ * base URL, authentication context, `Route-Policy` header, and serialized body. A POST that matches exactly one
+ * session's release goes, once: the release is used up, so a harness's resend of the same request is not
+ * released again. It goes with redirects off, so a gateway cannot move the body elsewhere, and the response to
+ * that very call goes back to the session that released it. A POST no release matches goes untouched unless a
+ * session watching its base URL says a policy is at stake, and then it fails before a byte is written.
  *
- * Why here: the harness hooks decide with what the harness tells them, which is not always what goes on the
- * wire (a configured header can replace the key the registry reported), and both harnesses skip their response
- * hook for a non-2xx response, which is how a refusal arrives.
+ * Why here: the harness hooks decide on what the harness tells them, which is not always what goes on the wire,
+ * and both harnesses skip their response hook for a non-2xx response, which is how a refusal arrives.
  */
 
-import { completionOf, outgoingOf, type Completion, type Outgoing } from "./request.ts";
+import { authKey, completionOf, outgoingOf, type Completion, type Outgoing } from "./request.ts";
 
-export type Verdict =
-  | { kind: "pass" }
-  /** The gate released this request: it goes, and `complete` gets the response to this call. */
-  | { kind: "released"; complete: (completion: Completion) => void }
-  /** Under the gate's watch, the gate did not release this request, and it must not leave. `stopped` runs if it does not. */
-  | { kind: "stop"; reason: string; stopped?: () => void };
+/** A request a session let go, as it must leave, and what to do with it. */
+export interface Release {
+  /** The session that released it; its responses and stops go there and nowhere else. */
+  owner: object;
+  base: string;
+  auth: Outgoing["auth"];
+  header: string | null;
+  body: string;
+  /** Whether what the decision relied on still holds at the moment it leaves. */
+  current(): boolean;
+  /** Called when the request is stopped at the gate instead. */
+  stopped(reason: string): void;
+  /** Called with the response to the call that sent it. */
+  complete(completion: Completion): void;
+}
 
-export type Gate = (outgoing: Outgoing) => Verdict;
+/** A session's say over a POST no release matched: why it must not leave, or null. */
+export interface Watcher {
+  check(outgoing: Outgoing): string | null;
+  stopped(reason: string): void;
+}
 
-// One wrapper per process, shared by every copy of this module a harness loads (omp re-imports an extension
-// for each session), so wrappers never stack.
-const REGISTRY = Symbol.for("inference-route-policy.fetch-gates");
+const REGISTRY = Symbol.for("inference-route-policy.fetch-gate");
+
+/**
+ * How long an unused release waits for its request. A harness sends right after the payload hook returns; one
+ * that has not sent by then will not, and an old release would only make a later identical one ambiguous.
+ */
+const RELEASE_TTL_MS = 30_000;
 
 interface Registry {
-  gates: Set<Gate>;
+  releases: { release: Release; expires: number }[];
+  watchers: Set<Watcher>;
 }
 
 function isRegistry(value: unknown): value is Registry {
-  return typeof value === "object" && value !== null && "gates" in value && value.gates instanceof Set;
+  return typeof value === "object" && value !== null && "releases" in value && Array.isArray(value.releases) && "watchers" in value && value.watchers instanceof Set;
 }
 
-/** Why a request must not leave, or null, and who to tell; or the release whose owner reads the response. */
-interface Judgment {
-  stop: string | null;
-  stopped: (() => void)[];
-  complete: ((completion: Completion) => void) | null;
-}
+const matches = (release: Release, outgoing: Outgoing): boolean =>
+  outgoing.url.startsWith(`${release.base}/`) &&
+  outgoing.body === release.body &&
+  outgoing.header === release.header &&
+  authKey(outgoing.auth) === authKey(release.auth);
 
-/** Why a request must not leave, or null; and the release whose owner reads the response. */
-function judge(gates: Iterable<Gate>, outgoing: Outgoing): Judgment {
-  let stop: string | null = null;
-  const stopped: (() => void)[] = [];
-  for (const gate of gates) {
-    let verdict: Verdict;
-    try {
-      verdict = gate(outgoing);
-    } catch (error) {
-      verdict = { kind: "stop", reason: `the plugin failed while checking the request: ${error instanceof Error ? error.message : "unknown error"}` };
-    }
-    // A request one gate released is that gate's; another gate's watch over the same base URL does not stop it.
-    if (verdict.kind === "released") return { stop: null, stopped: [], complete: verdict.complete };
-    if (verdict.kind === "stop") {
-      stop ??= verdict.reason;
-      if (verdict.stopped !== undefined) stopped.push(verdict.stopped);
-    }
+const tell = (notify: () => void): void => {
+  try {
+    notify();
+  } catch {
+    // The request's fate does not depend on whether a session could be told.
   }
-  return { stop, stopped, complete: null };
+};
+
+type Plan = { kind: "pass" } | { kind: "stop"; reason: string } | { kind: "send"; release: Release };
+
+/** What to do with one POST. Never throws: a failure to decide is a stop. */
+function plan(registry: Registry, outgoing: Outgoing): Plan {
+  try {
+    const now = Date.now();
+    registry.releases = registry.releases.filter((entry) => entry.expires > now);
+    const candidates = registry.releases.filter((entry) => matches(entry.release, outgoing)).map((entry) => entry.release);
+    const owners = new Set(candidates.map((release) => release.owner));
+    if (owners.size > 1) {
+      for (const release of candidates) tell(() => release.stopped("two sessions released this same request, so whose it is cannot be told"));
+      return { kind: "stop", reason: "two sessions released this same request, so whose it is cannot be told" };
+    }
+    const [release] = candidates;
+    if (release !== undefined) {
+      registry.releases.splice(registry.releases.findIndex((entry) => entry.release === release), 1);
+      if (!release.current()) {
+        const reason = "the detection reply this request was checked against was discarded before it left; send it again";
+        tell(() => release.stopped(reason));
+        return { kind: "stop", reason };
+      }
+      return { kind: "send", release };
+    }
+    let stop: string | null = null;
+    for (const watcher of registry.watchers) {
+      const reason = watcher.check(outgoing);
+      if (reason === null) continue;
+      stop ??= reason;
+      tell(() => watcher.stopped(reason));
+    }
+    return stop === null ? { kind: "pass" } : { kind: "stop", reason: stop };
+  } catch (error) {
+    return { kind: "stop", reason: `the plugin failed while checking the request: ${error instanceof Error ? error.message : "unknown error"}` };
+  }
 }
 
 function install(): Registry {
   const existing: unknown = Reflect.get(globalThis, REGISTRY);
   if (isRegistry(existing)) return existing;
-  const registry: Registry = { gates: new Set() };
+  const registry: Registry = { releases: [], watchers: new Set() };
   Reflect.set(globalThis, REGISTRY, registry);
   const original = globalThis.fetch;
   const gated = async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
-    let verdict: Judgment = { stop: null, stopped: [], complete: null };
-    if (registry.gates.size > 0) {
-      let outgoing: Outgoing | null = null;
-      try {
-        outgoing = outgoingOf(input, init);
-      } catch {
-        // Headers `fetch` itself cannot read make `fetch` fail below, before anything is sent.
-      }
-      if (outgoing?.method === "POST") verdict = judge(registry.gates, outgoing);
+    let outgoing: Outgoing;
+    try {
+      outgoing = outgoingOf(input, init);
+    } catch {
+      // Headers `fetch` itself cannot read make `fetch` fail, before anything is sent.
+      return original(input, init);
     }
-    if (verdict.stop !== null) {
-      for (const tell of verdict.stopped) {
-        try {
-          tell();
-        } catch {
-          // The request is stopped whether or not the user could be told.
-        }
-      }
-      throw new Error(`Blocked by the route policy plugin, nothing was sent: ${verdict.stop}`);
-    }
-    const response = await original(input, init);
-    if (verdict.complete !== null) {
-      try {
-        verdict.complete(completionOf(response));
-      } catch {
-        // Reading the result must not reach the harness's request.
-      }
-    }
+    if (outgoing.method !== "POST" || (registry.releases.length === 0 && registry.watchers.size === 0)) return original(input, init);
+    const next = plan(registry, outgoing);
+    if (next.kind === "stop") throw new Error(`Blocked by the route policy plugin, nothing was sent: ${next.reason}`);
+    if (next.kind === "pass") return original(input, init);
+    // A released request goes where it was released for, and nowhere a redirect would send its body.
+    const response = await original(input, { ...init, redirect: "manual" });
+    tell(() => next.release.complete(completionOf(response)));
     return response;
   };
   // Keep the runtime's own members of fetch (Bun's `preconnect`, for one).
@@ -105,9 +132,26 @@ function install(): Registry {
   return registry;
 }
 
-/** Puts `gate` in front of every `fetch` from now on. Returns the function that removes it. */
-export function addGate(gate: Gate): () => void {
+/** Adds a release to the process's table. Returns the function that withdraws it, if it is still unused. */
+export function addRelease(release: Release): () => void {
   const registry = install();
-  registry.gates.add(gate);
-  return () => registry.gates.delete(gate);
+  const entry = { release, expires: Date.now() + RELEASE_TTL_MS };
+  registry.releases.push(entry);
+  return () => {
+    const index = registry.releases.indexOf(entry);
+    if (index >= 0) registry.releases.splice(index, 1);
+  };
+}
+
+/** Puts a session's watcher in front of every `fetch`. Returns the function that removes it. */
+export function addWatcher(watcher: Watcher): () => void {
+  const registry = install();
+  registry.watchers.add(watcher);
+  return () => registry.watchers.delete(watcher);
+}
+
+/** Withdraws every unused release of a session, as when it ends. */
+export function withdrawReleases(owner: object): void {
+  const registry = install();
+  registry.releases = registry.releases.filter((entry) => entry.release.owner !== owner);
 }

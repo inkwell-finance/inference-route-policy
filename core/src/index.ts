@@ -645,6 +645,17 @@ export function someRouteMeets(routes: ReadonlyMap<string, PublishedRoute | null
 }
 
 /**
+ * The refusal a response carries, or null when it carries no `Route-Refused` (C5). This holds for every response,
+ * whatever the request carried. A value that cannot be read, or more than one, is still a refusal: its reason and
+ * key are then null.
+ */
+export function readRefusal(headers: ResultHeaders): { reason: RefusalReason | null; key: string | null } | null {
+  if (headers.refused.length === 0) return null;
+  const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
+  return parsed?.ok ? parsed.value : { reason: null, key: null };
+}
+
+/**
  * What a response says about the policy a client sent with a requirement (C3, C4, C5). Any `Route-Refused` is a
  * refusal, parsed or not, whatever else is there. Otherwise the policy is honored only by exactly one valid
  * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the model's
@@ -655,10 +666,8 @@ export function someRouteMeets(routes: ReadonlyMap<string, PublishedRoute | null
  */
 export function readOutcome(headers: ResultHeaders, sent: Policy, routes: ReadonlyMap<string, PublishedRoute | null> | null): Outcome {
   requirePolicy(sent);
-  if (headers.refused.length > 0) {
-    const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
-    return parsed?.ok ? { outcome: "refused", ...parsed.value } : { outcome: "refused", reason: null, key: null };
-  }
+  const refusal = readRefusal(headers);
+  if (refusal !== null) return { outcome: "refused", ...refusal };
   const notHonored = (why: string): Outcome => ({ outcome: "not-honored", why });
   // An empty region intersection is a policy no route can meet, so no response can have honored it. An empty
   // `only` needs no such line: it holds no provider, so the checks below already exclude whichever one is named.

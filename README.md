@@ -57,9 +57,10 @@ npm run e2e:pi
 Each asserts, from outside the harness: a request that is honored; one
 the gateway refuses; one the plugin holds back because no published
 route meets it; one blocked for lack of detection; one blocked by a
-failure inside the plugin; and one stopped because the key on the wire
-is not the key detection was read for. Each run writes what it ran and
-observed to `plugins/<harness>/e2e/transcript.txt`.
+failure inside the plugin; one stopped because the key on the wire is
+not the key detection was read for; and a harness retry that is stopped
+instead of resent. Each run writes what it ran and observed to
+`plugins/<harness>/e2e/transcript.txt`.
 
 ## Try it
 
@@ -83,11 +84,15 @@ result, `/route <policy>` sets it, and `/route clear` removes it.
 
 - A request is decided in the harness's `before_provider_request` hook
   and checked again where it leaves, in the process's `fetch`: a POST
-  to a base URL the plugin has seen goes out only if it matches a
-  request the plugin released, in base URL, key, model, and policy. A
-  harness feature that sends content to some other base URL without the
-  hook is not covered, and neither is a transport that does not use
-  `fetch`.
+  to a base URL the plugin has decided for goes out only if its URL,
+  credential headers, `Route-Policy` header, and body are exactly those
+  of a request the plugin released, once, and without following
+  redirects. A harness feature that sends content to some other base
+  URL without the hook is not covered, and neither is a transport that
+  does not use `fetch`.
+- A release is used once. A harness's automatic retry of the same
+  request is stopped, so a retryable error ends the turn and the user
+  sends again.
 - A POST whose body the plugin cannot read at `fetch`, such as a
   compressed one, is stopped whenever a policy is held or carried.
 - omp gives a plugin no way to set request headers, so there the held

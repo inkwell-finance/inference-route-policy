@@ -7,12 +7,12 @@
 
 import { hasRequirements, parsePolicy, type Detection } from "../../../core/src/index.ts";
 import { anyPolicy, anyRequirement, decide, readLayers, type Carriers, type Decision } from "./decide.ts";
-import type { Verdict } from "./fetch-gate.ts";
+import { addRelease } from "./fetch-gate.ts";
 import { fetchDetection, fetchModelList, normalizeBase, type DetectionResult, type Fetch, type Target } from "./gateway-client.ts";
 import { describeHeld, heldFromEnv, holdPolicy, type Held } from "./held.ts";
 import { isOpenRouter } from "./openrouter.ts";
 import { describeReport, interpret, type Report, type Sent } from "./outcome.ts";
-import { identityKey, type Completion, type Outgoing, type RequestIdentity } from "./request.ts";
+import { authKey, modelIn, type Completion, type Outgoing } from "./request.ts";
 
 export interface RouteClientOptions {
   carriers: Carriers;
@@ -35,16 +35,8 @@ export interface Prepared {
   generation: number;
 }
 
-/** What a released request is read against, and what must still hold when it leaves. */
-interface Ticket {
-  cacheKey: string;
-  generation: number;
-  sent: Sent;
-  requirement: boolean;
-}
-
-/** Releases remembered for resends. Past this the oldest is forgotten, which can only stop a resend of it. */
-const TICKET_LIMIT = 1024;
+/** Unused releases a session keeps. Past this the oldest is withdrawn, which can only stop it. */
+const RELEASE_LIMIT = 256;
 
 export class RouteClient {
   held: Held;
@@ -57,9 +49,9 @@ export class RouteClient {
   readonly #heldDetections = new Map<string, Detection>();
   readonly #heldLists = new Map<string, unknown>();
   readonly #generations = new Map<string, number>();
-  /** Released requests by identity. */
-  readonly #tickets = new Map<string, Ticket>();
-  /** Base URLs whose POSTs this client checks at the gate. */
+  /** Withdrawals of this client's releases, oldest first; a used release is already gone and withdraws nothing. */
+  readonly #withdrawals: (() => void)[] = [];
+  /** Base URLs this client sends to: a POST there that no release matches is its business. */
   readonly #bases = new Set<string>();
 
   constructor(options: RouteClientOptions) {
@@ -75,7 +67,7 @@ export class RouteClient {
 
   #fetch: Fetch = (input, init) => (this.#options.fetch ?? globalThis.fetch)(input, init);
 
-  #key = (target: Target): string => `${normalizeBase(target.base)}\n${target.credential ?? ""}`;
+  #key = (target: Target): string => `${normalizeBase(target.base)}\n${authKey(target.auth)}`;
 
   /** The detection result for a target, fetching it when none is held or in flight. */
   #detection(target: Target): Promise<DetectionResult> {
@@ -159,26 +151,30 @@ export class RouteClient {
   }
 
   /**
-   * Releases a decided request with the identity it will have on the wire. Only a request with a released
-   * identity passes the fetch gate, and only while its decision is current.
+   * Releases a decided request by the bytes it will leave with: its policy header and its serialized body, to
+   * the target's base URL with the target's authentication context. The fetch gate lets exactly those bytes go,
+   * once, while the decision is current, and hands this client the response to that call.
    */
-  release(prepared: Prepared & { decision: Exclude<Decision, { action: "block" }> }, identity: RequestIdentity): void {
-    const { decision } = prepared;
-    const ticket: Ticket = {
-      cacheKey: this.#key(prepared.target),
-      generation: prepared.generation,
-      sent: decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes },
-      requirement: decision.sent !== null && hasRequirements(decision.sent),
-    };
-    const key = identityKey(identity);
-    this.#bases.add(identity.base);
-    this.#tickets.delete(key);
-    this.#tickets.set(key, ticket);
-    // Forgetting the oldest release can only stop a late resend of it, never let anything through.
-    for (const oldest of this.#tickets.keys()) {
-      if (this.#tickets.size <= TICKET_LIMIT) break;
-      this.#tickets.delete(oldest);
-    }
+  release(prepared: Prepared & { decision: Exclude<Decision, { action: "block" }> }, header: string | null, body: string): void {
+    const { decision, target } = prepared;
+    const cacheKey = this.#key(target);
+    const sent: Sent = decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes };
+    const requirement = decision.sent !== null && hasRequirements(decision.sent);
+    this.#bases.add(target.base);
+    this.#withdrawals.push(
+      addRelease({
+        owner: this,
+        base: target.base,
+        auth: target.auth,
+        header,
+        body,
+        current: () => this.isCurrent(prepared),
+        stopped: (reason) => this.blocked(reason),
+        complete: (completion) => this.#complete(cacheKey, sent, requirement, completion),
+      }),
+    );
+    // Withdrawing an old unused release can only stop it, never let anything through.
+    while (this.#withdrawals.length > RELEASE_LIMIT) this.#withdrawals.shift()?.();
   }
 
   /** Reports a request the caller blocked: nothing of it was sent. */
@@ -187,33 +183,25 @@ export class RouteClient {
   }
 
   /**
-   * The fetch gate's question for this client. A POST to a base URL it watches goes only as a request it
-   * released, matched on base URL, credential, model and policy header, and only while the decision behind it is
-   * current. Anything else to that base URL is stopped if a policy could be at stake: one is held, or the request
-   * carries one, or its model cannot be read.
+   * The fetch gate's question about a POST no release matched. To a base URL this client sends to, it must not
+   * leave if a policy could be at stake: one is held, or the request carries one, or its model cannot be read.
    */
-  gate(outgoing: Outgoing): Verdict {
-    const base = [...this.#bases].filter((b) => outgoing.url.startsWith(`${b}/`)).sort((a, b) => b.length - a.length)[0];
-    if (base === undefined) return { kind: "pass" };
-    const ticket = outgoing.model === undefined ? undefined : this.#tickets.get(identityKey({ base, credential: outgoing.credential, model: outgoing.model, header: outgoing.header }));
-    if (ticket !== undefined) {
-      if (ticket.requirement && ticket.generation !== this.#generation(ticket.cacheKey)) {
-        return this.#stop("the detection reply this request was checked against was discarded before it left, so it is not sent; send it again");
-      }
-      return { kind: "released", complete: (completion) => this.#complete(ticket, completion) };
-    }
-    const policyAtStake = this.held.kind !== "none" || outgoing.header !== null || outgoing.model === undefined || (outgoing.model ?? "").includes("+");
-    if (!policyAtStake) return { kind: "pass" };
-    return this.#stop(`this request to ${base} is not one the plugin checked: its key, model, or Route-Policy header differs from what was released`);
+  check(outgoing: Outgoing): string | null {
+    const base = [...this.#bases].find((b) => outgoing.url.startsWith(`${b}/`));
+    if (base === undefined) return null;
+    const model = modelIn(outgoing.body);
+    const atStake = this.held.kind !== "none" || outgoing.header !== null || model === undefined || (model ?? "").includes("+");
+    return atStake ? `this request to ${base} is not one the plugin released: its key, body, or Route-Policy header differs from what was checked, or it was already sent once` : null;
   }
 
-  #stop = (reason: string): Verdict => ({ kind: "stop", reason, stopped: () => this.blocked(reason) });
-
   /** Reads the response to one released request (C3, C4, C5). */
-  #complete(ticket: Ticket, completion: Completion): void {
-    const report = interpret(completion.result, ticket.sent);
+  #complete(cacheKey: string, sent: Sent, requirement: boolean, completion: Completion): void {
+    const report: Report =
+      completion.status >= 300 && completion.status < 400 && completion.result.refused.length === 0
+        ? { kind: "not-honored", why: `the gateway answered with a redirect (status ${completion.status}), which the plugin does not follow with content` }
+        : interpret(completion.result, sent);
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
-    if (report.kind === "not-honored" && ticket.requirement) this.#discardDetection(ticket.cacheKey);
+    if (report.kind === "not-honored" && requirement) this.#discardDetection(cacheKey);
     this.#report(report);
   }
 

@@ -3,7 +3,7 @@
  * publishes are its claims; this client verifies no evidence, so nothing here is called verified (C7).
  */
 
-import { parseApplied, parseRefused, readOutcome, type Policy, type PublishedRoute, type RefusalReason, type ResultHeaders } from "../../../core/src/index.ts";
+import { parseApplied, readOutcome, readRefusal, type Policy, type PublishedRoute, type RefusalReason, type ResultHeaders } from "../../../core/src/index.ts";
 
 /** What the client sent, as the send decision recorded it. */
 export type Sent =
@@ -33,10 +33,8 @@ export function interpret(headers: ResultHeaders, sent: Sent): Report {
     }
   }
   // C5 holds for every response, whatever was sent: a key's own policy can be refused too.
-  if (headers.refused.length > 0) {
-    const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
-    return parsed?.ok ? { kind: "refused", ...parsed.value } : { kind: "refused", reason: null, key: null };
-  }
+  const refusal = readRefusal(headers);
+  if (refusal !== null) return { kind: "refused", ...refusal };
   if (sent.kind === "translated") return { kind: "unconfirmed" };
   const applied = headers.applied.length === 1 ? parseApplied(headers.applied[0]!) : null;
   return { kind: "served", provider: applied?.ok ? applied.value : null };

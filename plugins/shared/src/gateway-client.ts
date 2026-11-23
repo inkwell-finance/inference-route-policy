@@ -5,13 +5,14 @@
  */
 
 import { parseDetection, type Detection } from "../../../core/src/index.ts";
+import type { AuthContext } from "./request.ts";
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
-/** Where a request goes and with which key. `credential` is null when the request carries none. */
+/** Where a request goes, and the credential headers it carries there (empty when none). */
 export interface Target {
   base: string;
-  credential: string | null;
+  auth: AuthContext;
 }
 
 export type DetectionResult = { ok: true; detection: Detection } | { ok: false; why: string };
@@ -20,9 +21,10 @@ export type DetectionResult = { ok: true; detection: Detection } | { ok: false; 
 export const normalizeBase = (base: string): string => base.replace(/\/+$/, "");
 
 function headersFor(target: Target): Record<string, string> {
-  // Credentials go as a bearer token, the form every OpenAI-compatible gateway reads; detection needs none, but a
-  // key's bound policy is reported only to its holder.
-  return target.credential === null ? { accept: "application/json" } : { accept: "application/json", authorization: `Bearer ${target.credential}` };
+  // The same credential headers the request will carry, all of them: whichever the gateway takes the key from,
+  // detection and the model list answer for that key. Detection needs none, but a bound policy is reported only
+  // to its key's holder.
+  return { accept: "application/json", ...Object.fromEntries(target.auth) };
 }
 
 async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs: number): Promise<{ status: number; body: unknown }> {
@@ -43,7 +45,7 @@ async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs:
 export async function fetchDetection(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<DetectionResult> {
   try {
     const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/route-policy`, target, timeoutMs);
-    const read = parseDetection({ status, body, credentialed: target.credential !== null });
+    const read = parseDetection({ status, body, credentialed: target.auth.length > 0 });
     return read.ok ? { ok: true, detection: read.value } : { ok: false, why: `detection reply is not valid: ${read.key === null ? "" : `${read.key} `}${read.detail}` };
   } catch (error) {
     return { ok: false, why: `detection could not be fetched: ${error instanceof Error ? error.message : String(error)}` };

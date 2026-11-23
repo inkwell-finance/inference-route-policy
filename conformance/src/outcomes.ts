@@ -1,4 +1,4 @@
-import { isEvidenceUri, meets, parseApplied, parseRefused, REFUSAL_STATUS, type Policy, type PublishedRoute } from "../../core/src/index.ts";
+import { isEvidenceUri, meets, parseApplied, parseRefused, REFUSAL_STATUS, type Policy, type PublishedRoute, type RefusalReason } from "../../core/src/index.ts";
 import { sent, type Observation, type Probe } from "./http.ts";
 
 export interface Exchange {
@@ -12,10 +12,10 @@ export interface ResultContext {
   carriesPolicy: boolean | undefined;
   combined?: Policy;
   routes?: ReadonlyMap<string, PublishedRoute | null>;
-  requiresRefusal?: boolean;
+  expectedRefusal?: { reason: "unsupported"; key: string | null } | { reason: "unsatisfiable" };
 }
 
-type AuditId = "G6" | "G15" | "G17" | "G19" | "G26" | "G34";
+export type AuditId = "G1" | "G2" | "G3" | "G6" | "G15" | "G17" | "G19" | "G26" | "G29" | "G34";
 export interface ResultAudit {
   failures: Map<AuditId, string>;
   sawPolicyRelay: boolean;
@@ -25,6 +25,8 @@ export interface ResultAudit {
   comparedErrorShape: boolean;
   unpairedErrorShape: boolean;
 }
+
+const precedence: Readonly<Record<RefusalReason, number>> = { unsupported: 0, unsatisfiable: 1, unavailable: 2 };
 
 export const noResult = (reply: Observation): boolean => reply.applied.length === 0 && reply.refused.length === 0 && reply.evidence.length === 0;
 
@@ -89,7 +91,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     const provider = applied(reply);
     if (reply.applied.length !== 0 && provider === null) fail("G15", "S14: a Route-Applied value is exactly provider=<provider id>");
     if (reply.evidence.some((uri) => !isEvidenceUri(uri))) fail("G17", "S18: every Route-Evidence value is an evidence URI");
-    const { carriesPolicy, combined, routes } = contextFor(probe);
+    const { carriesPolicy, combined, routes, expectedRefusal } = contextFor(probe);
     if (carriesPolicy === false && (reply.refused.length > 0 || reply.evidence.length > 0)) fail("G26", "no Route-Refused or Route-Evidence without a policy");
 
     if (reply.refused.length > 0) {
@@ -98,6 +100,17 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
       const parsed = parseRefused(reply.refused[0]!);
       if (!parsed.ok || reply.status !== REFUSAL_STATUS[parsed.value.reason]) fail("G19", "S15: one valid Route-Refused value with its corresponding HTTP status");
       if (reply.applied.length !== 0 || reply.evidence.length !== 0) fail("G19", "a refusal has neither Route-Applied nor Route-Evidence");
+      if (expectedRefusal !== undefined) {
+        const { reason } = expectedRefusal;
+        if (!parsed.ok || parsed.value.reason !== reason || reply.status !== REFUSAL_STATUS[reason]
+          || reply.refused.length !== 1 || reply.applied.length !== 0 || reply.evidence.length !== 0) {
+          fail(reason === "unsupported" ? "G1" : "G3", `HTTP ${REFUSAL_STATUS[reason]} with only a valid ${reason} refusal`);
+        }
+        if (reason === "unsupported" && parsed.ok && parsed.value.reason === reason && parsed.value.key !== expectedRefusal.key) {
+          fail("G2", `the first failure names ${expectedRefusal.key ?? "no key"}`);
+        }
+        if (parsed.ok && precedence[parsed.value.reason] > precedence[reason]) fail("G29", `${reason} takes precedence over ${parsed.value.reason}`);
+      }
       if (!reply.hasBody) fail("G34", "a refusal has a nonempty error body");
       const references = ordinary.filter((entry) => sameCredential(entry.probe, probe));
       const sameStatus = references.filter((entry) => entry.reply.status === reply.status);
@@ -115,13 +128,18 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     // A bare 4xx/5xx may be an own error, not a relay. A route result or a
     // non-error response to policy traffic establishes an observable relay.
     const relay = reply.applied.length > 0 || reply.evidence.length > 0 || reply.status < 400;
+    if (expectedRefusal !== undefined && (relay || missingRefusal)) {
+      fail(expectedRefusal.reason === "unsupported" ? "G1" : "G3", `the policy must be refused as ${expectedRefusal.reason}`);
+    }
     if (!relay || carriesPolicy !== true) continue;
     audit.sawPolicyRelay = true;
     audit.sawPolicyResult = true;
     if (provider === null || (routes !== undefined && !routes.has(provider))) fail("G15", "one valid Route-Applied naming a published provider for this model");
     const route = provider === null ? undefined : routes?.get(provider);
     if (combined !== undefined) {
-      if (provider !== null && route != null && !meets({ provider, facts: route.facts }, combined)) fail("G6", "the published route meets the combined policy");
+      if (routes !== undefined && (provider === null || route == null || !meets({ provider, facts: route.facts }, combined))) {
+        fail("G6", "a named published route with valid facts meets the combined policy");
+      }
       if (combined.attest.length === 0) {
         if (reply.evidence.length !== 0) fail("G17", "no Route-Evidence when the combined policy does not require attest");
       } else {

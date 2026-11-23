@@ -11,12 +11,12 @@
  */
 
 import type { Decision } from "./decide.ts";
-import { addGate } from "./fetch-gate.ts";
+import { addWatcher, withdrawReleases } from "./fetch-gate.ts";
 import { normalizeBase, type Target } from "./gateway-client.ts";
 import { heldFromEntry, heldFromEnv, holdPolicy, type Held, type HeldEntry } from "./held.ts";
 import { OPENROUTER_PROVIDER_APIS } from "./openrouter.ts";
 import { describeReport, isQuiet, type Report } from "./outcome.ts";
-import { credentialOf } from "./request.ts";
+import { authKey, authOf } from "./request.ts";
 import { RouteClient, type Prepared } from "./route-client.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -79,10 +79,19 @@ interface RequestOf {
   configured: string | null;
 }
 
+/** Where each request API's transport puts the registry's key, and in what form. */
+function keyHeader(api: string | null, key: string): [string, string] {
+  if (api === "anthropic-messages") return ["x-api-key", key];
+  if (api === "google-generative-ai") return ["x-goog-api-key", key];
+  return ["authorization", `Bearer ${key}`];
+}
+
 /**
- * Reads the model and its credentials from a handler context. Null when the context has no usable model. The
- * key is the one a configured `Authorization` or `x-api-key` header sends, which replaces the registry's key
- * on the wire, else the registry's; `wire`, when the hook sees the request's own headers, is read first.
+ * Reads the model and the authentication context its request will carry from a handler context; null when the
+ * context has no usable model. The context is every credential header the configuration adds, plus the
+ * registry's key where the API's transport puts it unless a configured header already fills that place.
+ * `wire`, when the hook sees the request's own headers, is read last. This is a prediction: the fetch gate
+ * compares it with the headers that actually leave, and stops the request when they differ.
  */
 async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<RequestOf | null> {
   const model = member(ctx, "model");
@@ -98,11 +107,15 @@ async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<
   const apiKey = ok ? member(auth, "apiKey") : undefined;
   const authBase = ok ? member(auth, "baseUrl") : undefined;
   const configured = headersFrom(ok ? member(auth, "headers") : undefined, member(model, "headers"), wire);
-  const credential = credentialOf(configured) ?? (typeof apiKey === "string" && apiKey !== "" ? apiKey : null);
+  const requestApi = typeof api === "string" ? api : null;
+  if (typeof apiKey === "string" && apiKey !== "") {
+    const [name, value] = keyHeader(requestApi, apiKey);
+    if (!configured.has(name)) configured.set(name, value);
+  }
   return {
-    target: { base: normalizeBase(typeof authBase === "string" ? authBase : baseUrl), credential },
+    target: { base: normalizeBase(typeof authBase === "string" ? authBase : baseUrl), auth: authOf(configured) },
     modelId: id,
-    api: typeof api === "string" ? api : null,
+    api: requestApi,
     configured: configured.get("route-policy"),
   };
 }
@@ -172,7 +185,7 @@ interface Guarded {
   prepared: Prepared;
 }
 
-const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", credential: null }, generation: 0 } });
+const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", auth: [] }, generation: 0 } });
 
 export interface PluginOptions {
   /** True where `before_provider_headers` lets the plugin set request headers (pi); false where it cannot (omp). */
@@ -189,7 +202,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     ui = uiOf(ctx) ?? ui;
   };
   const client = new RouteClient({ carriers: options.headerHook ? "header" : "suffix", env: options.env, onReport: (report) => show(ui, report) });
-  const stopGating = addGate((outgoing) => client.gate(outgoing));
+  const stopWatching = addWatcher({ check: (outgoing) => client.check(outgoing), stopped: (reason) => client.blocked(reason) });
 
   /** Blocks with `reason`, telling the user if that can be done; never throws. */
   const refuse = (reason: string): object => {
@@ -203,8 +216,9 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
 
   /**
    * The payload to hand back to the harness for a decision, and a blocked one for anything that cannot be sent.
-   * A request that may go is released with the identity it will have on the wire, so the fetch gate lets it, and
-   * only it, through. What is returned is a plain copy of the payload as judged.
+   * What is returned is a plain parse of the payload's serialization, checked to still carry what the decision
+   * relies on (the model as decided, OpenRouter's fields), and released by exactly those bytes: the fetch gate
+   * lets out that body with that header and authentication context, and nothing else.
    */
   const apply = ({ request, prepared }: Guarded, payload: unknown): unknown => {
     try {
@@ -220,16 +234,22 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         }
         const existing = payload["provider"];
         next = { ...next, model: decision.model, provider: { ...(isObject(existing) ? existing : {}), ...decision.provider } };
-      } else if (decision.model !== payload["model"]) {
+      } else if (decision.model !== (typeof payload["model"] === "string" ? payload["model"] : request.modelId)) {
         if (typeof payload["model"] !== "string") return refuse("the request has no model field to carry the policy");
         next = { ...next, model: decision.model };
       }
+      // Judged as serialized: a payload's own `toJSON`, or a getter, could drop or change what was set above.
       const copy: unknown = JSON.parse(JSON.stringify(next));
-      const model = next["model"];
-      client.release(
-        { ...prepared, decision },
-        { base: prepared.target.base, credential: prepared.target.credential, model: typeof model === "string" ? model : null, header: decision.action === "send" ? decision.header : null },
-      );
+      const carried = member(copy, "model");
+      const expected = decision.action === "translate" || typeof payload["model"] === "string" ? decision.model : undefined;
+      if (carried !== expected) return refuse("the request's model, as serialized, is not the one the policy was decided for");
+      if (decision.action === "translate") {
+        const provider = member(copy, "provider");
+        for (const [field, value] of Object.entries(decision.provider)) {
+          if (JSON.stringify(member(provider, field)) !== JSON.stringify(value)) return refuse(`the request, as serialized, does not carry OpenRouter's provider.${field} as translated`);
+        }
+      }
+      client.release({ ...prepared, decision }, decision.action === "send" ? decision.header : null, JSON.stringify(copy));
       return copy;
     } catch (error) {
       return refuse(`the plugin failed: ${reasonOf(error)}`);
@@ -258,9 +278,10 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   for (const event of options.restoreEvents) api.on(event, restore);
   api.on("session_shutdown", () => {
     try {
-      stopGating();
+      stopWatching();
+      withdrawReleases(client);
     } catch {
-      // Nothing to send here; a failure to stop listening affects no request.
+      // Nothing to send here; a session that ended sends nothing more.
     }
   });
 
@@ -337,7 +358,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     const queue = waiting.get(key) ?? [];
     const [first] = queue;
     if (first === undefined) return blockWith("the plugin did not see this request's headers, so it cannot tell which policy they carry");
-    const same = (p: Prepared): boolean => wireOf(p.decision) === wireOf(first.decision) && p.target.credential === first.target.credential;
+    const same = (p: Prepared): boolean => wireOf(p.decision) === wireOf(first.decision) && authKey(p.target.auth) === authKey(first.target.auth);
     if (!queue.every(same)) {
       waiting.delete(key);
       return blockWith("requests for this model were prepared with different policies or keys at once; resend it");

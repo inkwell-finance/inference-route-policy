@@ -25,9 +25,9 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     harness.wireKey = "demo-key-zdr";
     const result = await harness.request();
     assert.equal(result.sent, false);
-    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked: its key, model, or Route-Policy header differs/);
+    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its key, body, or Route-Policy header differs/);
     assert.equal(gateway().inference().length, 0);
-    assert.match(notices(harness).at(-1) ?? "", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked/, "the user is told");
+    assert.match(notices(harness).at(-1) ?? "", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released/, "the user is told");
     assert.deepEqual(
       [...new Set(gateway().requests.filter((r) => r.method === "GET").map((r) => r.headers.authorization))],
       ["Bearer demo-key"],
@@ -42,6 +42,43 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.ok((await harness.request()).sent);
     assert.deepEqual([...new Set(gateway().requests.filter((r) => r.method === "GET").map((r) => r.headers.authorization))], ["Bearer demo-key-zdr"]);
     assert.equal(gateway().inference().length, 1);
+  });
+
+  test(`C1, C14: ${name}: every credential header the request carries is in the metadata reads and must leave as read`, async () => {
+    const harness = await make("zdr");
+    harness.model.headers = { "x-api-key": "demo-key-zdr" };
+    assert.ok((await harness.request()).sent, "bearer and x-api-key both leave as they were read");
+    const gets = gateway().requests.filter((r) => r.method === "GET");
+    assert.ok(gets.length > 0 && gets.every((r) => r.headers.authorization === "Bearer demo-key" && r.headers["x-api-key"] === "demo-key-zdr"));
+    // A transport that sends another x-api-key than the one detection was read with is stopped.
+    harness.model.headers = {};
+    harness.extraWireHeaders = { "x-api-key": "demo-key-zdr" };
+    const result = await harness.request();
+    assert.match(result.error ?? "", /is not one the plugin released/);
+    assert.equal(gateway().inference().length, 1);
+  });
+
+  test(`C5, C14: ${name}: with two sessions in one process, each response goes to the session that sent the request`, async () => {
+    const first = await make("zdr");
+    const second = await make("zdr");
+    gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
+    await second.request();
+    assert.match(notices(second).at(-1) ?? "", /refused by the gateway: unsatisfiable/);
+    assert.ok(!notices(first).some((text) => text.includes("refused")), "the other session hears nothing of it");
+    gateway().replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+    await first.request();
+    assert.match(notices(first).at(-1) ?? "", /NOT honored/);
+    assert.ok(!notices(second).some((text) => text.includes("NOT honored")));
+  });
+
+  test(`C9: ${name}: a payload whose own toJSON drops OpenRouter's fields is blocked, not released without them`, async () => {
+    gateway().replies.detection = { status: 404 };
+    const harness = await make("only=aurora");
+    harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
+    const payload = { model: "vendor/model", messages: [], toJSON: () => ({ model: "vendor/model", messages: [] }) };
+    const result = await harness.request(payload);
+    assert.match(result.error ?? "", /does not carry OpenRouter's provider\.only as translated/);
+    assert.equal(gateway().inference().length, 0);
   });
 
   for (const broken of ["ui", "model", "modelRegistry"]) {

@@ -15,7 +15,8 @@ before(async () => {
 after(async () => {
   await gateway.close();
 });
-beforeEach(() => {
+beforeEach(async () => {
+  await FakeHarness.endAll();
   gateway.requests.length = 0;
   gateway.replies.detection = { status: 200, body: { route_policy: "1" } };
   gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr+notrain+bits=8" }] }] } };

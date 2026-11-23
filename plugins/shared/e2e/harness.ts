@@ -46,6 +46,10 @@ interface DemoStack {
   plain: string;
   /** The gateway behind a proxy that answers `GET /models` with 404 and passes everything else through. */
   withheld: string;
+  /** POSTs the withholding proxy has received since the last `clearRequests`. */
+  proxiedPosts(): number;
+  /** Makes the withholding proxy answer the next POST itself, with a retryable 503, instead of passing it on. */
+  failNextPost(): void;
   /** Every request each mock provider received. */
   requests(): Promise<ProviderRequest[]>;
   clearRequests(): Promise<void>;
@@ -68,7 +72,16 @@ async function startDemoStack(transcript: Transcript): Promise<DemoStack> {
   });
 
   const upstream = new URL(origin);
+  let proxiedPosts = 0;
+  let failNext = false;
   const proxy = createServer((incoming, outgoing) => {
+    if (incoming.method === "POST") proxiedPosts += 1;
+    if (incoming.method === "POST" && failNext) {
+      failNext = false;
+      incoming.resume();
+      outgoing.writeHead(503, { "content-type": "application/json", "retry-after": "0" }).end(JSON.stringify({ error: { message: "try again" } }));
+      return;
+    }
     if (incoming.method === "GET" && incoming.url?.endsWith("/models")) {
       outgoing.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "model list withheld" } }));
       return;
@@ -98,7 +111,12 @@ async function startDemoStack(transcript: Transcript): Promise<DemoStack> {
       assert.ok(Array.isArray(log), "the demo request log is a JSON array");
       return log;
     },
+    proxiedPosts: () => proxiedPosts,
+    failNextPost: () => {
+      failNext = true;
+    },
     clearRequests: async () => {
+      proxiedPosts = 0;
       await fetch(`${origin}/__demo/requests`, { method: "DELETE" });
     },
     stop: async () => {
@@ -260,6 +278,8 @@ const text = (line: RpcLine): string => String(line["message"] ?? line["statusTe
 interface Observed {
   shown: RpcLine[];
   requests: ProviderRequest[];
+  /** POSTs that reached the withholding proxy. */
+  proxiedPosts: number;
 }
 
 interface Case {
@@ -268,6 +288,8 @@ interface Case {
   policy: string;
   /** Loads the plugin through `e2e/faulty-plugin.ts`, with this fault (see shared/e2e/faulty.ts). */
   fault?: Fault;
+  /** Have the proxy answer the first POST with a retryable 503. */
+  failFirstPost?: true;
   /** Checks what was observed; returns the failures. */
   check(observed: Observed): string[];
 }
@@ -337,7 +359,17 @@ const CASES: readonly Case[] = [
     policy: "zdr",
     fault: "key",
     check: (observed) => [
-      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked: its key, model, or Route-Policy header differs/),
+      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its key, body, or Route-Policy header differs/),
+      ...expectNoProviderContent(observed),
+    ],
+  },
+  {
+    name: "(f) a released request is sent once: the first send gets a retryable 503, and no second copy leaves",
+    provider: "withheld",
+    policy: "zdr",
+    failFirstPost: true,
+    check: (observed) => [
+      ...(observed.proxiedPosts === 1 ? [] : [`expected exactly one POST to leave the harness, got ${observed.proxiedPosts}`]),
       ...expectNoProviderContent(observed),
     ],
   },
@@ -362,6 +394,7 @@ async function runCase(spec: HarnessSpec, sandbox: Sandbox, stack: DemoStack, tr
     log(shownFrom(from));
 
     await stack.clearRequests();
+    if (test.failFirstPost) stack.failNextPost();
     from = session.lines.length;
     session.send({ id: "ask", type: "prompt", message: "Say hello." });
     const end = await session.waitFor((line) => line["type"] === "agent_end", from, 60_000, "the end of the turn");
@@ -373,7 +406,8 @@ async function runCase(spec: HarnessSpec, sandbox: Sandbox, stack: DemoStack, tr
       const reply = "errorMessage" in last && typeof last.errorMessage === "string" && last.errorMessage !== "" ? `error: ${last.errorMessage}` : JSON.stringify("content" in last ? last.content : null);
       transcript.log(`  turn ended; last assistant message: ${reply}`);
     }
-    const observed: Observed = { shown: shownFrom(from), requests: await stack.requests() };
+    const observed: Observed = { shown: shownFrom(from), requests: await stack.requests(), proxiedPosts: stack.proxiedPosts() };
+    if (test.failFirstPost) transcript.log(`  POSTs that left the harness for the proxy: ${observed.proxiedPosts}`);
     log(observed.shown);
     transcript.log(`  GET /__demo/requests: ${JSON.stringify(observed.requests.map((r) => ({ provider: r.provider, path: r.path, model: typeof r.body === "object" && r.body !== null && "model" in r.body ? r.body.model : null })))}`);
     const failures = test.check(observed);
