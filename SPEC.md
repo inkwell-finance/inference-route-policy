@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 4.
+Draft 5.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -18,7 +18,7 @@ example-model+zdr+sort=price
 Route-Policy: zdr+notrain+bits=8+region=us,de+sort=latency
 
 # What came back:
-Route-Applied: provider=aurora+zdr+notrain+bits=8+region=us
+Route-Applied: provider=aurora
 ```
 
 ## Motivation
@@ -230,7 +230,8 @@ A fact is a property of the route. Which facts a gateway publishes does
 not depend on which keys or values it accepts in requests.
 
 A route whose facts include `attest` MUST also carry `evidence`: the
-absolute URI of the provider's own evidence for that route (see
+absolute URI of the provider's own evidence for that route, with no
+comma and no whitespace in it; a comma is percent-encoded (see
 [Result](#result)).
 
 A route meets a policy when all of these hold:
@@ -254,24 +255,27 @@ not know. Neither can be something it required. Facts are **invalid**
 when they do not fit the grammar or limits, when `zdr`, `notrain`,
 `bits`, or `region` has a value that is not valid for it, when `attest`
 is a flag instead of a list, or when they contain `only`, `ignore`,
-`sort`, `order`, or `provider`. A reader MUST
+`sort`, or `order`. A reader MUST
 treat a route with invalid facts as meeting no policy that has a
 requirement, `only` and `ignore` included.
 
-Facts let a client show which choices exist before sending anything.
-Prices and measured speed are not facts and are not defined here.
+Facts let a client show which choices exist before sending anything,
+and tell what the provider named in `Route-Applied` meets. Prices and
+measured speed are not facts and are not defined here.
 
 ## Result
 
 A gateway relays a route's response, or it answers itself. A route
-**fails** when the gateway decides, before it has sent the status line
-of its final response to the client, not to relay that route's
-response: on a connection error, a timeout, or a status the gateway
-treats as retryable. Which conditions count is the gateway's choice. An
+**fails** when the gateway decides, before it has committed the status
+and headers of its final response to the client, not to relay that
+route's response: on a connection error, a timeout, or a status the
+gateway treats as retryable. Which conditions count is the gateway's
+choice. The final response is committed with its status line in
+HTTP/1.1 and with its header block in HTTP/2 and HTTP/3; an
 informational (1xx) response is not the final response. When a route
-fails, the gateway MAY try another qualifying route. Once it has sent
-the status line of its final response it MUST NOT move the request to
-another route.
+fails, the gateway MAY try another qualifying route. Once it has
+committed its final response it MUST NOT move the request to another
+route.
 
 Every request ends in exactly one of these outcomes. They are listed in
 the order a gateway decides them:
@@ -282,7 +286,7 @@ the order a gateway decides them:
 | **No policy** reached the request, by any carrier. | As without this protocol | MAY | MUST NOT | MUST NOT |
 | **Refused before routing.** A policy reached it and is `unsupported`, or no route meets it. | 400 | MUST NOT | MUST: `unsupported` or `unsatisfiable` | MUST NOT |
 | **Unavailable.** A policy reached it, routes qualify, and every one tried failed. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
-| **Relayed.** A policy reached it and a qualifying route's response is relayed. | The route's | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
+| **Relayed.** A policy reached it and a qualifying route's response is relayed. | The route's, with the route's body | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
 
 An own error comes first: a gateway does not check a policy on a
 request it would reject anyway, and no content is sent. Every rule in
@@ -291,23 +295,25 @@ those checks. A relayed response is never rewritten as a refusal, and a
 refusal never carries a provider's body.
 
 ```
-applied := "provider=" item ("+" facts)?
+applied := "provider=" item
 ```
 
 ```
-Route-Applied: provider=aurora+zdr+notrain+bits=8+region=us
+Route-Applied: provider=aurora
 ```
 
 `Route-Applied` names the provider id of the route whose response is
-relayed, followed by that route's published facts when they are not
-empty.
+relayed, and nothing else. What that route meets is in its published
+[facts](#facts). The value holds no comma, so two field lines joined
+into one value never read as one valid value.
 
 `Route-Evidence: <URI>` is the `evidence` URI published for that route:
 where the provider serves its own attestation evidence covering this
 response. The document's format and how to verify it are defined by the
 provider's attestation scheme, not here. The gateway MUST NOT put a
 verdict or summary of its own at that URI or in the header; it points
-at the provider's evidence and nothing else.
+at the provider's evidence and nothing else. Because the URI has no
+comma and no whitespace, two joined lines never read as one.
 
 A gateway MUST NOT pass a `Route-Applied`, `Route-Refused`, or
 `Route-Evidence` header it received from a provider through to the
@@ -340,8 +346,8 @@ An `unsupported` or `unsatisfiable` request is refused before any
 content is sent to any provider. An `unavailable` request has sent
 content only to routes that meet the combined policy.
 
-The response body is whatever error shape the API surface normally
-uses.
+The response body is an error in the shape the gateway uses for its own
+errors on that endpoint.
 
 ## Detection
 
@@ -421,6 +427,13 @@ on both carriers together, preferences included. Without such a reply
 it does not send the request: no content leaves the client. A request
 whose policies contain only preferences MAY be sent without detection.
 
+A client MAY reuse a valid reply for later requests to the same base
+URL with the same credentials, and MUST NOT use it for any other base
+URL or credentials. It MUST discard the reply when a request
+it sent with a requirement comes back not honored, and fetch a new one
+before it sends another requirement there. It SHOULD NOT keep a reply
+from one run of the client to the next.
+
 **Holding a policy.** A client that holds a policy of its own, and
 finds another typed into the model id as a suffix, applies both. Where
 it can use both carriers, it sends its own by the header and leaves the
@@ -438,12 +451,24 @@ and the key when there is one.
 
 For a request it sent with a requirement, a client MUST treat the
 policy as **not honored** when the response has no `Route-Refused` and
-does not have exactly one `Route-Applied` field line that fits the
-`applied` grammar with valid facts: it MUST NOT report the policy as
-applied, to its user or to code that asks. Repeated `Route-Applied`
-lines are not one, whether the client sees them apart or joined. It
-SHOULD check that the provider and facts in `Route-Applied` meet the
-requirements it sent, and treat a mismatch the same way.
+any of these holds:
+
+- it does not have exactly one `Route-Applied` value that fits the
+  `applied` grammar. A joined repetition does not fit, so a client that
+  sees only joined values applies the same test;
+- the policy it sent has `attest`, and the response does not have
+  exactly one `Route-Evidence` value that is an absolute URI with no
+  comma and no whitespace.
+
+A client MUST NOT report a policy that was not honored as applied, to
+its user or to code that asks. It SHOULD also check that the provider
+named, with the facts the gateway publishes for that route of the
+model, meets the requirements it sent, and treat a provider that is not
+among the model's published routes, invalid facts, or a mismatch as not
+honored. Honored means the gateway named a route and, for `attest`,
+said where its evidence is. It does not mean anyone verified that
+evidence, and without the check above it does not mean the route's
+published facts were compared with the policy.
 
 **Claims.** A client SHOULD NOT present a fact as verified unless it
 verified the evidence for it itself.
@@ -477,8 +502,8 @@ result as **unconfirmed**: it MUST NOT report the policy as applied.
 - **Result headers come from the gateway.** A provider that returns
   `Route-Applied` cannot speak for the gateway, because the gateway
   drops it.
-- `Route-Applied` and `Route-Refused` carry provider ids and keys from
-  this document, nothing from the content and nothing secret.
+- `Route-Applied` carries a provider id and `Route-Refused` a key from
+  this document: nothing from the content and nothing secret.
 
 ## Limits
 
@@ -491,9 +516,7 @@ result as **unconfirmed**: it MUST NOT report the policy as applied.
 | Item | 32 bytes |
 
 These apply to a policy on a carrier, to a key default, and to a facts
-string. In `Route-Applied` they apply to the facts that follow the
-provider, not to the whole value. The limits are the same at every
-gateway.
+string. The limits are the same at every gateway.
 
 ## Adoption
 

@@ -15,8 +15,8 @@ const BASELINE_SORT: readonly string[] = ["price", "latency", "throughput"];
 
 /** Keys whose presence restricts which routes qualify. `sort` and `order` only order them. */
 const REQUIREMENT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore"];
-/** Keys a route's facts may never carry: the ones that are not facts, and the envelope key of `Route-Applied`. */
-const NOT_FACTS: Readonly<Record<string, true>> = { only: true, ignore: true, sort: true, order: true, provider: true };
+/** Keys a route's facts may never carry, because they are not facts. */
+const NOT_FACTS: Readonly<Record<string, true>> = { only: true, ignore: true, sort: true, order: true };
 
 const KEY_SOURCE = "[a-z][a-z0-9]{0,15}";
 const KEY = new RegExp(`^${KEY_SOURCE}$`);
@@ -201,8 +201,19 @@ export function formatPolicy(policy: Policy): Result<string> {
   const parsed = parsePolicy(text);
   if (!parsed.ok) return parsed;
   // Joining can change meaning without breaking the grammar, so the string must read back as the same policy.
-  const fields = (p: Policy): unknown[] => [p.zdr, p.notrain, p.bits, p.region, p.attest, p.only, p.ignore, p.sort, p.order];
-  return JSON.stringify(fields(parsed.value)) === JSON.stringify(fields(policy)) ? { ok: true, value: text } : fail(null, "holds a value that does not read back as written");
+  const same = (a: readonly string[] | null, b: readonly string[] | null): boolean => (a === null || b === null ? a === b : a.length === b.length && a.every((item, i) => item === b[i]));
+  const read = parsed.value;
+  const unchanged =
+    read.zdr === policy.zdr &&
+    read.notrain === policy.notrain &&
+    read.bits === policy.bits &&
+    read.sort === policy.sort &&
+    same(read.region, policy.region) &&
+    same(read.attest, policy.attest) &&
+    same(read.only, policy.only) &&
+    same(read.ignore, policy.ignore) &&
+    same(read.order, policy.order);
+  return unchanged ? { ok: true, value: text } : fail(null, "holds a value that does not read back as written");
 }
 
 /** The keys a policy uses, for checking them against a detection reply. */
@@ -359,33 +370,28 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
   return [...first, ...rest];
 }
 
-/** Whether a string can be a provider id on the wire (S17). */
-export const isProviderId = (id: string): boolean => ITEM.test(id);
+/** Whether a value can be a provider id on the wire (S17). Anything that is not a string is not one. */
+export const isProviderId = (id: unknown): id is string => typeof id === "string" && ITEM.test(id);
+
+/** Whether a value is an absolute URI with no comma and no whitespace: an `evidence` URI or a `Route-Evidence` value (S18). */
+export const isEvidenceUri = (uri: unknown): uri is string => typeof uri === "string" && /^[A-Za-z][A-Za-z0-9+.-]*:[^\s,]+$/.test(uri);
 
 /**
- * The `Route-Applied` value for the route whose response is relayed (S14), from that route's published facts
- * string. Throws on a provider id that is not an item or facts that may not be published: a gateway checks both
- * when it loads its routes, so either reaching here is a programming error, and writing it would produce a header
- * no reader accepts or one that claims what the route does not.
+ * The `Route-Applied` value for the route whose response is relayed (S14). Throws on a provider id that is not an
+ * item: a gateway checks its ids when it loads its routes, so one reaching here is a programming error, and writing
+ * it would produce a header no reader accepts.
  */
-export function formatApplied(provider: string, publishedFacts: string): string {
-  if (!isProviderId(provider)) throw new RangeError(`"${provider}" is not a provider id`);
-  const facts = parsePublishedFacts(publishedFacts);
-  if (!facts.ok) throw new RangeError(`"${publishedFacts}" may not be published as facts: ${facts.detail}`);
-  return publishedFacts === "" ? `provider=${provider}` : `provider=${provider}+${publishedFacts}`;
+export function formatApplied(provider: string): string {
+  if (!isProviderId(provider)) throw new RangeError(`"${String(provider)}" is not a provider id`);
+  return `provider=${provider}`;
 }
 
-/** Reads `Route-Applied` (S14): the provider first, then facts read as `parseFacts` reads them, under their own limits. */
-export function parseApplied(text: string): Result<{ provider: string; facts: Facts }> {
+/** Reads `Route-Applied` (S14) and returns the provider id it names. Two lines joined into one value do not parse. */
+export function parseApplied(text: string): Result<string> {
   const prefix = "provider=";
   if (!text.startsWith(prefix)) return fail("provider", "does not begin with the provider");
-  const plus = text.indexOf("+");
-  const provider = text.slice(prefix.length, plus < 0 ? undefined : plus);
-  if (!isProviderId(provider)) return fail("provider", "malformed provider id");
-  // `provider=x+` is malformed; `provider=x` alone is a route that meets nothing.
-  if (plus === text.length - 1) return fail(null, "nothing after the last +");
-  const facts = parseFacts(plus < 0 ? "" : text.slice(plus + 1));
-  return facts.ok ? { ok: true, value: { provider, facts: facts.value } } : facts;
+  const provider = text.slice(prefix.length);
+  return isProviderId(provider) ? { ok: true, value: provider } : fail("provider", "is not exactly one provider id");
 }
 
 export type RefusalReason = "unsupported" | "unsatisfiable" | "unavailable";
@@ -400,9 +406,9 @@ export const REFUSAL_STATUS: Readonly<Record<RefusalReason, number>> = Object.fr
 export function formatRefused(reason: "unsupported", key?: string | null): string;
 export function formatRefused(reason: "unsatisfiable" | "unavailable"): string;
 export function formatRefused(reason: RefusalReason, key: string | null = null): string {
-  if (!Object.hasOwn(REFUSAL_STATUS, reason)) throw new RangeError(`"${reason}" is not a refusal reason`);
+  if (typeof reason !== "string" || !Object.hasOwn(REFUSAL_STATUS, reason)) throw new RangeError(`"${String(reason)}" is not a refusal reason`);
   if (key === null) return `reason=${reason}`;
-  if (reason !== "unsupported" || !KEY.test(key)) throw new RangeError(`cannot name key "${key}" in a "${reason}" refusal`);
+  if (reason !== "unsupported" || typeof key !== "string" || !KEY.test(key)) throw new RangeError(`cannot name key "${String(key)}" in a "${reason}" refusal`);
   return `reason=${reason}+key=${key}`;
 }
 
@@ -477,10 +483,20 @@ export function parseDetection(body: unknown): Result<Detection> {
 }
 
 /**
- * The detection reply body a gateway with this `support` sends. Throws on a bound policy the gateway would refuse:
- * it may not bind one (G10), and a client would treat the whole reply as no detection.
+ * The detection reply body a gateway with this `support` sends. Throws on anything a client would not accept or
+ * the gateway could not honor: a list entry this revision does not define, which `parsePolicy` would refuse
+ * however it is listed, or a bound policy that fails the order of checks, which the gateway may not bind (G36).
  */
 export function formatDetection(support: Support, keyPolicy: string | null = null): Record<string, unknown> {
+  const lists: [name: string, listed: ReadonlySet<string>, definedHere: readonly string[]][] = [
+    ["keys", support.keys, BASELINE_KEYS],
+    ["attest", support.attest, BASELINE_ATTEST],
+    ["sort", support.sort, BASELINE_SORT],
+  ];
+  for (const [name, listed, definedHere] of lists) {
+    const unknown = [...listed].find((entry) => !definedHere.includes(entry));
+    if (unknown !== undefined) throw new RangeError(`"${String(unknown)}" in ${name} is not defined by this revision`);
+  }
   if (keyPolicy !== null) {
     const bound = parsePolicy(keyPolicy, support);
     if (!bound.ok) throw new RangeError(`key policy "${keyPolicy}" fails the order of checks: ${bound.detail}`);
@@ -504,24 +520,52 @@ export function clearedToSend(support: Support | null, policies: readonly Policy
   return support !== null && policies.every((policy) => supports(support, policy));
 }
 
+/** The values of each result header's field lines, or one joined value each where that is all the client can see. */
+export interface ResultHeaders {
+  applied: readonly string[];
+  refused: readonly string[];
+  evidence: readonly string[];
+}
+
 export type Outcome =
   | { outcome: "refused"; reason: RefusalReason | null; key: string | null }
-  | { outcome: "honored"; provider: string; facts: Facts }
+  /** `checked` is false when the client had no model list to compare the route's published facts with (C4). */
+  | { outcome: "honored"; provider: string; evidence: string | null; checked: boolean }
   | { outcome: "not-honored"; why: string };
 
 /**
- * What a response says about the policy a client sent with a requirement (C3, C4, C5). `applied` and `refused` are
- * the values of every `Route-Applied` and `Route-Refused` field line, or one joined value each where that is all
- * the client can see. Any `Route-Refused` is a refusal, parsed or not, whatever else is there. Otherwise the policy
- * is honored only by exactly one `Route-Applied` that parses, has valid facts, and meets `sent`.
+ * What a response says about the policy a client sent with a requirement (C3, C4, C5). Any `Route-Refused` is a
+ * refusal, parsed or not, whatever else is there. Otherwise the policy is honored only by exactly one valid
+ * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the published
+ * facts string of each route of the model by provider id, from the gateway's model list, or null when the client
+ * has none: with it, the named provider must be published there with valid facts that meet `sent`; without it,
+ * only the provider-id requirements can be checked.
  */
-export function readOutcome(applied: readonly string[], refused: readonly string[], sent: Policy): Outcome {
-  if (refused.length > 0) {
-    const parsed = refused.length === 1 ? parseRefused(refused[0]!) : null;
+export function readOutcome(headers: ResultHeaders, sent: Policy, routes: ReadonlyMap<string, string> | null): Outcome {
+  if (headers.refused.length > 0) {
+    const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
     return parsed?.ok ? { outcome: "refused", ...parsed.value } : { outcome: "refused", reason: null, key: null };
   }
-  if (applied.length !== 1) return { outcome: "not-honored", why: applied.length === 0 ? "no Route-Applied" : "more than one Route-Applied" };
-  const parsed = parseApplied(applied[0]!);
-  if (!parsed.ok) return { outcome: "not-honored", why: `Route-Applied is not valid: ${parsed.detail}` };
-  return meets(parsed.value, sent) ? { outcome: "honored", ...parsed.value } : { outcome: "not-honored", why: `route "${parsed.value.provider}" does not meet the policy sent` };
+  const notHonored = (why: string): Outcome => ({ outcome: "not-honored", why });
+  if (headers.applied.length !== 1) return notHonored(headers.applied.length === 0 ? "no Route-Applied" : "more than one Route-Applied");
+  const applied = parseApplied(headers.applied[0]!);
+  if (!applied.ok) return notHonored(`Route-Applied is not valid: ${applied.detail}`);
+  const provider = applied.value;
+
+  let evidence: string | null = null;
+  if (sent.attest.length > 0) {
+    const [uri] = headers.evidence;
+    if (headers.evidence.length !== 1 || !isEvidenceUri(uri)) return notHonored("attest was required and there is not exactly one valid Route-Evidence");
+    evidence = uri;
+  }
+
+  if (routes === null) {
+    const named = (sent.only === null || sent.only.includes(provider)) && !sent.ignore.includes(provider);
+    return named ? { outcome: "honored", provider, evidence, checked: false } : notHonored(`provider "${provider}" is excluded by the policy sent`);
+  }
+  const published = routes.get(provider);
+  if (published === undefined) return notHonored(`provider "${provider}" is not among the model's published routes`);
+  const facts = parseFacts(published);
+  if (!facts.ok) return notHonored(`the facts published for "${provider}" are not valid: ${facts.detail}`);
+  return meets({ provider, facts: facts.value }, sent) ? { outcome: "honored", provider, evidence, checked: true } : notHonored(`route "${provider}" does not meet the policy sent`);
 }
