@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 17.
+Draft 18.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -411,7 +411,13 @@ detection is `https://gateway.example/v1/route-policy?tenant=east`.
 Trailing `/` characters are removed from the base URL's path before a
 path is appended. The query is kept exactly as given, an empty one (a
 bare `?`) included. Two base URLs that differ in their query are
-different base URLs, and an empty query is not the same as none.
+different base URLs, and an empty query is not the same as none. Two
+spellings that RFC 3986 defines as equivalent, differing only in the
+case of the scheme or host, a default port, or dot segments, are one
+base URL. A client whose URL handling would send a base URL's path or
+query other than as written, for example by percent-encoding a
+character, has no detection for the base URL as written, and so sends
+no requirement to it.
 Detection does not require credentials. The reply
 has status `200` and a JSON object as its body:
 

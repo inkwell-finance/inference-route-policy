@@ -62,8 +62,7 @@ export const contextKey = (context: RequestContext): string => JSON.stringify(co
 /**
  * Where a request goes: the base URL without its query, and the query, which every request there carries too.
  * Both are as `fetch` puts them on the wire: the URL parser's serialization, which is the request target `fetch`
- * sends (scheme and host lowercased, default port and dot segments removed, percent-encoding and `+` kept as
- * given). Metadata reads and the released request are both read through it, so equal here is equal on the wire.
+ * sends. Metadata reads and the released request are both read through it, so equal here is equal on the wire.
  */
 export interface Place {
   /** Scheme, host, and path, without trailing slashes. */
@@ -78,10 +77,10 @@ export interface Place {
  */
 function queryOf(url: URL): string {
   if (url.search !== "") return url.search;
-  // Without its fragment, a URL whose serialization ends in "?" has an empty query.
-  const bare = new URL(url.href);
-  bare.hash = "";
-  return bare.href.endsWith("?") ? "?" : "";
+  // The serialization escapes every "#" before the fragment's, so the first one starts it.
+  const href = url.href;
+  const hash = href.indexOf("#");
+  return (hash === -1 ? href : href.slice(0, hash)).endsWith("?") ? "?" : "";
 }
 
 /** A URL `fetch` can send: credentials in it make `fetch` refuse the request, so they name no place. */
@@ -89,8 +88,55 @@ function sendable(url: URL): boolean {
   return url.username === "" && url.password === "";
 }
 
-/** A base URL as a place, or null when it is not an absolute URL `fetch` can send to. */
-export function placeOf(baseUrl: string): Place | null {
+/** RFC 3986, 5.2.4: a path without its "." and ".." segments, "/" when nothing is left. */
+function withoutDotSegments(path: string): string {
+  const segments = path.split("/").slice(1);
+  const kept: string[] = [];
+  for (const [index, segment] of segments.entries()) {
+    const last = index === segments.length - 1;
+    if (segment === "." || segment === "..") {
+      if (segment === "..") kept.pop();
+      if (last) kept.push("");
+    } else {
+      kept.push(segment);
+    }
+  }
+  return `/${kept.join("/")}`;
+}
+
+const DEFAULT_PORTS: Readonly<Record<string, string>> = { "http:": "80", "https:": "443" };
+
+/**
+ * How the parser would send the base URL other than as written, or null when it sends it as written. Written
+ * and sent may differ only where RFC 3986 says the two name the same resource: the case of the scheme and of an
+ * ASCII host (6.2.2.1), a default or empty port (6.2.3), an empty path as "/" (6.2.3), and "." and ".." segments
+ * (6.2.2.3). Anything else the parser rewrites, such as a character it percent-encodes, a backslash, a tab, a
+ * non-ASCII host, or another spelling of an IP address, would send the request somewhere not written.
+ */
+function rewritten(written: string, url: URL): string | null {
+  const parts = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#[\s\S]*)?$/.exec(written);
+  if (parts === null) return "it is not written as scheme://host/path?query";
+  const [, scheme = "", authority = "", path = "", query = "", fragment] = parts;
+  if (fragment !== undefined) return `its fragment ${JSON.stringify(fragment)} is never sent`;
+  const differences: string[] = [];
+  if (`${scheme.toLowerCase()}:` !== url.protocol) differences.push(`its scheme ${JSON.stringify(scheme)} would be sent as ${JSON.stringify(url.protocol.slice(0, -1))}`);
+  const hostPort = /^(\[[^\]]*\]|[^:]*)(?::(\d*))?$/.exec(authority);
+  const host = hostPort?.[1] ?? authority;
+  const port = hostPort?.[2] ?? "";
+  if (host.toLowerCase() !== url.hostname) differences.push(`its host ${JSON.stringify(host)} would be sent as ${JSON.stringify(url.hostname)}`);
+  if (port !== url.port && !(url.port === "" && port === DEFAULT_PORTS[url.protocol])) {
+    differences.push(`its port ${JSON.stringify(port)} would be sent as ${JSON.stringify(url.port)}`);
+  }
+  if (withoutDotSegments(path) !== url.pathname) differences.push(`its path ${JSON.stringify(path)} would be sent as ${JSON.stringify(url.pathname)}`);
+  if (query !== queryOf(url)) differences.push(`its query ${JSON.stringify(query)} would be sent as ${JSON.stringify(queryOf(url))}`);
+  return differences.length === 0 ? null : differences.join(", and ");
+}
+
+/**
+ * A base URL as a place, with why it cannot be used exactly as written (null when it can); null instead when it
+ * is not an absolute URL `fetch` can send to. A place that is not as written may carry no policy (C14).
+ */
+export function placeOf(baseUrl: string): { place: Place; unexact: string | null } | null {
   let url: URL;
   try {
     url = new URL(baseUrl);
@@ -98,7 +144,11 @@ export function placeOf(baseUrl: string): Place | null {
     return null;
   }
   if (!sendable(url)) return null;
-  return { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: queryOf(url) };
+  const difference = rewritten(baseUrl, url);
+  return {
+    place: { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: queryOf(url) },
+    unexact: difference === null ? null : `the base URL ${JSON.stringify(baseUrl)} cannot be used exactly as written: ${difference}; a policy is not sent anywhere else`,
+  };
 }
 
 /** A request as it leaves through `fetch`, before anything is sent. */

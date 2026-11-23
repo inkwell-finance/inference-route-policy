@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { OPENROUTER_BASE } from "../src/openrouter.ts";
 import type { FakeHarness } from "./fake-harness.ts";
+import { PATH_QUERY_CASES, WHOLE_URL_CASES } from "./url-cases.ts";
 import type { FakeGateway } from "./fixtures.ts";
 
 const notices = (harness: FakeHarness): string[] => harness.shown.filter((s) => s.method === "notify").map((s) => s.text);
@@ -115,6 +116,45 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     harness.wireUrl = `${base}/chat/completions`;
     assert.match((await harness.request()).error ?? "", /is not one the plugin released/);
     assert.equal(gateway().inference().length, 1);
+  });
+
+  test(`C14: ${name}: a base URL the parser would send otherwise than written reaches nothing, metadata included, and says what would be sent; written as sent, it is read and sent byte for byte`, async () => {
+    const origin = new URL(gateway().base).origin;
+    for (const { name: kind, path, query, sentPath, sentQuery, difference } of PATH_QUERY_CASES) {
+      const harness = await make("zdr");
+      harness.model.baseUrl = `${origin}${path}${query}`;
+      harness.wireUrl = `${origin}${sentPath}/chat/completions${sentQuery}`;
+      const before = gateway().requests.length;
+      const result = await harness.request();
+      const received = gateway().requests.slice(before).map((r) => `${r.method} ${r.path}`);
+      if (difference === null) {
+        assert.ok(result.sent, `${kind}: ${result.error ?? ""}`);
+        assert.deepEqual(received, [`GET ${sentPath}/route-policy${sentQuery}`, `GET ${sentPath}/models${sentQuery}`, `POST ${sentPath}/chat/completions${sentQuery}`], kind);
+      } else {
+        assert.ok(result.error?.includes(`cannot be used exactly as written: ${difference}`), `${kind}: ${result.error ?? "sent"}`);
+        assert.deepEqual(received, [], `${kind}: nothing reaches the gateway`);
+      }
+    }
+  });
+
+  test(`C14: ${name}: a host the parser would spell otherwise than written reaches nothing; a scheme and host differing only in case are used`, async () => {
+    const port = new URL(gateway().base).port;
+    for (const { name: kind, written, difference } of WHOLE_URL_CASES) {
+      if (!written.includes("{port}")) continue;
+      const harness = await make("zdr");
+      harness.model.baseUrl = written.replace("{port}", port).replace("GATEWAY.TEST", "127.0.0.1");
+      harness.wireUrl = `http://127.0.0.1:${port}/v1/chat/completions`;
+      const before = gateway().requests.length;
+      const result = await harness.request();
+      const received = gateway().requests.slice(before).length;
+      if (difference === null) {
+        assert.ok(result.sent, `${kind}: ${result.error ?? ""}`);
+        assert.equal(received, 3, kind);
+      } else {
+        assert.ok(result.error?.includes(`cannot be used exactly as written: ${difference}`), `${kind}: ${result.error ?? "sent"}`);
+        assert.equal(received, 0, `${kind}: nothing reaches the gateway`);
+      }
+    }
   });
 
   test(`C1, C14: ${name}: a configured header that is not a string is not read as context, so a transport that sends it anyway is stopped`, async () => {

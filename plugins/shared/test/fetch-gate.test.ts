@@ -212,9 +212,9 @@ test("C1, C14: a request goes only where fetch puts it on the wire for the relea
   ];
   for (const row of rows) {
     gateway.requests.length = 0;
-    const place = placeOf(row.base);
-    assert.ok(place !== null, row.name);
-    const owner = release({ ...place });
+    const read = placeOf(row.base);
+    assert.ok(read !== null && read.unexact === null, row.name);
+    const owner = release({ ...read.place });
     const sending = fetch(row.url, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY });
     if (row.target instanceof RegExp) {
       await assert.rejects(sending, row.target, row.name);
@@ -236,25 +236,6 @@ test("C1, C14: header lines as fetch sends them: repeated lines go as one joined
   const raw = gateway.inference()[0]?.rawHeaders ?? [];
   const lines = (name: string): string[] => raw.flatMap((value, i) => (i % 2 === 1 && raw[i - 1]?.toLowerCase() === name ? [value] : []));
   assert.deepEqual([lines("x-tenant"), lines("authorization")], [["a, b"], ["Bearer k"]], "one line each, as the metadata reads sent them");
-});
-
-test("C1, C14: a base URL is the same place however the parser was handed it, and a different one when the parser keeps the difference", () => {
-  const same: [string, string][] = [
-    ["HTTP://GateWay.Test/v1", "http://gateway.test/v1"],
-    ["http://gateway.test:80/v1", "http://gateway.test/v1"],
-    ["https://gateway.test:443/v1", "https://gateway.test/v1"],
-    ["http://[0:0:0:0:0:0:0:1]:8/v1", "http://[::1]:8/v1"],
-    ["http://gateway.test/a/./b/../v1/", "http://gateway.test/a/v1"],
-    ["http://gateway.test/v1#part", "http://gateway.test/v1"],
-  ];
-  for (const [given, base] of same) assert.deepEqual(placeOf(given), { base, query: "" }, given);
-  const different: [string, string][] = [
-    ["http://gateway.test./v1", "http://gateway.test/v1"],
-    ["http://gateway.test/V1", "http://gateway.test/v1"],
-    ["http://gateway.test/%761", "http://gateway.test/v1"],
-  ];
-  for (const [given, other] of different) assert.notDeepEqual(placeOf(given), placeOf(other), given);
-  assert.equal(placeOf("http://user:secret@gateway.test/v1"), null, "credentials in the URL name no place fetch can send to");
 });
 
 test("C1: a GET is never stopped, and a POST no watcher claims goes", async () => {

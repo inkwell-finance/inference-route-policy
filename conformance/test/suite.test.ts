@@ -985,8 +985,8 @@ test("G15 G20: a single selected endpoint may commit a valid response slowly", a
   assert.equal(report.failed + report.skipped, 0);
 });
 
-for (const query of ["", "?", "?tenant=east", "?a=first&a=second", "?tag=a%2bb&tag=a+b&flag=%3F&v='raw'"]) {
-  test(`G20 G23 G9: raw request targets retain ${JSON.stringify(query) || "no query"}`, async (t) => {
+for (const query of ["", "?", "?tenant=east", "?a=first&a=second", "?tag=O'Brien", "?tag=O%27Brien", "?tag=a%2bb&tag=a+b&flag=%3F"]) {
+  test(`G20 G23 G9: raw request targets retain ${query === "" ? "no query" : JSON.stringify(query)}`, async (t) => {
     const upstream = await baseAt(t, serve(good, 0), "");
     const paths = ["route-policy", "models", ...INFERENCE_ENDPOINTS].map((endpoint) => `/v1/${endpoint}${query}`);
     const actual = new Set<string | undefined>();
@@ -1014,7 +1014,7 @@ for (const query of ["", "?", "?tenant=east", "?a=first&a=second", "?tag=a%2bb&t
 test("G20 G23: an unescaped base request target is rejected before any probe", async (t) => {
   let count = 0;
   const base = await baseAt(t, serve((request, transport) => { count++; return good(request, transport); }, 0));
-  for (const invalid of [`${base}?tenant=two words`, `${base}/naïve`, `${base}\\tenant`]) {
+  for (const invalid of [`${base}?tenant=two words`, `${base}/naïve`, `${base}?tenant=\tq`, `${base}?tenant=\r\nq`, `${base}?tenant=\x00q`, `${base}\\tenant`]) {
     await assert.rejects(runConformance({ base: invalid }), /cannot reproduce the base URL's request target exactly/);
   }
   assert.equal(count, 0);
@@ -1075,4 +1075,165 @@ test("G8 G9 G11: structural policy errors alone cannot verify an accepted carrie
   const report = await run(t, target);
   assert.equal(report.failed, 0);
   for (const id of ["G8", "G9", "G11"]) assert.equal(report.checks.find((entry) => entry.id === id)?.status, "SKIP");
+});
+
+for (const broken of ["none", "header", "suffix"] as const) {
+  test(`G11: a one-route catalog exposes ${broken === "none" ? "both valid carrier orders" : `dropping the impossible ${broken} requirement`}`, async (t) => {
+    const open = createGateway({
+      models: { [model]: [{ ...routes[0]!, facts: "zdr" }] }, accept: { keys: ["zdr", "notrain"] },
+      fetch: () => Response.json({ output: "served" }),
+    });
+    const pairs = new Set<string>();
+    const report = await run(t, fixture(({ header, suffix, next, rewrite }) => {
+      if ((header !== "zdr" || suffix !== "notrain") && (header !== "notrain" || suffix !== "zdr")) return next();
+      pairs.add(`${header}:${suffix}`);
+      if (broken === "header" && header === "notrain") return rewrite({ header: null });
+      if (broken === "suffix" && suffix === "notrain") return rewrite({ suffix: null });
+      return next();
+    }, open));
+    const check = report.checks.find(({ id }) => id === "G11");
+    assert.equal(check?.status, broken === "none" ? "PASS" : "FAIL");
+    if (broken === "none") assert.deepEqual(pairs, new Set(["zdr:notrain", "notrain:zdr"]));
+    if (broken === "header") assert.ok(pairs.has("notrain:zdr"));
+    if (broken === "suffix") assert.ok(pairs.has("zdr:notrain"));
+    if (broken !== "none") assert.match(check.detail, /both valid carriers constrain the request/);
+  });
+}
+
+test("G11: a policy satisfied by the sole route in both carriers cannot demonstrate omission of either", async (t) => {
+  const open = createGateway({
+    models: { [model]: [routes[0]!] }, accept: { keys: ["zdr"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, open);
+  const check = report.checks.find(({ id }) => id === "G11");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /distinguishing omission of the header and suffix/);
+});
+
+for (const order of [[0, 1], [1, 0]] as const) test(`G11: provider-only narrowing ${order[0] === 0 ? "is observable with the weaker provider first" : "is inconclusive when every probe relays the same provider"}`, async (t) => {
+  const modelRoutes = [{ ...routes[0]!, facts: "bits=8" }, { ...routes[1]!, facts: "bits=64", evidence: undefined }];
+  const open = createGateway({
+    models: { [model]: order.map((i) => {
+      const { evidence: _evidence, ...route } = modelRoutes[i]!;
+      return route;
+    }) }, accept: { keys: ["bits"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, open);
+  const check = report.checks.find(({ id }) => id === "G11");
+  assert.equal(check?.status, order[0] === 0 ? "PASS" : "SKIP");
+});
+
+for (const comparable of [true, false]) test(`G34: a missing traceId ${comparable ? "matches an observed bad input field error" : "is inconclusive without a comparable HTTP 400 field error"}`, async (t) => {
+  const fieldControls = new Set<string | null>();
+  const report = await run(t, fixture(async ({ body, request, auth, next }) => {
+    if (request.method !== "POST") return next();
+    const problem = { type: "about:blank", title: "Bad request" };
+    const headers = { "content-type": "application/problem+json" };
+    if (body.model === model && body.messages === 4) {
+      fieldControls.add(auth);
+      return Response.json(comparable ? problem : { ...problem, traceId: "ordinary" }, { status: comparable ? 400 : 422, headers });
+    }
+    const raw = await request.clone().text();
+    const reply = await next();
+    if (reply.status < 400) return reply;
+    const refused = reply.headers.has(refusal);
+    const details = refused ? problem : { ...problem, traceId: "ordinary" };
+    const bodyFieldStatus = !refused && (Object.hasOwn(body, "model") || raw === "{}") && reply.status === 400 ? 422 : reply.status;
+    return change(reply, { status: bodyFieldStatus, body: JSON.stringify(details), replace: headers });
+  }));
+  assert.deepEqual(fieldControls, new Set([`Bearer ${key}`, `Bearer ${policyKey}`]));
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, comparable ? "PASS" : "SKIP");
+  if (comparable) assert.match(check.detail, /matches an ordinary error shape observed on this endpoint and credential/);
+  else assert.match(check.detail, /missing refusal member \$\.traceId/);
+  assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+});
+
+test("G12: a non-default published region exposes dropped intersections", async (t) => {
+  const target = createGateway({
+    models: { [model]: [{ ...routes[0]!, facts: "region=jp" }] }, accept: { keys: ["region"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  let altered = 0;
+  const report = await run(t, fixture(({ header, suffix, next, rewrite }) => {
+    if (header !== "region=jp" || suffix !== "region=de") return next();
+    altered++;
+    return rewrite({ suffix: null });
+  }, target));
+  assert.equal(altered, 1);
+  assert.equal(report.checks.find(({ id }) => id === "G12")?.status, "FAIL");
+});
+
+test("G12: no route with a region fact cannot distinguish empty intersection from either input alone", async (t) => {
+  const target = createGateway({
+    models: { [model]: [routes[2]!] }, accept: { keys: ["region"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, target);
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G12");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /a qualifying published region/);
+});
+
+test("G10: a sole route already meeting the bound requirement cannot show its narrowing effect", async (t) => {
+  const target = createGateway({
+    models: { [model]: [routes[0]!] }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, target);
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G10");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /qualification can distinguish applying the bound key policy/);
+});
+
+test("G13: a common provider cannot establish a bound requirement was retained", async (t) => {
+  const target = createGateway({
+    models: { [model]: [routes[0]!, routes[2]!] }, accept: { keys: ["zdr", "sort"] },
+    keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const report = await run(t, target);
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G13");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /routes are all excluded by the bound requirement/);
+});
+
+test("G7: a sort-only gateway can demonstrate that a preference does not remove its route", async (t) => {
+  const target = createGateway({
+    models: { [model]: [routes[0]!] }, accept: { keys: ["sort"], sort: ["price"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  let header = false;
+  let suffix = false;
+  const report = await run(t, fixture((probe) => {
+    header ||= probe.header === "sort=price";
+    suffix ||= probe.suffix === "sort=price";
+    return probe.next();
+  }, target));
+  assert.ok(header && suffix);
+  assert.equal(report.checks.find(({ id }) => id === "G7")?.status, "PASS");
+});
+
+for (const additional of ["bits", "sort"] as const) test(`G11: impossible precision is tested in both orders with a matching ${additional} carrier`, async (t) => {
+  const target = createGateway({
+    models: { [model]: [{ ...routes[0]!, facts: additional === "bits" ? "bits=8" : "" }] },
+    accept: { keys: additional === "bits" ? ["bits"] : ["bits", "sort"], sort: ["price"] },
+    fetch: () => Response.json({ output: "served" }),
+  });
+  const partner = additional === "bits" ? "bits=1" : "sort=price";
+  const impossible = additional === "bits" ? "bits=64" : "bits=1";
+  const pairs = new Set<string>();
+  const report = await run(t, fixture(({ header, suffix, next }) => {
+    if (header !== null && suffix !== null && [header, suffix].includes(impossible) && [header, suffix].includes(partner)) {
+      pairs.add(`${header}:${suffix}`);
+    }
+    return next();
+  }, target));
+  assert.deepEqual(pairs, new Set([`${partner}:${impossible}`, `${impossible}:${partner}`]));
+  assert.equal(report.checks.find(({ id }) => id === "G11")?.status, "PASS");
 });

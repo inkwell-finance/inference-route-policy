@@ -203,8 +203,7 @@ test("C1, C14: no query, an empty query, and a query are three base URLs: each i
   const given: [string, string][] = [[gateway.base, ""], [`${gateway.base}?`, "?"], [`${gateway.base}?t=1`, "?t=1"]];
   const sends: (() => Promise<Response>)[] = [];
   for (const [base, query] of given) {
-    const place = placeOf(base);
-    assert.deepEqual(place, { base: gateway.base, query }, base);
+    assert.deepEqual(placeOf(base), { place: { base: gateway.base, query }, unexact: null }, base);
     sends.push(release(c, await decide(c, { base: gateway.base, query, context: bearer("k") })));
   }
   for (const send of sends) await sendText(send);

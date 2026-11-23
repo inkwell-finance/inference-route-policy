@@ -5,6 +5,7 @@ export interface Exchange {
   probe: Probe;
   reply: Observation;
   ordinaryControl?: boolean;
+  fieldErrorControl?: boolean;
   missingRefusal?: boolean;
 }
 
@@ -42,6 +43,7 @@ export function applied(reply: Observation): string | null {
 interface Shape {
   contradiction?: string;
   unseen?: string;
+  missing?: string;
 }
 
 function jsonType(value: unknown): string {
@@ -54,18 +56,20 @@ function compareJsonShape(value: unknown, controls: readonly unknown[], path: st
   const similar = controls.filter((sample) => jsonType(sample) === type);
   if (similar.length === 0) return { contradiction: `${path} has type ${type}, which no control shows` };
   let unseen: string | undefined;
+  let missing: string | undefined;
   if (Array.isArray(value)) {
     const items: unknown[] = similar.flatMap((sample) => Array.isArray(sample) ? sample : []);
     for (const item of value) {
       const result = compareJsonShape(item, items, `${path}[]`);
       if (result.contradiction !== undefined) return result;
+      missing ??= result.missing;
       unseen ??= result.unseen;
     }
   } else if (value !== null && typeof value === "object") {
     const objects = similar.filter((sample) => sample !== null && typeof sample === "object");
     for (const key of Object.keys(objects[0]!)) {
       if (!Object.hasOwn(value, key) && objects.every((sample) => Object.hasOwn(sample, key))) {
-        return { contradiction: `${path}.${key} is missing but present in every control at ${path}` };
+        missing ??= `${path}.${key}`;
       }
     }
     const fields: [string, unknown][] = Object.entries(value);
@@ -74,24 +78,34 @@ function compareJsonShape(value: unknown, controls: readonly unknown[], path: st
       const result = compareJsonShape(field, members, `${path}.${key}`);
       if (result.contradiction !== undefined) return result;
       unseen ??= result.unseen;
+      missing ??= result.missing;
     }
   }
-  return unseen === undefined ? {} : { unseen };
+  return { ...(missing === undefined ? {} : { missing }), ...(unseen === undefined ? {} : { unseen }) };
 }
 
 function mediaType(reply: Observation): string | undefined {
   return reply.contentType?.split(";", 1)[0]?.trim().toLowerCase();
 }
 
-function compareErrorShape(reply: Observation, controls: readonly Observation[]): Shape {
+function compareErrorShape(reply: Observation, controls: readonly Observation[], comparableFieldError: boolean): Shape {
   if (controls.length === 0) return { unseen: "an ordinary error body under the same credential" };
   const media = mediaType(reply);
   const sameMedia = controls.filter((sample) => mediaType(sample) === media);
   if (sameMedia.length === 0) return { contradiction: `media type ${media ?? "(none)"} was not used by any ordinary error control` };
   const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
   if (reply.body !== undefined) {
-    return json.length === 0 ? { contradiction: "JSON was not used by any ordinary error control with the same media type" }
-      : compareJsonShape(reply.body, json, "$");
+    if (json.length === 0) return { contradiction: "JSON was not used by any ordinary error control with the same media type" };
+    if (json.some((sample) => {
+      const one = compareJsonShape(reply.body, [sample], "$");
+      return one.contradiction === undefined && one.missing === undefined && one.unseen === undefined;
+    })) return {};
+    const shape = compareJsonShape(reply.body, json, "$");
+    if (shape.contradiction === undefined && shape.missing !== undefined && comparableFieldError) {
+      return { contradiction: `${shape.missing} is missing and no observed ordinary shape, including the HTTP ${reply.status} field-validation controls, omits it` };
+    }
+    return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
+      ? shape : { unseen: "one ordinary error control showing the refusal's combination of members and types" };
   }
   if (media === "application/json" || media?.endsWith("+json") || json.length === sameMedia.length) {
     return { contradiction: "expected a JSON error body" };
@@ -156,13 +170,18 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
       }
       if (!reply.hasBody) fail("G34", "a refusal has a nonempty error body");
       const references = ordinary.filter((entry) => sameCredential(entry.probe, probe));
-      const shape = compareErrorShape(reply, references.map(({ reply }) => reply));
+      const comparableFieldError = references.some((control) => control.fieldErrorControl && control.reply.status === reply.status
+        && mediaType(control.reply) === mediaType(reply));
+      const shape = compareErrorShape(reply, references.map(({ reply }) => reply), comparableFieldError);
       if (shape.contradiction !== undefined && reply.hasBody) {
         audit.shapeControlsNeeded.set(probe.credential, shape.contradiction);
-        fail("G34", `the same error body structure as an ordinary error on this endpoint: ${shape.contradiction}`);
+        const controls = [...new Set(references.map(({ reply: sample }) => `HTTP ${sample.status} ${mediaType(sample) ?? "(no media type)"}`))];
+        fail("G34", `the same error body structure as an ordinary error on this endpoint and credential (${controls.join(", ")}): ${shape.contradiction}`);
       }
       if (shape.unseen !== undefined && reply.hasBody) audit.shapeControlsNeeded.set(probe.credential,
         shape.unseen.startsWith("$") ? `an ordinary error control showing refusal member ${shape.unseen}` : shape.unseen);
+      else if (shape.missing !== undefined && reply.hasBody) audit.shapeControlsNeeded.set(probe.credential,
+        `an ordinary field-validation control establishing whether missing refusal member ${shape.missing} is required`);
       continue;
     }
 

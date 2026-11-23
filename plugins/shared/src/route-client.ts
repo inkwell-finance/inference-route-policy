@@ -117,15 +117,19 @@ export class RouteClient {
    * Decides one request. `model` is its `model` field and `configured` a `Route-Policy` value the harness sends
    * on its own. Reads the gateway first when the decision needs it: detection whenever a policy reaches the
    * request, the model list when a requirement does, the key's own included. A request no policy reaches fetches
-   * nothing, but is still judged against what is already held for its base URL and credential (C16).
+   * nothing, but is still judged against what is already held for its base URL and credential (C16). `unexact`
+   * says why the base URL cannot be used as written; a request a policy reaches is then blocked before any read.
    */
-  async decide(target: Target, model: string, configured: string | null): Promise<Prepared> {
+  async decide(target: Target, model: string, configured: string | null, unexact: string | null = null): Promise<Prepared> {
     const key = this.#key(target);
     // Taken before any read: a discard while this decision waits makes it stale.
     const generation = this.#generation(key);
     const prepared = (decision: Decision): Prepared => ({ decision, target: { ...target, base: normalizeBase(target.base) }, generation });
     const layers = readLayers(this.held, model, configured);
     if (!layers.ok) return prepared({ action: "block", reason: layers.reason });
+    // A base URL the parser would not send as written is somewhere else than written: nothing is read from it,
+    // and no policy is sent to it. A request no policy reaches goes on as the harness sends it.
+    if (unexact !== null && anyPolicy(layers.value)) return prepared({ action: "block", reason: unexact });
     const base = normalizeBase(target.base);
     this.#bases.add(base);
     let detection: Detection | null = this.#heldDetections.get(key) ?? null;

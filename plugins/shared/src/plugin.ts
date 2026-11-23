@@ -84,6 +84,8 @@ interface RequestOf {
   api: string | null;
   /** A `Route-Policy` the provider configuration adds on its own. */
   configured: string | null;
+  /** Why the base URL cannot be used exactly as written, or null: a request with a policy is not sent there. */
+  unexact: string | null;
 }
 
 /** Where each request API's transport puts the registry's key, and in what form. */
@@ -122,7 +124,8 @@ async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<
   const place = placeOf(typeof authBase === "string" ? authBase : baseUrl);
   if (place === null) return null;
   return {
-    target: { ...place, context: contextOf(configured) },
+    target: { ...place.place, context: contextOf(configured) },
+    unexact: place.unexact,
     modelId: id,
     api: requestApi,
     configured: configured.get("route-policy"),
@@ -368,7 +371,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         const work = async (): Promise<Guarded> => {
           const request = await requestOf(ctx, headers);
           if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
-          return { request, prepared: await client.decide(request.target, request.modelId, request.configured) };
+          return { request, prepared: await client.decide(request.target, request.modelId, request.configured, request.unexact) };
         };
         const { request, prepared } = await withDeadline(work, (why) => blockWith(`preparing the request's headers failed: ${why}`));
         if (request === null) throw new Error(prepared.decision.action === "block" ? prepared.decision.reason : "no request");
@@ -424,7 +427,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (typeof model === "string" && splitModel(model).policy !== splitModel(request.modelId).policy) {
           return blockWith(`the request names the model "${model}" while "${request.modelId}" is selected; the policy typed into one is not in the other`);
         }
-        return { request, prepared: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured) };
+        return { request, prepared: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured, request.unexact) };
       };
       return apply(await withDeadline(work, (why) => blockWith(`the plugin failed: ${why}`)), payload);
     } catch (error) {
