@@ -474,7 +474,30 @@ test("C14: a base URL that cannot be used as written holds nothing, so a request
   assert.equal(gateway.requests.filter((r) => r.path.includes("team=R'D")).length, 0, "nothing was read for the place as written");
 });
 
-test("C14: whatever was read before for other places, credentials, and models, each request gets the decision it gets in a fresh client that read only its own place", async () => {
+// Three models, each published with routes of its own, and two catalogs: the team's lists the same models with
+// other routes. Facts differ by route, so one policy is met for one model and not for another.
+const FACTS: Readonly<Record<string, string>> = { aurora: "zdr+notrain", basalt: "zdr", cobalt: "" };
+const CATALOGS: Readonly<Record<"plain" | "team", Readonly<Record<string, readonly string[]>>>> = {
+  plain: { alfa: ["aurora"], bravo: ["basalt"], charlie: ["cobalt"] },
+  team: { alfa: ["basalt", "cobalt"], bravo: ["aurora"], charlie: ["aurora", "basalt"] },
+};
+const catalogOf = (query: string): "plain" | "team" => (query.includes("team=") ? "team" : "plain");
+
+// Replies that differ by place: the team's key policy and k2's are each met by some routes and not others.
+function placesWithCatalogs(): void {
+  gateway.replies.detection = (headers, path) =>
+    path.includes("team=R%27D")
+      ? { status: 200, body: { route_policy: "1", key_policy: "zdr" } }
+      : headers.authorization === "Bearer k2"
+        ? { status: 200, body: { route_policy: "1", key_policy: "notrain" } }
+        : { status: 200, body: { route_policy: "1" } };
+  gateway.replies.models = (_headers, path) => ({
+    status: 200,
+    body: { data: Object.entries(CATALOGS[catalogOf(path)]).map(([id, providers]) => ({ id, routes: providers.map((provider) => ({ provider, facts: FACTS[provider] ?? "" })) })) },
+  });
+}
+
+test("C14: whatever was read before for other places, credentials, and models, each request gets the decision it gets in a fresh client that read only its own place, and each model is judged by its own routes there", async (t) => {
   const places: Located[] = [];
   const written = placeOf(`${gateway.base}?team=R'D`);
   assert.ok(written !== null && written.unexact !== null);
@@ -484,10 +507,13 @@ test("C14: whatever was read before for other places, credentials, and models, e
   places.push({ target: { ...written.place, context: bearer("k2") }, unexact: null });
   places.push({ target: target("k2"), unexact: null });
   const policies = [null, "zdr", "sort=price", "only=aurora", "notrain"];
-  const models = ["demo-model", "demo-model+zdr", "demo-model+sort=latency"];
+  const models = ["alfa", "bravo", "charlie"].flatMap((id) => [id, `${id}+zdr`, `${id}+sort=latency`]);
+  // What the generator produced, per dimension, resolved: each must take at least two values, or the title's
+  // "other places, credentials, and models" would not be exercised.
+  const seen = { place: new Set<string>(), credential: new Set<string>(), model: new Set<string>(), suffix: new Set<string>(), policy: new Set<string>(), outcome: new Set<string>(), routesChecked: new Set<string>() };
   for (const seed of [1, 7, 42]) {
     reset();
-    differingPlaces();
+    placesWithCatalogs();
     // A small deterministic generator: the interleaving is random but the same on every run.
     let state = seed;
     const pick = <T,>(items: readonly T[]): T => {
@@ -498,23 +524,48 @@ test("C14: whatever was read before for other places, credentials, and models, e
     };
     const steps: { place: number; policy: string | null; model: string }[] = [];
     const { client: warm } = client("zdr");
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 40; i++) {
       const step = { place: places.indexOf(pick(places)), policy: pick(policies), model: pick(models) };
       steps.push(step);
+      const place = places[step.place];
+      assert.ok(place !== undefined);
       const decideIn = async (c: RouteClient, s: typeof step): Promise<Decision> => {
         c.held = s.policy === null ? { kind: "none" } : holdPolicy(s.policy, "session");
-        const place = places[s.place];
-        assert.ok(place !== undefined);
-        return (await c.decide(place, s.model, null)).decision;
+        const at = places[s.place];
+        assert.ok(at !== undefined);
+        return (await c.decide(at, s.model, null)).decision;
       };
-      const got = view(await decideIn(warm, step));
+      const decision = await decideIn(warm, step);
+      const label = `seed ${seed}, step ${i}: ${JSON.stringify(step)}`;
       // The reference: a fresh client that has seen only the earlier requests to this same place.
       const { client: fresh } = client("zdr");
-      const own = places[step.place]?.unexact === null ? steps.slice(0, -1).filter((s) => s.place === step.place) : [];
+      const own = place.unexact === null ? steps.slice(0, -1).filter((s) => s.place === step.place) : [];
       for (const earlier of own) await decideIn(fresh, earlier);
-      assert.equal(got, view(await decideIn(fresh, step)), `seed ${seed}, step ${i}: ${JSON.stringify(step)}`);
+      assert.equal(view(decision), view(await decideIn(fresh, step)), label);
+      // And judged by its own model's routes in its own place's catalog, never another model's.
+      const base = step.model.split("+")[0] ?? "";
+      if (decision.action === "send" && decision.routes !== null) {
+        assert.deepEqual([...decision.routes.keys()], CATALOGS[catalogOf(place.target.query)][base], label);
+        seen.routesChecked.add(base);
+      }
+      if (decision.action === "block" && /no route the model list publishes/.test(decision.reason)) {
+        assert.match(decision.reason, new RegExp(`publishes for ${base} meets`), label);
+      }
+      seen.place.add(`${place.target.query}|${place.unexact === null ? "as written" : "not as written"}`);
+      seen.credential.add(place.target.context.map(([, value]) => value).join());
+      seen.model.add(base);
+      seen.suffix.add(step.model.slice(base.length));
+      seen.policy.add(String(step.policy));
+      seen.outcome.add(decision.action === "block" ? `block: ${decision.reason.replace(/ \(.*$|:.*$/, "").slice(0, 40)}` : `${decision.action}${decision.action === "send" && decision.routes !== null ? " with routes" : ""}`);
     }
   }
+  for (const [dimension, values] of Object.entries(seen)) {
+    t.diagnostic(`${dimension}: ${[...values].join(" / ")}`);
+    assert.ok(values.size >= 2, `${dimension} takes ${values.size} value(s)`);
+  }
+  assert.equal(seen.model.size, 3, "every model is generated");
+  assert.equal(seen.routesChecked.size, 3, "every model has a send checked against its own routes");
+  assert.equal(seen.place.size, 3, "every place, the one not usable as written included");
 });
 
 test("C14, C15: a request the previous session released is still stopped when stale, but its stop is not shown in the next session", async () => {

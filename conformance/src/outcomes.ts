@@ -65,24 +65,45 @@ function jsonType(value: unknown): string {
   return value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
 }
 
-function shapeDifference(value: unknown, sample: unknown, path: string): string | undefined {
+// Intern a flat description of each node using its children's IDs. Unlike
+// recursive shape strings, descriptors don't grow with subtree depth.
+function shapeIndex() {
+  const ids = new Map<string, number>();
+  const nodes = new WeakMap<object, number>();
+  function intern(description: string): number {
+    let id = ids.get(description);
+    if (id === undefined) ids.set(description, id = ids.size);
+    return id;
+  }
+  return function shapeId(value: unknown): number {
+    if (value === null || typeof value !== "object") return intern(jsonType(value));
+    const cached = nodes.get(value);
+    if (cached !== undefined) return cached;
+    const description = Array.isArray(value)
+      ? `a${JSON.stringify([...new Set(value.map(shapeId))].sort((a, b) => a - b))}`
+      : `o${JSON.stringify(Object.keys(value).sort().map((key) => [key, shapeId(Reflect.get(value, key))]))}`;
+    const id = intern(description);
+    nodes.set(value, id);
+    return id;
+  };
+}
+
+// Only called once we know the IDs differ; it locates a difference for SKIP.
+function shapeDifference(value: unknown, sample: unknown, shapeId: (value: unknown) => number, path: string): string {
   if (jsonType(value) !== jsonType(sample)) return path;
-  if (Array.isArray(value) && Array.isArray(sample)) {
-    if (value.some((item: unknown) => !sample.some((candidate: unknown) => shapeDifference(item, candidate, path) === undefined))
-      || sample.some((item: unknown) => !value.some((candidate: unknown) => shapeDifference(item, candidate, path) === undefined))) {
-      return `${path}[]`;
-    }
-  } else if (value !== null && typeof value === "object" && sample !== null && typeof sample === "object") {
+  if (Array.isArray(value)) return `${path}[]`;
+  if (value !== null && typeof value === "object" && sample !== null && typeof sample === "object") {
     const fields: [string, unknown][] = Object.entries(value);
     for (const [key, field] of fields) {
       const member = `${path}.${key}`;
       if (!Object.hasOwn(sample, key)) return member;
-      const difference = shapeDifference(field, Reflect.get(sample, key), member);
-      if (difference !== undefined) return difference;
+      const counterpart: unknown = Reflect.get(sample, key);
+      if (shapeId(field) !== shapeId(counterpart)) return shapeDifference(field, counterpart, shapeId, member);
     }
     const extra = Object.keys(sample).find((key) => !Object.hasOwn(value, key));
     if (extra !== undefined) return `${path}.${extra}`;
   }
+  return path;
 }
 
 function compareJsonShape(value: unknown, controls: readonly unknown[], path: string): Shape {
@@ -123,7 +144,7 @@ function mediaType(reply: Observation): string | undefined {
   return reply.contentType?.split(";", 1)[0]?.trim().toLowerCase();
 }
 
-function compareErrorShape(reply: Observation, controls: readonly Observation[]): Shape {
+function compareErrorShape(reply: Observation, controls: readonly Observation[], shapeId: (value: unknown) => number): Shape {
   const media = mediaType(reply);
   const sameMedia = controls.filter((sample) => mediaType(sample) === media);
   if (controls.length > 0 && sameMedia.length === 0) {
@@ -135,15 +156,11 @@ function compareErrorShape(reply: Observation, controls: readonly Observation[])
   if (reply.body === undefined) return { contradiction: "expected a JSON error body" };
   const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
   if (json.length === 0) return { unseen: "an ordinary JSON error body under the same credential" };
-  let firstDifference: string | undefined;
-  for (const sample of json) {
-    const difference = shapeDifference(reply.body, sample, "$");
-    if (difference === undefined) return {};
-    firstDifference ??= difference;
-  }
+  const refusalId = shapeId(reply.body);
+  if (json.some((sample) => shapeId(sample) === refusalId)) return {};
   const shape = compareJsonShape(reply.body, json, "$");
   return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
-    ? shape : { unseen: `one ordinary error control with the same whole refusal shape (difference at ${firstDifference})` };
+    ? shape : { unseen: `one ordinary error control with the same whole refusal shape (difference at ${shapeDifference(reply.body, json[0], shapeId, "$")})` };
 }
 
 function sameCredential(a: Probe, b: Probe): boolean {
@@ -155,6 +172,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     failures: new Map(), catalogRelays: [], attestedRelays: [], results: [], refusals: [], shapeControlsNeeded: new Set(),
   };
   const ordinary = exchanges.filter(({ ordinaryControl, reply }) => ordinaryControl && reply.hasBody && noResult(reply));
+  const shapeId = shapeIndex();
   for (const exchange of exchanges) {
     const { probe, reply, missingRefusal } = exchange;
     const fail = (id: AuditId, required: string) => {
@@ -215,7 +233,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
         fail("G34", `a refusal has a nonempty error body; the refusal was empty (compared with ${sampled()})`);
         continue;
       }
-      const shape = compareErrorShape(reply, references.map(({ reply }) => reply));
+      const shape = compareErrorShape(reply, references.map(({ reply }) => reply), shapeId);
       if (shape.contradiction !== undefined) {
         audit.shapeControlsNeeded.add(probe.credential);
         fail("G34", `the refusal uses this endpoint's ordinary error format; ${shape.contradiction} (based on ${sampled()})`);

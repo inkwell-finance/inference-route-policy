@@ -109,7 +109,7 @@ test("C1: omp: a guard that cannot decide before omp's 30-second handler budget 
   }
 });
 
-test("C2: omp: with no policy at all, requests go as they are and nothing is fetched first", async () => {
+test("C2: omp: with no policy at all, a request goes as it is and nothing is fetched first", async () => {
   const harness = await omp();
   const payload = { model: "demo-model", messages: [{ role: "user", content: "hi" }] };
   assert.ok((await harness.request(payload)).sent);

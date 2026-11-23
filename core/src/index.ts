@@ -378,9 +378,13 @@ export const parsePublishedFacts = (text: string): Result<Facts> => readFacts(te
 
 /** Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. */
 export function meets(route: { provider: string; facts: Facts }, policy: Policy): boolean {
-  const { provider, facts } = route;
-  requireFacts(facts);
   requirePolicy(policy);
+  return qualifies(route.provider, route.facts, policy);
+}
+
+/** `meets` for a policy already known to be parser-made, so a caller that checked it once does not check it per route. */
+function qualifies(provider: string, facts: Facts, policy: Policy): boolean {
+  requireFacts(facts);
   if (policy.zdr && !facts.zdr) return false;
   if (policy.notrain && !facts.notrain) return false;
   if (policy.bits !== null && (facts.bits === null || facts.bits < policy.bits)) return false;
@@ -658,7 +662,7 @@ export function someRouteMeets(routes: ReadonlyMap<string, PublishedRoute | null
   requirePolicy(policy);
   for (const [provider, published] of routes) {
     if (published === null || (policy.attest.length > 0 && published.evidence === null)) continue;
-    if (meets({ provider, facts: published.facts }, policy)) return true;
+    if (qualifies(provider, published.facts, policy)) return true;
   }
   return false;
 }
@@ -710,7 +714,7 @@ export function readOutcome(headers: ResultHeaders, sent: Policy, routes: Readon
   const published = routes.get(provider);
   if (published === undefined) return notHonored(`provider "${provider}" is not among the model's published routes`);
   if (published === null) return notHonored(`provider "${provider}" is published more than once or with invalid facts`);
-  if (!meets({ provider, facts: published.facts }, sent)) return notHonored(`route "${provider}" does not meet the policy sent`);
+  if (!qualifies(provider, published.facts, sent)) return notHonored(`route "${provider}" does not meet the policy sent`);
   if (evidence !== null && evidence !== published.evidence) return notHonored(`Route-Evidence is not the evidence published for "${provider}"`);
   return { outcome: "honored", provider, evidence, checked: true };
 }

@@ -173,17 +173,21 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().requests.length, before, "neither /route nor the request read anything");
   });
 
-  test(`C3, C5: ${name}: the status line and every notice about a response name the request they are about`, async () => {
+  test(`C3, C5: ${name}: the status line and every notice about a response name the request they are about, each its own`, async () => {
     const harness = await make("zdr");
-    const about = new RegExp(`\\(request for demo-model(\\+zdr)? to ${gateway().base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)$`);
+    const escaped = gateway().base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const about = new RegExp(`\\(request for demo-model(\\+zdr)? to ${escaped}\\)$`);
     await harness.request();
     const status = harness.shown.filter((line) => line.method === "setStatus").at(-1)?.text ?? "";
     assert.match(status, /^route policy honored: served by aurora/);
     assert.match(status, about);
+    // The second request goes to another place, so the notice must name this one, not the first.
     gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
+    harness.model.baseUrl = `${gateway().base}?t=2`;
+    harness.wireUrl = `${gateway().base}/chat/completions?t=2`;
     await harness.request();
     assert.match(notices(harness).at(-1) ?? "", /^route policy refused by the gateway: unsatisfiable \(request for /);
-    assert.match(notices(harness).at(-1) ?? "", about);
+    assert.match(notices(harness).at(-1) ?? "", new RegExp(`\\(request for demo-model(\\+zdr)? to ${escaped}\\?t=2\\)$`));
   });
 
   test(`C2, C14: ${name}: a policy of preferences alone is not sent to a base URL that cannot be used as written either`, async () => {

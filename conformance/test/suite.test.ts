@@ -229,23 +229,20 @@ test("G6: a suffix relay without a provider cannot prove the combined policy was
   assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
 });
 
-test("G10: a matching model does not hide a lost key default on a second model", async (t) => {
+test("G10: dropping the key default only on a second model with no qualifying route is detected", async (t) => {
   const second = `${model}-second`;
   const target = createGateway({
     models: { [model]: routes, [second]: [routes[2]!] }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
-    fetch: () => Response.json({ output: "served" }),
+    fetch: (url: string) => Response.json({ provider: new URL(url).hostname }),
   });
-  const report = await run(t, async (request, transport) => {
-    if (request.method === "POST" && request.headers.get("authorization") === `Bearer ${policyKey}` && !request.headers.has("route-policy")) {
-      const body: unknown = await request.clone().json().catch(() => null);
-      if (body !== null && typeof body === "object" && "model" in body && body.model === second) {
-        const headers = new Headers(request.headers);
-        headers.set("authorization", `Bearer ${key}`);
-        return target(new Request(request, { headers }), transport);
-      }
-    }
-    return target(request, transport);
-  });
+  const relays = new Map<string, unknown>();
+  const report = await run(t, fixture(async ({ auth, id, suffix, header, next, rewrite }) => {
+    if (auth !== `Bearer ${policyKey}` || suffix !== null || header !== null || (id !== model && id !== second)) return next();
+    const reply = id === second ? await rewrite({ neutralKey: true }) : await next();
+    relays.set(id, await reply.clone().json());
+    return reply;
+  }, target));
+  assert.deepEqual(relays, new Map([[model, { provider: "aurora.example" }], [second, { provider: "cobalt.example" }]]));
   assert.equal(report.checks.find(({ id }) => id === "G10")?.status, "FAIL");
 });
 
@@ -273,23 +270,29 @@ test("G7: a preference in the suffix cannot exclude a route that meets the heade
   assert.equal(report.checks.find(({ id }) => id === "G7")?.status, "FAIL");
 });
 
-test("G13: proper narrowing on one model does not hide a widened default on another", async (t) => {
+test("G13: correct bound-key filtering on one model does not hide widening on a different model", async (t) => {
   const second = `${model}-second`;
   const target = createGateway({
-    models: { [model]: routes, [second]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    models: { [model]: routes, [second]: [{ ...routes[1]!, provider: "second-basalt" }] },
+    keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
     fetch: () => Response.json({ output: "served" }),
   });
-  const report = await run(t, async (request, transport) => {
-    if (request.method === "POST" && request.headers.get("authorization") === `Bearer ${policyKey}` && request.headers.get("route-policy") === "bits=9") {
-      const body: unknown = await request.clone().json().catch(() => null);
-      if (body !== null && typeof body === "object" && "model" in body && body.model === second) {
-        const headers = new Headers(request.headers);
-        headers.set("authorization", `Bearer ${key}`);
-        return target(new Request(request, { headers }), transport);
-      }
+  const observed = new Map<string, string | null>();
+  const report = await run(t, fixture(async ({ auth, id, suffix, header, next, rewrite }) => {
+    if (auth !== `Bearer ${policyKey}` || suffix !== null) return next();
+    if (id === model && header === "bits=9") {
+      const reply = await next();
+      observed.set(id, reply.headers.get(refusal));
+      return reply;
     }
-    return target(request, transport);
-  });
+    if (id === second && header === "only=second-basalt") {
+      const reply = await rewrite({ neutralKey: true });
+      observed.set(id, reply.headers.get(applied));
+      return reply;
+    }
+    return next();
+  }, target));
+  assert.deepEqual(observed, new Map([[model, "reason=unsatisfiable"], [second, "provider=second-basalt"]]));
   assert.equal(report.checks.find(({ id }) => id === "G13")?.status, "FAIL");
 });
 
@@ -301,6 +304,7 @@ test("G24: an unknown provider does not invalidate a list that also names a qual
 
 test("G10 G13 G23: each credential's own catalog determines its model and matching routes", async (t) => {
   const catalogReads: string[] = [];
+  const inferenceRelays = new Map<string, Set<string>>();
   const scopedGateways = new Map<string, RequestHandler>();
   for (const carrier of ["bearer", "api"] as const) {
     for (const role of ["ordinary", "bound"] as const) {
@@ -313,7 +317,7 @@ test("G10 G13 G23: each credential's own catalog determines its model and matchi
       }));
     }
   }
-  const report = await run(t, (request, transport) => {
+  const report = await run(t, async (request, transport) => {
     const bearer = request.headers.get("authorization");
     const apiKey = request.headers.get("x-api-key");
     const carrier = apiKey === null ? "bearer" : "api";
@@ -322,9 +326,30 @@ test("G10 G13 G23: each credential's own catalog determines its model and matchi
     if (new URL(request.url).pathname === "/v1/models") catalogReads.push(id);
     const handler = scopedGateways.get(id);
     assert.ok(handler);
-    return handler(request, transport);
+    const body: unknown = request.method === "POST" ? await request.clone().json().catch(() => null) : null;
+    const reply = await handler(request, transport);
+    const named = reply.headers.get(applied);
+    if (named !== null) {
+      assert.ok(typeof body === "object" && body !== null && "model" in body && typeof body.model === "string");
+      const baseModel = splitModel(body.model).id;
+      if (baseModel === `${id}-aux`) {
+        assert.equal(named, "provider=routeprobe0");
+        return reply;
+      }
+      assert.equal(baseModel, id);
+      let observed = inferenceRelays.get(id);
+      if (observed === undefined) inferenceRelays.set(id, observed = new Set());
+      observed.add(named);
+    }
+    return reply;
   }, INFERENCE_ENDPOINTS);
   assert.deepEqual(catalogReads.sort(), [...scopedGateways.keys()].sort());
+  assert.deepEqual([...inferenceRelays.keys()].sort(), [...scopedGateways.keys()].sort());
+  for (const [id, observed] of inferenceRelays) {
+    const prefix = id.replace(/-model$/, "").replace("/", "-");
+    assert.deepEqual(observed, new Set(id.endsWith("/bound-model") ? [`provider=${prefix}-0`]
+      : [`provider=${prefix}-0`, `provider=${prefix}-1`, `provider=${prefix}-2`]));
+  }
   assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
 });
 
@@ -918,6 +943,31 @@ for (const broken of [false, true]) test(`G25: a stable bound-key rate limit ${b
   else assert.equal(report.failed, 0);
 });
 
+test("G25 G34: a corroborated Responses rate limit supplies the only matching refusal shape for its credential", async (t) => {
+  const problem = { type: "urn:demo:rejected", title: "Request rejected" };
+  const media = { "content-type": "application/problem+json" };
+  const throttled = new Set<string | null>();
+  let ordinaryRefusals = 0;
+  const report = await run(t, fixture(async ({ id, auth, header, suffix, body, next }) => {
+    if (auth !== `Bearer ${policyKey}` || id !== model || suffix !== null) return next();
+    if ((header === null || header === "bits=0") && typeof body.input === "string" && body.max_output_tokens === 16
+      && !Object.hasOwn(body, "route_conformance_unknown_field")) {
+      throttled.add(header);
+      return Response.json(problem, { status: 429, headers: media });
+    }
+    const reply = await next();
+    if (header !== "only=0,a-b_c.d") return reply;
+    assert.equal(reply.headers.get(refusal), "reason=unsatisfiable");
+    ordinaryRefusals++;
+    return change(reply, { body: JSON.stringify(problem), replace: media });
+  }), ["responses"]);
+  assert.deepEqual(throttled, new Set([null, "bits=0"]));
+  assert.equal(ordinaryRefusals, 1);
+  assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+  assert.equal(report.checks.find(({ id }) => id === "G25")?.status, "PASS");
+  assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
+});
+
 test("G2 G21: the audit catches unsupported and invented attribution on a separate streaming probe", async (t) => {
   let broken = 0;
   const report = await run(t, fixture(({ body, header, next }) => {
@@ -1378,4 +1428,29 @@ for (const scope of ["endpoint", "credential"] as const) test(`G34: a matching J
   ], () => context);
   assert.equal(audit.failures.has("G34"), false);
   assert.equal(audit.shapeUnverified, "an ordinary JSON error body under the same credential");
+});
+
+test("G34: whole-shape matching reads each nested singleton node once per body as depth increases", () => {
+  for (const depth of [0, 1, 2, 4, 8, 16, 32]) {
+    let reads = 0;
+    function nested(value: number): unknown {
+      let node: unknown = { get leaf() { reads++; return value; } };
+      for (let i = 0; i < depth; i++) {
+        const child = node;
+        const array: unknown[] = [null];
+        Object.defineProperty(array, 0, { get() { reads++; return child; } });
+        node = array;
+      }
+      return node;
+    }
+    const probe = { path: "responses" };
+    const reply = { status: 400, hasBody: true, contentType: "application/json", applied: [], refused: [], evidence: [], received: "HTTP 400" };
+    const audit = auditResults([
+      { probe, reply: { ...reply, body: nested(1) }, ordinaryControl: "wrong input field" },
+      { probe, reply: { ...reply, body: nested(2), refused: [formatRefused("unsupported")] } },
+    ], () => ({ carriesPolicy: true }));
+    assert.equal(audit.failures.has("G34"), false);
+    assert.equal(audit.shapeUnverified, undefined);
+    assert.equal(reads, 2 * (depth + 1), `array depth ${depth}`);
+  }
 });

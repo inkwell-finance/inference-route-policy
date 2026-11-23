@@ -394,8 +394,13 @@ export async function runConformance(options: Options): Promise<Report> {
       if (!isBareError(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
       return sample;
     }
+    // Only the ordinary side supplies an error shape. Matching status on
+    // the policy challenge corroborates origin, not the challenge's body.
+    function registerOwnError(kind: string, ...samples: Exchange[]): void {
+      for (const sample of samples) sample.ordinaryControl = kind;
+    }
     async function compareOwn(before: Exchange, probe: Probe, kind: string): Promise<void> {
-      before.ordinaryControl = kind;
+      registerOwnError(kind, before);
       const requirement = `the same ordinary error status ${before.reply.status} as the no-policy control, with no result headers`;
       const { reply } = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
       if (!noResult(reply)) throw mismatch(probe, reply.received, requirement);
@@ -406,6 +411,7 @@ export async function runConformance(options: Options): Promise<Report> {
         precondition ??= `a stable ordinary error; the two no-policy controls returned HTTP ${before.reply.status} and ${last}`;
         return;
       }
+      registerOwnError(kind, repeated);
       throw mismatch(probe, reply.received, requirement);
     }
     await run("G1", "the malformed-policy probes returned unsupported", async () => {
@@ -832,6 +838,7 @@ export async function runConformance(options: Options): Promise<Report> {
           const challenge = await observeControl({ ...malformed, credential });
           if (challenge !== undefined && isBareError(challenge.reply) && challenge.reply.status === candidate.reply.status
             && challenge.reply.status !== malformedControl.reply.status) {
+            registerOwnError("bad credential", challenge);
             await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] }, "bad credential");
           } else {
             missing.push(`bad-credentials subcase: headerless HTTP ${candidate.reply.status} did not distinguish credential rejection from a provider relay`);
@@ -847,9 +854,12 @@ export async function runConformance(options: Options): Promise<Report> {
           // Bracket the challenge; a throttle that has cleared proves nothing.
           const probe = policyInference(throttleModel.id, INVALID_POLICY);
           const challenged = await observeControl(probe);
-          if (challenged === undefined || challenged.reply.status !== 429 || !noResult(challenged.reply)) {
+          if (challenged !== undefined && challenged.reply.status === 429 && isBareError(challenged.reply)) {
+            registerOwnError("rate limit", before);
+          } else {
             const after = await observeControl(plain);
             if (after?.reply.status === 429 && isBareError(after.reply)) {
+              registerOwnError("rate limit", before, after);
               throw mismatch(probe, challenged?.reply.received ?? "no response", "ordinary HTTP 429 with no route headers while both bound-key controls are throttled");
             }
             missing.push("rate-limit subcase: the bound-key control was no longer throttled after the probe");
@@ -880,7 +890,7 @@ export async function runConformance(options: Options): Promise<Report> {
           if (seen.has(raw)) continue;
           const sample = await observe(scopedProbe(raw)).catch(() => undefined);
           if (sample === undefined || !isBareError(sample.reply)) continue;
-          sample.ordinaryControl = raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field";
+          registerOwnError(raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field", sample);
         }
         const current = scopeFor(scopedProbe("{}"));
         const model = current?.models[0];
@@ -901,7 +911,7 @@ export async function runConformance(options: Options): Promise<Report> {
             if (control === undefined || !isBareError(control.reply)) continue;
             const challenged = await observe({ ...probe, policies: [INVALID_POLICY] }).catch(() => undefined);
             if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-              control.ordinaryControl = kind;
+              registerOwnError(kind, control);
             }
           }
           const witness = model.policies[0]?.text;
@@ -913,7 +923,7 @@ export async function runConformance(options: Options): Promise<Report> {
             if (control !== undefined && isBareError(control.reply)) {
               const challenged = await observe(on(endpoint, credential)(synthetic, witness)).catch(() => undefined);
               if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-                control.ordinaryControl = "unknown model";
+                registerOwnError("unknown model", control);
               }
             }
           }
