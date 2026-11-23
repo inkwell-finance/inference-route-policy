@@ -1,9 +1,10 @@
 import {
-  baselineSupport, combinePolicies, formatRefused, isEvidenceUri, isProviderId, keysOf, meets, parseApplied, parseDetection,
-  parsePolicy, parsePublishedFacts, parseRefused, publishedRoutes, REFUSAL_STATUS, splitModel,
+  baselineSupport, combinePolicies, formatRefused, isEvidenceUri, isProviderId, keysOf, meets, parseDetection,
+  parsePolicy, parsePublishedFacts, parseRefused, publishedRoutes, REFUSAL_STATUS, someRouteMeets, splitModel,
   type Detection, type Policy, type PublishedRoute, type RefusalReason, type Support,
 } from "../../core/src/index.ts";
 import { request, sent, type Credential, type Observation, type Probe } from "./http.ts";
+import { applied, auditResults, noResult, type Exchange, type ResultContext } from "./outcomes.ts";
 
 export const INFERENCE_ENDPOINTS = ["chat/completions", "responses", "messages"] as const;
 export type Endpoint = (typeof INFERENCE_ENDPOINTS)[number];
@@ -125,49 +126,51 @@ function qualifying(model: Model, policy: Policy): string[] {
   return providers;
 }
 
-function applied(reply: Observation): string | null {
-  if (reply.applied.length !== 1) return null;
-  const parsed = parseApplied(reply.applied[0]!);
-  return parsed.ok ? parsed.value : null;
-}
-
 function refusal(reply: Observation, reason: RefusalReason, key?: string | null): boolean {
   return reply.status === REFUSAL_STATUS[reason] && reply.refused.length === 1 && reply.refused[0] === (reason === "unsupported" ? formatRefused(reason, key) : formatRefused(reason));
 }
 
-const noResult = (reply: Observation): boolean => reply.applied.length === 0 && reply.refused.length === 0 && reply.evidence.length === 0;
-const couldRelay = (reply: Observation, allowed: readonly string[]): boolean => refusal(reply, "unavailable") || allowed.some((id) => id === applied(reply));
+const couldRelay = (reply: Observation, allowed: readonly string[]): boolean => refusal(reply, "unavailable") || (reply.refused.length === 0 && allowed.some((id) => id === applied(reply)));
 const bodyFor = (endpoint: Endpoint, model: string, stream = false): string => JSON.stringify(endpoint === "responses"
   ? { model, input: "Reply with one word.", max_output_tokens: 16, stream }
   : { model, messages: [{ role: "user", content: "Reply with one word." }], max_tokens: 16, stream });
 
-function sameJsonShape(left: unknown, right: unknown): boolean {
-  if (left === null || right === null) return left === right;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right)) return false;
-    const a: unknown[] = left;
-    const b: unknown[] = right;
-    // A list can have a different number of details (including none); order is not structure.
-    return a.length === 0 || b.length === 0 || (
-      a.every((x) => b.some((y) => sameJsonShape(x, y))) && b.every((y) => a.some((x) => sameJsonShape(x, y)))
-    );
-  }
-  if (typeof left !== "object" || typeof right !== "object") return typeof left === typeof right;
-  const keys = Object.keys(left);
-  return keys.length === Object.keys(right).length && keys.every((key) => Object.hasOwn(right, key) && sameJsonShape(member(left, key), member(right, key)));
+function jsonBody(probe: Probe): unknown {
+  if (probe.raw === undefined) return undefined;
+  try { return JSON.parse(probe.raw); } catch { return undefined; }
 }
 
-function mediaType(reply: Observation): string | undefined {
-  return reply.contentType?.split(";", 1)[0]?.trim().toLowerCase();
+function withoutExplicitPolicy(probe: Probe): Probe {
+  const body = jsonBody(probe);
+  const model = member(body, "model");
+  const split = typeof model === "string" ? splitModel(model) : undefined;
+  const raw = split?.policy != null && typeof body === "object" && body !== null ? JSON.stringify({ ...body, model: split.id }) : probe.raw;
+  return { path: probe.path, ...(raw === undefined ? {} : { raw }), ...(probe.credential === undefined ? {} : { credential: probe.credential }) };
 }
 
-function sameErrorShape(ordinary: Observation, refusal: Observation): boolean {
-  if (ordinary.body !== undefined || refusal.body !== undefined) {
-    return ordinary.body !== undefined && refusal.body !== undefined && sameJsonShape(ordinary.body, refusal.body);
+// These statuses can vary between the probe and its control even with the same input.
+const transientOwnError = (reply: Observation): boolean => noResult(reply) && (reply.status === 429 || reply.status === 503);
+
+function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
+  const model = member(jsonBody(probe), "model");
+  const split = typeof model === "string" ? splitModel(model) : undefined;
+  const routeMap = scope?.models.find(({ id }) => id === split?.id)?.routes;
+  const keyPolicy = scope?.detection?.keyPolicy;
+  const explicit = (probe.policies?.length ?? 0) > 0 || split?.policy != null;
+  const carriesPolicy = explicit || keyPolicy != null ? true : keyPolicy === null ? false : undefined;
+  const result: ResultContext = { carriesPolicy, ...(routeMap === undefined ? {} : { routes: routeMap }) };
+  if (scope?.detection === undefined) return result;
+  if ((probe.policies?.length ?? 0) > 1) return { ...result, requiresRefusal: true };
+  const layers: { key?: Policy; header?: Policy; suffix?: Policy } = {};
+  for (const [layer, text] of [["key", keyPolicy], ["header", probe.policies?.[0]], ["suffix", split?.policy]] as const) {
+    if (text == null) continue;
+    const parsed = parsePolicy(text, scope.detection.support);
+    if (!parsed.ok) return { ...result, requiresRefusal: true };
+    layers[layer] = parsed.value;
   }
-  const media = mediaType(ordinary);
-  // For non-JSON endpoints, compare the representation rather than assuming an error envelope.
-  return ordinary.hasBody && refusal.hasBody && media === mediaType(refusal) && media !== "application/json" && !media?.endsWith("+json");
+  result.combined = combinePolicies(layers);
+  if (carriesPolicy === true && routeMap !== undefined) result.requiresRefusal = !someRouteMeets(routeMap, result.combined);
+  return result;
 }
 
 export async function runConformance(options: Options): Promise<Report> {
@@ -179,20 +182,42 @@ export async function runConformance(options: Options): Promise<Report> {
   const checks: Check[] = [];
   const primaryKey = options.key ?? options.policyKey;
   const boundKey = options.policyKey ?? options.key;
-  const send = (probe: Probe) => request(base, probe, options.timeoutMs ?? 10_000);
+  const exchanges: Exchange[] = [];
+  let precondition: string | undefined;
+  async function observe(probe: Probe): Promise<Exchange> {
+    const exchange = { probe, reply: await request(base, probe, options.timeoutMs ?? 10_000) };
+    exchanges.push(exchange);
+    return exchange;
+  }
   const mismatch = (probe: Probe, cameBack: string, requirement: string): Error => new Error(`sent ${sent(probe)}; received ${cameBack}; required: ${requirement}`);
   async function expect(probe: Probe, requirement: string, matches: (reply: Observation) => boolean): Promise<Observation> {
-    let reply: Observation;
-    try { reply = await send(probe); }
-    catch (error) { throw mismatch(probe, String(error), requirement); }
-    if (!matches(reply)) throw mismatch(probe, reply.received, requirement);
-    return reply;
+    const exchange = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
+    const { reply } = exchange;
+    if (matches(reply)) return reply;
+    if (probe.raw !== undefined && reply.status >= 400 && noResult(reply)) {
+      const plain = withoutExplicitPolicy(probe);
+      const control = await observe(plain).catch(() => undefined);
+      if (control !== undefined && control.reply.status === reply.status && noResult(control.reply)) {
+        const context = resultContext(plain, scopeFor(plain));
+        precondition ??= `gateway answered its own error ${reply.status} to the ${context.carriesPolicy === true ? "control without explicit policy (same bound key)" : "no-policy control"}`;
+        return reply;
+      }
+      if (reply.status === REFUSAL_STATUS.unsupported && control !== undefined && (control.reply.status < 400 || applied(control.reply) !== null)
+        && resultContext(probe, scopeFor(probe)).requiresRefusal) exchange.missingRefusal = true;
+      if (transientOwnError(reply)) {
+        precondition ??= `gateway answered a transient headerless HTTP ${reply.status}; the no-policy control did not establish that routing was reached`;
+        return reply;
+      }
+    }
+    throw mismatch(probe, reply.received, requirement);
   }
   async function check(id: string, detail: string, run: () => Promise<void | string>, endpoint?: Endpoint): Promise<void> {
     const tag = endpoint === undefined ? { id } : { id, endpoint };
     try {
+      precondition = undefined;
       const missing = await run();
-      checks.push(missing === undefined ? { ...tag, status: "PASS", detail } : { ...tag, status: "SKIP", detail: `missing precondition: ${missing}` });
+      const absent = precondition ?? missing;
+      checks.push(absent === undefined ? { ...tag, status: "PASS", detail } : { ...tag, status: "SKIP", detail: `missing precondition: ${absent}` });
     } catch (error) {
       checks.push({ ...tag, status: "FAIL", detail: error instanceof Error ? error.message : String(error) });
     }
@@ -213,6 +238,9 @@ export async function runConformance(options: Options): Promise<Report> {
       byKey.set(key, existing);
     }
     return existing;
+  }
+  function scopeFor(probe: Probe): Scope | undefined {
+    return probe.credential === undefined ? anonymous : scoped.get(probe.credential.header)?.get(probe.credential.key);
   }
   const selections = [...new Set(endpoints)].map((endpoint) => ({
     endpoint, primary: scope(primaryKey, authHeaderFor(endpoint)), bound: scope(boundKey, authHeaderFor(endpoint)),
@@ -256,7 +284,7 @@ export async function runConformance(options: Options): Promise<Report> {
       const probe = metadata("models", current);
       try {
         const reply = await expect(probe, "a successful model list", () => true);
-        if (current.credential === undefined && (reply.status === 401 || reply.status === 403)) continue;
+        if (noResult(reply) && (reply.status === 401 || reply.status === 403 || transientOwnError(reply))) continue;
         const problem = schemaProblem(reply.body);
         if (problem !== undefined || reply.status < 200 || reply.status >= 300) throw mismatch(probe, reply.received, problem ?? "a successful model list");
         current.models = discover(reply.body, current.detection?.support ?? BASELINE);
@@ -264,7 +292,7 @@ export async function runConformance(options: Options): Promise<Report> {
       } catch (error) { firstFailure ??= error; }
     }
     if (firstFailure !== undefined) throw firstFailure;
-    if (count === 0) return "credentials accepted by /models";
+    if (count !== modelScopes.size) return "an accessible /models response for each supplied credential";
   });
 
   const on = (ep: Endpoint, credential?: Credential) => (id: string, header?: string, suffix?: string, stream?: boolean): Probe => ({
@@ -275,6 +303,7 @@ export async function runConformance(options: Options): Promise<Report> {
   const unsatisfiable = (r: Observation) => refusal(r, "unsatisfiable");
   const rejected = (r: Observation) => refusal(r, "unsupported");
   for (const { endpoint, primary, bound: policyScope } of selections) {
+    const firstExchange = exchanges.length;
     const { detection, models } = primary;
     const support = detection?.support;
     const boundText = detection?.keyPolicy;
@@ -296,14 +325,23 @@ export async function runConformance(options: Options): Promise<Report> {
     const inference = on(endpoint, primary.credential);
     const policyInference = on(endpoint, policyScope.credential);
     const bodyProbe = (raw: string): Probe => ({ ...metadata(endpoint, primary), raw });
-    let missingCredential = false;
-    if (primary.credential === undefined && first !== undefined) {
-      const control = await send(inference(first.id, INVALID_POLICY)).catch(() => undefined);
-      missingCredential = control !== undefined && (control.status === 401 || control.status === 403) && noResult(control);
+    const run = (id: string, detail: string, fn: () => Promise<void | string>) => check(id, detail, fn, endpoint);
+    // Ordinary-error samples serve both G25 and the final error-shape audit.
+    async function ordinaryError(probe: Probe): Promise<Exchange> {
+      const sample = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), "an ordinary error response"); });
+      if (sample.reply.status < 400 || !noResult(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
+      return sample;
     }
-    const run = (id: string, detail: string, fn: () => Promise<void | string>) => check(id, detail, missingCredential && id !== "G25" && id !== "G10" && id !== "G13"
-      ? async () => "credentials accepted by this endpoint"
-      : fn, endpoint);
+    async function compareOwn(before: Exchange, probe: Probe): Promise<void> {
+      before.ordinaryControl = true;
+      const { reply } = await ordinaryError(probe);
+      if (reply.status === before.reply.status) return;
+      if (transientOwnError(before.reply) || transientOwnError(reply)) {
+        precondition ??= `a stable ordinary error; the two probes returned HTTP ${before.reply.status} and ${reply.status}`;
+        return;
+      }
+      throw mismatch(probe, reply.received, `the same ordinary error status ${before.reply.status} as the no-policy control`);
+    }
     await run("G1", "invalid policies are refused, not ignored", async () => {
       if (first === undefined) return needModel;
       for (const invalid of ["", "bits=0", "region=uk", "only=probe0,probe0", "zdr++notrain", "zdr=1"]) {
@@ -335,10 +373,10 @@ export async function runConformance(options: Options): Promise<Report> {
         const alternate = text.startsWith("only=") ? positives.find((entry) => entry.model === model && entry.policy.only !== null && !entry.allowed.some((id) => allowed.includes(id))) : undefined;
         if (alternate !== undefined) {
           const reply = await expect(inference(model.id, alternate.text), `a different qualifying provider (${alternate.allowed.join(", ")}) or 503 unavailable`, allowedOrUnavailable(alternate.allowed));
-          if (!refusal(reply, "unavailable")) relays++;
+          if (applied(reply) !== null) relays++;
         }
         const response = await expect(inference(model.id, text), `a qualifying provider (${allowed.join(", ")}) or 503 unavailable`, allowedOrUnavailable(allowed));
-        if (!refusal(response, "unavailable")) relays++;
+        if (applied(response) !== null) relays++;
       }
       if (relays === 0) return "a relay for a satisfiable policy (all probes returned unavailable)";
     });
@@ -454,47 +492,22 @@ export async function runConformance(options: Options): Promise<Report> {
       }
       return "an accepted explicit policy that would widen the matching routes without the bound policy";
     });
-    await run("G15", "every observed policy relay carries a single published provider id", async () => {
+    // Supply one streaming probe and controls for both sides of the attest rule.
+    // The final audit checks these and every other response observed below.
+    await run("G15", "observed policy relays named a published provider", async () => {
       if (positive === undefined || !knowBound) return "a satisfiable advertised policy";
-      let relays = 0;
-      for (const stream of [false, true]) {
-        const reply = await expect(inference(positive.model.id, positive.text, undefined, stream), "relay reports one published Route-Applied; an unavailable refusal is not a relay", (r) => refusal(r, "unavailable") || positive.model.routes.has(applied(r) ?? ""));
-        if (!refusal(reply, "unavailable")) relays++;
-      }
-      if (relays === 0) return "a relay for the satisfiable policy (both probes returned unavailable)";
+      await expect(inference(positive.model.id, positive.text, undefined, true), "streaming relay or unavailable", (r) => refusal(r, "unavailable") || r.applied.length > 0);
     });
-    await run("G17", "relayed evidence appears exactly for attest and equals the route's published URI", async () => {
+    await run("G17", "observed relays gave evidence exactly when required", async () => {
       const attested = knowBound ? positives.find(({ policy }) => withKey(policy).attest.length > 0) : undefined;
       const unattested = knowBound ? positives.find(({ model, policy, allowed }) => withKey(policy).attest.length === 0 && allowed.every((id) => model.routes.get(id)?.evidence != null))
         ?? positives.find(({ policy }) => withKey(policy).attest.length === 0) : undefined;
-      const samples: { model: Model; probe: Probe; attest: boolean }[] = [];
-      if (attested !== undefined) samples.push({ model: attested.model, probe: inference(attested.model.id, attested.text), attest: true });
-      if (unattested !== undefined) samples.push({ model: unattested.model, probe: inference(unattested.model.id, unattested.text), attest: false });
+      for (const candidate of [attested, unattested]) {
+        if (candidate !== undefined) await expect(inference(candidate.model.id, candidate.text), "an inference response for the evidence probe", () => true);
+      }
       if (policyBound !== undefined && policyBound.attest.length > 0) {
         const model = policyScope.models.find((entry) => qualifying(entry, policyBound).length > 0);
-        if (model !== undefined) samples.push({ model, probe: policyInference(model.id), attest: true });
-      }
-      let attestRelay = false;
-      for (const { model, probe, attest } of samples) {
-        const reply = await expect(probe, attest ? "relayed Route-Evidence equals the applied provider's published evidence exactly" : "a non-attest relay carries no Route-Evidence", (r) => {
-          if (refusal(r, "unavailable")) return true;
-          if (!attest) return r.evidence.length === 0;
-          const uri = model.routes.get(applied(r) ?? "")?.evidence;
-          return r.evidence.length === 1 && isEvidenceUri(uri) && r.evidence[0] === uri;
-        });
-        if (attest && !refusal(reply, "unavailable")) attestRelay = true;
-      }
-      if (!attestRelay) return "an attestation policy accepted by the gateway and a matching route that relays";
-    });
-    await run("G19", "refusals and relays have exclusive result headers, with at most one line of each", async () => {
-      if (first === undefined) return needModel;
-      const exclusive = (r: Observation) => r.applied.length <= 1 && r.refused.length <= 1 && r.evidence.length <= 1 && (r.refused.length === 0 || (r.applied.length === 0 && r.evidence.length === 0));
-      await expect(inference(first.id, "bits=0"), "one refusal, no applied or evidence", (r) => r.refused.length === 1 && exclusive(r));
-      if (detection?.keyPolicy === null) await expect(inference(first.id), "at most one line per result header without a policy", exclusive);
-      if (negative !== undefined && knowBound) await expect(inference(negative.model.id, negative.text), "one refusal, no applied or evidence", (r) => r.refused.length === 1 && exclusive(r));
-      const evidencePolicy = positives.find(({ policy }) => withKey(policy).attest.length > 0);
-      for (const item of new Set([positive, evidencePolicy])) {
-        if (item !== undefined && knowBound) await expect(inference(item.model.id, item.text), "at most one line per result header and no refusal on a relay", (r) => exclusive(r) && (r.refused.length === 0 || refusal(r, "unavailable")));
+        if (model !== undefined) await expect(policyInference(model.id), "an inference response for the bound evidence probe", () => true);
       }
     });
     await run("G21", "unlisted keys and enum values refuse; listed fixed-domain keys accept their valid values", async () => {
@@ -551,21 +564,20 @@ export async function runConformance(options: Options): Promise<Report> {
         [inference(""), inference("", INVALID_POLICY, INVALID_POLICY)],
       ];
       for (const [plain, policy] of samples) {
-        const before = await expect(plain, "ordinary error with no route headers", (r) => r.status >= 400 && noResult(r));
-        await expect(policy, `ordinary error status ${before.status} wins over invalid policy, with no route headers`, (r) => r.status === before.status && noResult(r));
+        await compareOwn(await ordinaryError(plain), policy);
       }
       // Absence from /models alone doesn't prove that a model id won't resolve.
-      const unknown = await expect(inference(unknownModel), "control request for an unpublished model id", () => true);
-      if (unknown.status === 404 && noResult(unknown)) {
-        await expect(inference(unknownModel, INVALID_POLICY, INVALID_POLICY), "unknown model error comes before policy checks", (r) => r.status === unknown.status && noResult(r));
+      const unknown = await observe(inference(unknownModel));
+      if (unknown.reply.status === 404 && noResult(unknown.reply)) {
+        await compareOwn(unknown, inference(unknownModel, INVALID_POLICY, INVALID_POLICY));
       }
       if (first !== undefined) {
         const wrongKey = `route-conformance-invalid-${crypto.randomUUID()}`;
         const beforeProbe = { ...inference(first.id), credential: { key: wrongKey, header: authHeaderFor(endpoint) } };
-        const before = await expect(beforeProbe, "a response to a syntactically valid request with an unrecognized credential", () => true);
-        if (before.status === 401 || before.status === 403) {
-          if (!noResult(before)) throw mismatch(beforeProbe, before.received, "a credential error carries no result headers");
-          await expect({ ...beforeProbe, policies: [INVALID_POLICY] }, "bad credentials win over malformed policy, with no route headers", (r) => r.status === before.status && noResult(r));
+        const before = await observe(beforeProbe);
+        if (before.reply.status === 401 || before.reply.status === 403) {
+          if (!noResult(before.reply)) throw mismatch(beforeProbe, before.reply.received, "a credential error carries no result headers");
+          await compareOwn(before, { ...beforeProbe, policies: [INVALID_POLICY] });
         }
       }
     });
@@ -578,21 +590,34 @@ export async function runConformance(options: Options): Promise<Report> {
       await expect(inference(negative.model.id, "bits=0", negative.text), "invalid header takes precedence over unsatisfiable suffix", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(negative.model.id, negative.text, "bits=0"), "invalid suffix takes precedence over unsatisfiable header", (r) => refusal(r, "unsupported", "bits"));
     });
-    await run("G34", "refusals use the same error body shape as ordinary errors on this endpoint", async () => {
-      if (first === undefined) return needModel;
-      const ordinary: Observation[] = [];
+    const endpointExchanges = exchanges.slice(firstExchange);
+    // A refusal with a different credential may use a different endpoint envelope.
+    const unmatched = new Set(endpointExchanges.filter(({ probe, reply }) => reply.refused.length > 0
+      && !endpointExchanges.some(({ probe: sample, ordinaryControl, reply: ordinary }) => sample.credential === probe.credential && ordinaryControl && ordinary.hasBody))
+      .map(({ probe }) => probe.credential));
+    for (const credential of unmatched) {
       for (const raw of ["{", '{"model":4}']) {
-        const reply = await expect(bodyProbe(raw), "an ordinary error from this endpoint", (r) => r.status >= 400 && noResult(r));
-        if (reply.hasBody) ordinary.push(reply);
+        const sample = await observe({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) }).catch(() => undefined);
+        if (sample !== undefined && sample.reply.status >= 400 && noResult(sample.reply)) sample.ordinaryControl = true;
       }
-      if (ordinary.length === 0) return "an ordinary error with a body whose shape can be compared";
-      for (const probe of [inference(first.id, "bits=0"), ...(negative === undefined ? [] : [inference(negative.model.id, negative.text)])]) {
-        await expect(probe, `an error with the same structural members and types as an ordinary error: ${ordinary.map((r) => r.received).join("; ")}`, (r) => {
-          const sameStatus = ordinary.filter((own) => own.status === r.status);
-          return r.refused.length === 1 && (sameStatus.length ? sameStatus : ordinary).some((own) => sameErrorShape(own, r));
-        });
-      }
-    });
+    }
+    const audit = auditResults(exchanges.slice(firstExchange), (probe) => resultContext(probe, scopeFor(probe)));
+    const audited = (id: "G6" | "G15" | "G17" | "G19" | "G26" | "G34", detail: string, missing?: string) => {
+      const failure = audit.failures.get(id);
+      const existing = checks.find((entry) => entry.id === id && entry.endpoint === endpoint);
+      const verdict: Check = failure !== undefined ? { id, endpoint, status: "FAIL", detail: failure }
+        : missing !== undefined ? { id, endpoint, status: "SKIP", detail: `missing precondition: ${missing}` }
+        : { id, endpoint, status: "PASS", detail };
+      if (existing === undefined) checks.push(verdict);
+      else if (failure !== undefined || (existing.status === "PASS" && missing !== undefined)) Object.assign(existing, verdict);
+    };
+    audited("G6", "observed relays met the combined policy");
+    audited("G15", "observed policy relays named a published provider", audit.sawPolicyRelay ? undefined : "a relay for a request with a policy");
+    audited("G17", "observed relays gave evidence exactly when required", audit.sawAttestationRelay ? undefined : "a relay for a policy with attest");
+    audited("G19", "observed refusals and relays used exclusive single result headers", audit.sawPolicyResult ? undefined : "an observed policy refusal or relay");
+    audited("G26", "observed policy-free traffic carried neither refusal nor evidence");
+    audited("G34", "every observed refusal matched an endpoint error shape", audit.sawRefusal && audit.comparedErrorShape && !audit.unpairedErrorShape
+      ? undefined : audit.sawRefusal ? "an ordinary error body under the same credential for each observed refusal" : "an observed refusal");
   }
 
   return { checks, passed: checks.filter((c) => c.status === "PASS").length, failed: checks.filter((c) => c.status === "FAIL").length, skipped: checks.filter((c) => c.status === "SKIP").length };

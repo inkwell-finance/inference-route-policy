@@ -119,6 +119,32 @@ test("C1: pi: a payload naming another model than its headers were prepared for 
   assert.match(result.error ?? "", /the request's model is not the one its headers were prepared for/);
 });
 
+test("C14: pi: a request prepared before another came back not honored is not released, and no stale detection decides it", async () => {
+  const harness = await pi("zdr");
+  // B's headers are prepared while A is out; A then comes back not honored, which discards the detection reply.
+  await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: {} });
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  await harness.request();
+  assert.match(notices(harness).at(-1) ?? "", /NOT honored/);
+  const reads = gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length;
+  gateway.requests.length = 0;
+  const payload = await harness.emit("before_provider_request", { type: "before_provider_request", payload: { model: "demo-model", messages: [] } }, "payload");
+  assert.throws(() => JSON.stringify(payload), /the detection reply this request was checked against was discarded since; it is not sent/);
+  assert.ok(reads >= 1);
+  // The next request reads detection again before anything goes.
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
+  assert.ok((await harness.request()).sent);
+  assert.equal(gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length, 1);
+});
+
+test("C14: pi: requests for one model prepared with different keys at once block the next payload", async () => {
+  const harness = await pi("zdr");
+  await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: { authorization: "Bearer demo-key" } });
+  await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: { authorization: "Bearer demo-key-zdr" } });
+  const payload = await harness.emit("before_provider_request", { type: "before_provider_request", payload: { model: "demo-model", messages: [] } }, "payload");
+  assert.throws(() => JSON.stringify(payload), /prepared with different policies or keys at once/);
+});
+
 adapterContract("pi", pi, () => gateway);
 
 test("C10: pi: the held policy survives a session resume", async () => {

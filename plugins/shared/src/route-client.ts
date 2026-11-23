@@ -1,16 +1,18 @@
 /**
  * The plugin's state for one harness session: the held policy, what it has fetched from each gateway, and the
- * requests it let through, so it can read their results. Detection replies and model lists live only in this
- * object, keyed by base URL and credential together (C14), and are never written anywhere (C15).
+ * requests it released. Detection replies and model lists live only in this object, keyed by base URL and
+ * credential together (C14), and are never written anywhere (C15). A released request goes only through the
+ * fetch gate, which asks `gate`, and its response is read from that same call.
  */
 
 import { hasRequirements, parsePolicy, type Detection } from "../../../core/src/index.ts";
 import { anyPolicy, anyRequirement, decide, readLayers, type Carriers, type Decision } from "./decide.ts";
+import type { Verdict } from "./fetch-gate.ts";
 import { fetchDetection, fetchModelList, normalizeBase, type DetectionResult, type Fetch, type Target } from "./gateway-client.ts";
 import { describeHeld, heldFromEnv, holdPolicy, type Held } from "./held.ts";
 import { isOpenRouter } from "./openrouter.ts";
 import { describeReport, interpret, type Report, type Sent } from "./outcome.ts";
-import type { Exchange } from "./observe.ts";
+import { identityKey, type Completion, type Outgoing, type RequestIdentity } from "./request.ts";
 
 export interface RouteClientOptions {
   carriers: Carriers;
@@ -22,24 +24,27 @@ export interface RouteClientOptions {
    * (omp does after 30 seconds), so the two reads before a request must finish well inside that.
    */
   timeoutMs?: number;
-  /** Called with the report for each response this client sent, and for each request it blocked. */
+  /** Called with the report for each response to a released request, and for each request blocked. */
   onReport: (report: Report) => void;
 }
 
-/** A request this client let through, exactly as it went on the wire, and what to read its response against. */
-interface Pending {
-  base: string;
-  credential: string | null;
+/** A decision, the target it was made for, and the detection generation it relied on. */
+export interface Prepared {
+  decision: Decision;
+  target: Target;
+  generation: number;
+}
+
+/** What a released request is read against, and what must still hold when it leaves. */
+interface Ticket {
   cacheKey: string;
-  /** The serialized body, which ties a response to this request and no other. */
-  body: string;
-  header: string | null;
+  generation: number;
   sent: Sent;
   requirement: boolean;
 }
 
-/** The most pending requests remembered; one whose response never comes is forgotten after this many more. */
-const PENDING_LIMIT = 32;
+/** Releases remembered for resends. Past this the oldest is forgotten, which can only stop a resend of it. */
+const TICKET_LIMIT = 1024;
 
 export class RouteClient {
   held: Held;
@@ -51,7 +56,11 @@ export class RouteClient {
   // What is held now, for a request that may use what is held but would not fetch anything itself.
   readonly #heldDetections = new Map<string, Detection>();
   readonly #heldLists = new Map<string, unknown>();
-  readonly #pending: Pending[] = [];
+  readonly #generations = new Map<string, number>();
+  /** Released requests by identity. */
+  readonly #tickets = new Map<string, Ticket>();
+  /** Base URLs whose POSTs this client checks at the gate. */
+  readonly #bases = new Set<string>();
 
   constructor(options: RouteClientOptions) {
     this.#options = options;
@@ -102,10 +111,14 @@ export class RouteClient {
     return pending;
   }
 
-  /** C14: the detection reply for this base URL and credential can no longer be trusted. */
+  /** How many times the detection reply for a base URL and credential has been discarded. */
+  #generation = (cacheKey: string): number => this.#generations.get(cacheKey) ?? 0;
+
+  /** C14: the detection reply for this base URL and credential can no longer be trusted, nor anything decided on it. */
   #discardDetection(cacheKey: string): void {
     this.#detections.delete(cacheKey);
     this.#heldDetections.delete(cacheKey);
+    this.#generations.set(cacheKey, this.#generation(cacheKey) + 1);
   }
 
   /**
@@ -114,11 +127,15 @@ export class RouteClient {
    * request, the model list when a requirement does, the key's own included. A request no policy reaches fetches
    * nothing, but is still judged against what is already held for its base URL and credential (C16).
    */
-  async decide(target: Target, model: string, configured: string | null): Promise<Decision> {
-    const layers = readLayers(this.held, model, configured);
-    if (!layers.ok) return { action: "block", reason: layers.reason };
-    const base = normalizeBase(target.base);
+  async decide(target: Target, model: string, configured: string | null): Promise<Prepared> {
     const key = this.#key(target);
+    // Taken before any read: a discard while this decision waits makes it stale.
+    const generation = this.#generation(key);
+    const prepared = (decision: Decision): Prepared => ({ decision, target: { ...target, base: normalizeBase(target.base) }, generation });
+    const layers = readLayers(this.held, model, configured);
+    if (!layers.ok) return prepared({ action: "block", reason: layers.reason });
+    const base = normalizeBase(target.base);
+    this.#bases.add(base);
     let detection: Detection | null = this.#heldDetections.get(key) ?? null;
     let noDetection = "not fetched";
     let modelList: { list: unknown } | null = this.#heldLists.has(key) ? { list: this.#heldLists.get(key) } : null;
@@ -133,21 +150,35 @@ export class RouteClient {
         modelList = list === null ? null : { list };
       }
     }
-    return decide(layers.value, this.#options.carriers, { base, detection, noDetection, modelList });
+    return prepared(decide(layers.value, this.#options.carriers, { base, detection, noDetection, modelList }));
   }
 
-  /** Records a request the caller is about to let through, with the exact body it will send. */
-  sending(target: Target, decision: Exclude<Decision, { action: "block" }>, body: string): void {
-    this.#pending.push({
-      base: normalizeBase(target.base),
-      credential: target.credential,
-      cacheKey: this.#key(target),
-      body,
-      header: decision.action === "send" ? decision.header : null,
+  /** Whether nothing a decision relied on has been discarded since it was made (C14). */
+  isCurrent(prepared: Prepared): boolean {
+    return prepared.generation === this.#generation(this.#key(prepared.target));
+  }
+
+  /**
+   * Releases a decided request with the identity it will have on the wire. Only a request with a released
+   * identity passes the fetch gate, and only while its decision is current.
+   */
+  release(prepared: Prepared & { decision: Exclude<Decision, { action: "block" }> }, identity: RequestIdentity): void {
+    const { decision } = prepared;
+    const ticket: Ticket = {
+      cacheKey: this.#key(prepared.target),
+      generation: prepared.generation,
       sent: decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes },
       requirement: decision.sent !== null && hasRequirements(decision.sent),
-    });
-    if (this.#pending.length > PENDING_LIMIT) this.#pending.shift();
+    };
+    const key = identityKey(identity);
+    this.#bases.add(identity.base);
+    this.#tickets.delete(key);
+    this.#tickets.set(key, ticket);
+    // Forgetting the oldest release can only stop a late resend of it, never let anything through.
+    for (const oldest of this.#tickets.keys()) {
+      if (this.#tickets.size <= TICKET_LIMIT) break;
+      this.#tickets.delete(oldest);
+    }
   }
 
   /** Reports a request the caller blocked: nothing of it was sent. */
@@ -156,27 +187,33 @@ export class RouteClient {
   }
 
   /**
-   * Reads a response if it answers a request this client let through: same base URL, same credential, same
-   * body, same `Route-Policy`. A response to this base URL and credential that matches none while a request with
-   * a requirement is outstanding there cannot be tied to its request: nothing about it is confirmed, and the
-   * detection reply it might have answered is no longer trusted.
+   * The fetch gate's question for this client. A POST to a base URL it watches goes only as a request it
+   * released, matched on base URL, credential, model and policy header, and only while the decision behind it is
+   * current. Anything else to that base URL is stopped if a policy could be at stake: one is held, or the request
+   * carries one, or its model cannot be read.
    */
-  observe(exchange: Exchange): void {
-    if (exchange.method !== "POST") return;
-    const here = this.#pending.filter((p) => exchange.url.startsWith(`${p.base}/`) && exchange.credential === p.credential);
-    if (here.length === 0) return;
-    const index = this.#pending.findIndex((p) => here.includes(p) && exchange.body === p.body && exchange.routePolicy === p.header);
-    if (index < 0) {
-      const outstanding = here.filter((p) => p.requirement);
-      if (outstanding.length === 0) return;
-      for (const p of outstanding) this.#discardDetection(p.cacheKey);
-      this.#report({ kind: "untied", base: outstanding[0]!.base });
-      return;
+  gate(outgoing: Outgoing): Verdict {
+    const base = [...this.#bases].filter((b) => outgoing.url.startsWith(`${b}/`)).sort((a, b) => b.length - a.length)[0];
+    if (base === undefined) return { kind: "pass" };
+    const ticket = outgoing.model === undefined ? undefined : this.#tickets.get(identityKey({ base, credential: outgoing.credential, model: outgoing.model, header: outgoing.header }));
+    if (ticket !== undefined) {
+      if (ticket.requirement && ticket.generation !== this.#generation(ticket.cacheKey)) {
+        return this.#stop("the detection reply this request was checked against was discarded before it left, so it is not sent; send it again");
+      }
+      return { kind: "released", complete: (completion) => this.#complete(ticket, completion) };
     }
-    const [pending] = this.#pending.splice(index, 1);
-    const report = interpret(exchange.result, pending!.sent);
+    const policyAtStake = this.held.kind !== "none" || outgoing.header !== null || outgoing.model === undefined || (outgoing.model ?? "").includes("+");
+    if (!policyAtStake) return { kind: "pass" };
+    return this.#stop(`this request to ${base} is not one the plugin checked: its key, model, or Route-Policy header differs from what was released`);
+  }
+
+  #stop = (reason: string): Verdict => ({ kind: "stop", reason, stopped: () => this.blocked(reason) });
+
+  /** Reads the response to one released request (C3, C4, C5). */
+  #complete(ticket: Ticket, completion: Completion): void {
+    const report = interpret(completion.result, ticket.sent);
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
-    if (report.kind === "not-honored" && pending!.requirement) this.#discardDetection(pending!.cacheKey);
+    if (report.kind === "not-honored" && ticket.requirement) this.#discardDetection(ticket.cacheKey);
     this.#report(report);
   }
 

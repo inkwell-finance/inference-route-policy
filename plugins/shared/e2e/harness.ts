@@ -12,6 +12,7 @@ import { createServer, request as httpRequest } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Fault } from "./faulty.ts";
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -265,7 +266,8 @@ interface Case {
   name: string;
   provider: string;
   policy: string;
-  plugin?: "faulty";
+  /** Loads the plugin through `e2e/faulty-plugin.ts`, with this fault (see shared/e2e/faulty.ts). */
+  fault?: Fault;
   /** Checks what was observed; returns the failures. */
   check(observed: Observed): string[];
 }
@@ -323,9 +325,19 @@ const CASES: readonly Case[] = [
     name: "(d) blocked: zdr through the gateway when the plugin fails inside its guard (its context's model accessor throws)",
     provider: "gateway",
     policy: "zdr",
-    plugin: "faulty",
+    fault: "model",
     check: (observed) => [
       ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: .*(model unavailable \(injected by the e2e runner\)|could not prepare the headers)/),
+      ...expectNoProviderContent(observed),
+    ],
+  },
+  {
+    name: "(e) blocked at fetch: the harness reports one key and sends another; detection was read for the reported one",
+    provider: "gateway",
+    policy: "zdr",
+    fault: "key",
+    check: (observed) => [
+      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked: its key, model, or Route-Policy header differs/),
       ...expectNoProviderContent(observed),
     ],
   },
@@ -333,8 +345,10 @@ const CASES: readonly Case[] = [
 
 async function runCase(spec: HarnessSpec, sandbox: Sandbox, stack: DemoStack, transcript: Transcript, test: Case): Promise<string[]> {
   transcript.log(`\n== ${test.name}`);
-  const { command, args } = spec.launch(test.provider, test.plugin ?? "shipped");
-  const session = new RpcSession(command, args, sandbox, transcript);
+  const { command, args } = spec.launch(test.provider, test.fault === undefined ? "shipped" : "faulty");
+  const env = test.fault === undefined ? sandbox.env : { ...sandbox.env, IRP_E2E_FAULT: test.fault };
+  if (test.fault !== undefined) transcript.log(`  (IRP_E2E_FAULT=${test.fault}, read only by e2e/faulty-plugin.ts)`);
+  const session = new RpcSession(command, args, { ...sandbox, env }, transcript);
   const shownFrom = (from: number): RpcLine[] => session.lines.slice(from).filter((line) => ui(line, "notify") || ui(line, "setStatus"));
   const log = (lines: RpcLine[]): void => {
     for (const line of lines) transcript.log(`  <- ${line["method"]}: ${text(line).replaceAll("\n", "\n     ")}`);

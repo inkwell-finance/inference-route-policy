@@ -20,6 +20,30 @@ function hostile(ctx: unknown, broken: string): object {
 }
 
 export function adapterContract(name: string, make: (policy?: string) => Promise<FakeHarness>, gateway: () => FakeGateway): void {
+  test(`C1, C14: ${name}: a request that leaves with another key than the one its detection was read for is stopped at fetch`, async () => {
+    const harness = await make("zdr");
+    harness.wireKey = "demo-key-zdr";
+    const result = await harness.request();
+    assert.equal(result.sent, false);
+    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked: its key, model, or Route-Policy header differs/);
+    assert.equal(gateway().inference().length, 0);
+    assert.match(notices(harness).at(-1) ?? "", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin checked/, "the user is told");
+    assert.deepEqual(
+      [...new Set(gateway().requests.filter((r) => r.method === "GET").map((r) => r.headers.authorization))],
+      ["Bearer demo-key"],
+      "detection was read only for the key the registry reported",
+    );
+  });
+
+  test(`C14: ${name}: a configured Authorization header is the key the plugin reads detection for, and the request with it goes`, async () => {
+    const harness = await make("zdr");
+    harness.model.headers = { Authorization: "Bearer demo-key-zdr" };
+    harness.wireKey = "demo-key-zdr";
+    assert.ok((await harness.request()).sent);
+    assert.deepEqual([...new Set(gateway().requests.filter((r) => r.method === "GET").map((r) => r.headers.authorization))], ["Bearer demo-key-zdr"]);
+    assert.equal(gateway().inference().length, 1);
+  });
+
   for (const broken of ["ui", "model", "modelRegistry"]) {
     test(`C1: ${name}: a context whose ${broken} accessor throws gets a blocking payload, never a rejection`, async () => {
       const harness = await make("zdr");

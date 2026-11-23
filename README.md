@@ -54,8 +54,11 @@ npm run e2e:omp
 npm run e2e:pi
 ```
 
-Each asserts, from outside the harness, one honored request, one
-refused request, and one blocked request, and writes what it ran and
+Each asserts, from outside the harness: a request that is honored; one
+the gateway refuses; one the plugin holds back because no published
+route meets it; one blocked for lack of detection; one blocked by a
+failure inside the plugin; and one stopped because the key on the wire
+is not the key detection was read for. Each run writes what it ran and
 observed to `plugins/<harness>/e2e/transcript.txt`.
 
 ## Try it
@@ -78,11 +81,15 @@ result, `/route <policy>` sets it, and `/route clear` removes it.
 
 ## Known limits of the plugins
 
-- A request is guarded when it passes through the harness's
-  `before_provider_request` hook. A harness feature that sends content
-  without that hook is not covered.
-- Results are read from the process's `fetch`. A transport that does not
-  use it gets no result report; it is never reported as honored.
+- A request is decided in the harness's `before_provider_request` hook
+  and checked again where it leaves, in the process's `fetch`: a POST
+  to a base URL the plugin has seen goes out only if it matches a
+  request the plugin released, in base URL, key, model, and policy. A
+  harness feature that sends content to some other base URL without the
+  hook is not covered, and neither is a transport that does not use
+  `fetch`.
+- A POST whose body the plugin cannot read at `fetch`, such as a
+  compressed one, is stopped whenever a policy is held or carried.
 - omp gives a plugin no way to set request headers, so there the held
   policy travels as a model suffix.
 

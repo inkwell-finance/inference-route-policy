@@ -27,6 +27,11 @@ const good = createGateway({
   fetch: (url: string) => Response.json({ text: `served by ${new URL(url).hostname}` }),
 });
 
+const unavailableGateway = createGateway({
+  models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+  fetch: () => new Response("provider failure", { status: 503 }),
+});
+
 interface Exchange {
   request: Request;
   transport: Parameters<RequestHandler>[1];
@@ -185,6 +190,20 @@ test("G10 G13 G23: each credential's own catalog determines its model and matchi
   assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
 });
 
+test("G10 G13 G23: an inaccessible policy-key catalog does not borrow models from the ordinary credential", async (t) => {
+  let catalogDenied = 0;
+  const report = await run(t, async (request, transport) => {
+    if (new URL(request.url).pathname === "/v1/models" && request.headers.get("authorization") === `Bearer ${policyKey}`) {
+      catalogDenied++;
+      return Response.json({ error: { type: "access_denied", message: "no catalog permission" } }, { status: 403 });
+    }
+    return good(request, transport);
+  });
+  assert.equal(catalogDenied, 1);
+  assert.equal(report.failed, 0);
+  for (const id of ["G10", "G13", "G23"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "SKIP", id);
+});
+
 function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "nested-type" | "array-member-type" | "empty-body"): RequestHandler {
   return async (request, transport) => {
     const reply = await good(request, transport);
@@ -265,6 +284,147 @@ test("G21: an applied header does not mask rejection of a valid listed value", a
     return header === "bits=32" ? change(reply, { replace: { [applied]: formatApplied("aurora"), [refusal]: formatRefused("unsupported", "bits") } }) : reply;
   }));
   assert.equal(report.checks.find(({ id }) => id === "G21")?.status, "FAIL");
+});
+
+test("G25 G1 G6 G10 G13: ordinary HTTP 429 blocks policy probes without any conformance failures", async (t) => {
+  const usableInputs: { header: string | null; id: string; suffix: string | null; body: Record<string, unknown>; auth: string | null }[] = [];
+  const report = await run(t, fixture(({ request, header, id, suffix, body, auth, next }) => {
+    if (request.method !== "POST") return next();
+    if (id === model) usableInputs.push({ header, id, suffix, body, auth });
+    return Response.json({ error: { type: "rate_limit", message: "try later" } }, { status: 429 });
+  }), INFERENCE_ENDPOINTS);
+  assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+  for (const endpoint of INFERENCE_ENDPOINTS) {
+    for (const id of ["G1", "G6", "G10", "G13"]) {
+      const verdict = report.checks.find((c) => c.endpoint === endpoint && c.id === id);
+      assert.equal(verdict?.status, "SKIP");
+      assert.match(verdict.detail, /gateway answered its own error 429 to the (no-policy control|control without explicit policy)/);
+    }
+    assert.equal(report.checks.find((c) => c.endpoint === endpoint && c.id === "G25")?.status, "PASS");
+  }
+  const i = usableInputs.findIndex(({ suffix }) => suffix !== null);
+  assert.ok(i >= 0, "a suffix probe was sent");
+  const probe = usableInputs[i]!;
+  const control = usableInputs[i + 1]!;
+  assert.deepEqual(control, { ...probe, header: null, suffix: null, body: { ...probe.body, model: probe.id } });
+});
+
+test("G2 G19: a matching ordinary status does not excuse a forbidden policy result header", async (t) => {
+  const report = await run(t, fixture(({ request, header, next }) => {
+    if (request.method !== "POST") return next();
+    return Response.json({ error: { type: "rate_limit", message: "try later" } }, { status: 429,
+      ...(header === "bits=0+only=a,a" ? { headers: { [refusal]: formatRefused("unsupported", "bits") } } : {}),
+    });
+  }));
+  for (const id of ["G2", "G19"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+});
+
+test("G15 G17 G34: all qualifying routes may be unavailable, with a correctly shaped refusal", async (t) => {
+  const report = await run(t, unavailableGateway);
+  assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+  assert.equal(report.checks.find(({ id }) => id === "G15")?.status, "SKIP");
+  assert.equal(report.checks.find(({ id }) => id === "G17")?.status, "SKIP");
+  assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
+});
+
+test("G34: an isolated malformed unavailable refusal is caught outside the dedicated evidence and stream probes", async (t) => {
+  let changed = false;
+  const report = await run(t, async (request, transport) => {
+    const reply = await unavailableGateway(request, transport);
+    if (!changed && request.headers.get("route-policy") === "bits=1" && reply.headers.get(refusal) === formatRefused("unavailable")) {
+      changed = true;
+      return change(reply, { body: "service unavailable", replace: { "content-type": "text/plain" } });
+    }
+    return reply;
+  });
+  assert.ok(changed, "the satisfiable probe actually observed the broken 503");
+  assert.deepEqual(report.checks.filter(({ status }) => status === "FAIL").map(({ id }) => id), ["G34"]);
+  assert.match(report.checks.find(({ id }) => id === "G34")!.detail, /service unavailable/);
+});
+
+for (const { condition, config, skipped } of [
+  { condition: "only a subset of keys and enumerated values is accepted", config: { accept: { keys: ["zdr", "attest", "sort"], attest: ["prompt"], sort: ["latency"] } }, skipped: ["G12", "G24"] },
+  { condition: "no request keys are accepted", config: { accept: { keys: [], attest: [], sort: [] }, keys: { [key]: {}, [policyKey]: {} } }, skipped: ["G3", "G6", "G10", "G17"] },
+  { condition: "one route qualifies for every satisfiable policy", config: { models: { [model]: [routes[0]!] } }, skipped: ["G13", "G17"] },
+  { condition: "no route publishes attest", config: { models: { [model]: [routes[0]!, routes[2]!] } }, skipped: ["G17"] },
+  { condition: "no credential carries a default policy", config: { keys: { [key]: {}, [policyKey]: {} } }, skipped: ["G10", "G13"] },
+  { condition: "the accessible model catalog is empty", config: { models: {} }, skipped: ["G1", "G15", "G17"] },
+] as const) {
+  test(`G10 G12 G13 G15 G17 G21 G23 G24: no false failures when ${condition}`, async (t) => {
+    const target = createGateway({
+      models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+      fetch: () => Response.json({ output: "served" }), ...config,
+    });
+    const report = await run(t, target);
+    assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+    for (const id of skipped) assert.equal(report.checks.find((c) => c.id === id)?.status, "SKIP", id);
+  });
+}
+
+test("G8 G15 G19: a published model may be unavailable on one API surface despite resolving on another", async (t) => {
+  const report = await run(t, async (request, transport) => new URL(request.url).pathname === "/v1/responses"
+    ? Response.json({ error: { type: "not_found_error", message: "not supported on this endpoint" } }, { status: 404 })
+    : good(request, transport), ["chat/completions", "responses"]);
+  assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
+  for (const id of ["G8", "G15", "G19"]) {
+    assert.equal(report.checks.find((c) => c.endpoint === "chat/completions" && c.id === id)?.status, "PASS");
+    assert.equal(report.checks.find((c) => c.endpoint === "responses" && c.id === id)?.status, "SKIP");
+  }
+});
+
+test("G25 G15: transient throttling of a single streaming probe is not a missing relay header", async (t) => {
+  let ordinaryOwnErrors = 0;
+  const report = await run(t, fixture(({ body, header, next }) => {
+    if (body.stream === true && header !== null && ordinaryOwnErrors++ === 0) {
+      return Response.json({ error: { type: "rate_limit", message: "try again" } }, { status: 429 });
+    }
+    return next();
+  }));
+  assert.equal(ordinaryOwnErrors, 1);
+  assert.equal(report.failed, 0);
+  assert.match(report.checks.find(({ id }) => id === "G15")!.detail, /transient headerless HTTP 429/);
+});
+
+test("G15: an interrupted non-SSE relay still exposes the committed result headers", async (t) => {
+  let interrupted = 0;
+  const report = await run(t, fixture(({ body, next }) => {
+    if (body.stream !== true) return next();
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        interrupted++;
+        controller.error(new Error("connection fell away after headers"));
+      },
+    }, { highWaterMark: 0 }); // The adapter commits headers before pulling the body.
+    return new Response(stream, { headers: { [applied]: formatApplied("aurora"), "content-type": "application/octet-stream" } });
+  }));
+  assert.equal(interrupted, 1);
+  assert.equal(report.failed, 0);
+  assert.equal(report.checks.find(({ id }) => id === "G15")?.status, "PASS");
+});
+
+test("G15 G17 G19 S14 S15 S18: result rules also audit responses received by carrier and advertisement probes", async (t) => {
+  const report = await run(t, fixture(async ({ header, suffix, next }) => {
+    const reply = await next();
+    if (suffix === "zdr" && header === null) return change(reply, { replace: {
+      [applied]: "provider=aurora, provider=basalt", [evidence]: "https://_invalid.example/",
+    } });
+    if (header === "sort=throughput" && suffix === null) return change(reply, { replace: { [refusal]: "reason=unavailable+key=zdr" } });
+    return reply;
+  }));
+  for (const id of ["G15", "G17", "G19"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL", id);
+  assert.match(report.checks.find(({ id }) => id === "G15")!.detail, /S14/);
+  assert.match(report.checks.find(({ id }) => id === "G17")!.detail, /S18/);
+  assert.match(report.checks.find(({ id }) => id === "G19")!.detail, /S15/);
+});
+
+test("G19: missing refusal header fails when the matching no-policy control reaches routing", async (t) => {
+  const report = await run(t, fixture(async ({ header, next }) => {
+    const reply = await next();
+    return header === "bits=64" && reply.headers.has(refusal) ? change(reply, { replace: { [refusal]: null } }) : reply;
+  }));
+  const verdict = report.checks.find(({ id }) => id === "G19");
+  assert.equal(verdict?.status, "FAIL");
+  assert.match(verdict.detail, /the no-policy control reached routing/);
 });
 
 test("G9 G15 G17 G25 G34: the real demo passes on all requested endpoints with zero skips", async (t) => {

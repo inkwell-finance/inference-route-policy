@@ -3,20 +3,21 @@
  * report of every response. omp and pi expose the same extension API names for all of this; they differ in
  * whether a handler may set request headers, which `headerHook` says.
  *
- * Blocking: both harnesses catch an error thrown from `before_provider_request`, or a rejected handler, and send
- * the request with the payload it had, so neither blocks. What does is the payload: the handler returns one
- * whose JSON serialization throws, which stops the transport before it opens a connection and surfaces the
- * reason as the turn's error. Every handler that shapes a request therefore runs whole inside a boundary whose
- * failure path returns that payload and touches nothing else.
+ * Blocking happens in two places. Both harnesses catch an error thrown from `before_provider_request`, or a
+ * rejected handler, and send the request with the payload it had, so neither blocks; what does is the payload:
+ * the handler returns one whose JSON serialization throws, which stops the transport before it opens a
+ * connection. Every handler that shapes a request runs whole inside a boundary whose failure path returns that
+ * payload. Then, at `fetch`, the gate lets a request out only as the plugin released it (see fetch-gate.ts).
  */
 
 import type { Decision } from "./decide.ts";
+import { addGate } from "./fetch-gate.ts";
 import { normalizeBase, type Target } from "./gateway-client.ts";
 import { heldFromEntry, heldFromEnv, holdPolicy, type Held, type HeldEntry } from "./held.ts";
-import { observeExchanges } from "./observe.ts";
 import { OPENROUTER_PROVIDER_APIS } from "./openrouter.ts";
 import { describeReport, isQuiet, type Report } from "./outcome.ts";
-import { RouteClient } from "./route-client.ts";
+import { credentialOf } from "./request.ts";
+import { RouteClient, type Prepared } from "./route-client.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -57,15 +58,19 @@ function uiOf(ctx: unknown): UI | null {
   return { notify: (message, type) => notify.call(ui, message, type), setStatus: (key, text) => setStatus.call(ui, key, text) };
 }
 
-/** A `Route-Policy` value in a header record, whatever its case; null when there is none. */
-function routePolicyIn(headers: unknown): string | null {
-  if (!isObject(headers)) return null;
-  for (const [name, value] of Object.entries(headers)) if (name.toLowerCase() === "route-policy" && typeof value === "string") return value;
-  return null;
+/** A header record as `Headers`, skipping values that are not strings (pi deletes a header set to null). */
+function headersFrom(...records: unknown[]): Headers {
+  const headers = new Headers();
+  for (const record of records) {
+    if (!isObject(record)) continue;
+    for (const [name, value] of Object.entries(record)) if (typeof value === "string") headers.set(name, value);
+  }
+  return headers;
 }
 
 /** The request a hook's context is about: where it goes, with which key, for which model, over which API. */
 interface RequestOf {
+  /** The base URL and the key the request will carry, as far as the harness says; the fetch gate checks the key. */
   target: Target;
   modelId: string;
   /** The harness's name for the request API (`openai-completions`, ...); null when it gives none. */
@@ -74,8 +79,12 @@ interface RequestOf {
   configured: string | null;
 }
 
-/** Reads the model and its credentials from a handler context. Null when the context has no usable model. */
-async function requestOf(ctx: unknown): Promise<RequestOf | null> {
+/**
+ * Reads the model and its credentials from a handler context. Null when the context has no usable model. The
+ * key is the one a configured `Authorization` or `x-api-key` header sends, which replaces the registry's key
+ * on the wire, else the registry's; `wire`, when the hook sees the request's own headers, is read first.
+ */
+async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<RequestOf | null> {
   const model = member(ctx, "model");
   const id = member(model, "id");
   const baseUrl = member(model, "baseUrl");
@@ -88,11 +97,13 @@ async function requestOf(ctx: unknown): Promise<RequestOf | null> {
   const ok = member(auth, "ok") === true;
   const apiKey = ok ? member(auth, "apiKey") : undefined;
   const authBase = ok ? member(auth, "baseUrl") : undefined;
+  const configured = headersFrom(ok ? member(auth, "headers") : undefined, member(model, "headers"), wire);
+  const credential = credentialOf(configured) ?? (typeof apiKey === "string" && apiKey !== "" ? apiKey : null);
   return {
-    target: { base: normalizeBase(typeof authBase === "string" ? authBase : baseUrl), credential: typeof apiKey === "string" && apiKey !== "" ? apiKey : null },
+    target: { base: normalizeBase(typeof authBase === "string" ? authBase : baseUrl), credential },
     modelId: id,
     api: typeof api === "string" ? api : null,
-    configured: routePolicyIn(member(model, "headers")) ?? (ok ? routePolicyIn(member(auth, "headers")) : null),
+    configured: configured.get("route-policy"),
   };
 }
 
@@ -155,13 +166,13 @@ function withDeadline<T>(work: () => Promise<T>, fallback: (why: string) => T): 
   return Promise.race([done, late]).finally(() => clearTimeout(timer));
 }
 
-/** A decision and the request it was made for; a block needs none. */
+/** A prepared decision and the request it was made for; a block needs no request. */
 interface Guarded {
   request: RequestOf | null;
-  decision: Decision;
+  prepared: Prepared;
 }
 
-const blockWith = (reason: string): Guarded => ({ request: null, decision: { action: "block", reason } });
+const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", credential: null }, generation: 0 } });
 
 export interface PluginOptions {
   /** True where `before_provider_headers` lets the plugin set request headers (pi); false where it cannot (omp). */
@@ -178,7 +189,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     ui = uiOf(ctx) ?? ui;
   };
   const client = new RouteClient({ carriers: options.headerHook ? "header" : "suffix", env: options.env, onReport: (report) => show(ui, report) });
-  const stopObserving = observeExchanges((exchange) => client.observe(exchange));
+  const stopGating = addGate((outgoing) => client.gate(outgoing));
 
   /** Blocks with `reason`, telling the user if that can be done; never throws. */
   const refuse = (reason: string): object => {
@@ -192,13 +203,15 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
 
   /**
    * The payload to hand back to the harness for a decision, and a blocked one for anything that cannot be sent.
-   * What is returned is a plain copy of the payload as judged, so the bytes the transport writes are the bytes
-   * the decision was made on, and its serialization is what ties the response to this request.
+   * A request that may go is released with the identity it will have on the wire, so the fetch gate lets it, and
+   * only it, through. What is returned is a plain copy of the payload as judged.
    */
-  const apply = ({ request, decision }: Guarded, payload: unknown): unknown => {
+  const apply = ({ request, prepared }: Guarded, payload: unknown): unknown => {
     try {
+      const { decision } = prepared;
       if (decision.action === "block") return refuse(decision.reason);
       if (request === null) return refuse("the plugin does not know where the request goes");
+      if (!client.isCurrent(prepared)) return refuse("the detection reply this request was checked against was discarded since; it is not sent");
       if (!isObject(payload)) return refuse("the request's payload is not a JSON object the plugin can read");
       let next: Record<string, unknown> = { ...payload };
       if (decision.action === "translate") {
@@ -211,9 +224,12 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (typeof payload["model"] !== "string") return refuse("the request has no model field to carry the policy");
         next = { ...next, model: decision.model };
       }
-      const body = JSON.stringify(next);
-      client.sending(request.target, decision, body);
-      const copy: unknown = JSON.parse(body);
+      const copy: unknown = JSON.parse(JSON.stringify(next));
+      const model = next["model"];
+      client.release(
+        { ...prepared, decision },
+        { base: prepared.target.base, credential: prepared.target.credential, model: typeof model === "string" ? model : null, header: decision.action === "send" ? decision.header : null },
+      );
       return copy;
     } catch (error) {
       return refuse(`the plugin failed: ${reasonOf(error)}`);
@@ -242,7 +258,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   for (const event of options.restoreEvents) api.on(event, restore);
   api.on("session_shutdown", () => {
     try {
-      stopObserving();
+      stopGating();
     } catch {
       // Nothing to send here; a failure to stop listening affects no request.
     }
@@ -281,13 +297,13 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     },
   });
 
-  // pi: decisions the header hook made, waiting for the same request's payload hook, by base URL, credential,
-  // and model. `unprepared` counts header hooks that ended without a decision for a known request; while it is
-  // nonzero, which header a payload got is unknowable, so the next payload is blocked and every waiting decision
-  // is dropped.
-  const prepared = new Map<string, Decision[]>();
+  // pi: decisions the header hook made, waiting for the same request's payload hook, by base URL and model; each
+  // carries the key it was made for, read from the request's own headers. `unprepared` counts header hooks that
+  // ended without a decision; while it is nonzero, which header a payload got is unknowable, so the next payload
+  // is blocked and every waiting decision is dropped.
+  const waiting = new Map<string, Prepared[]>();
   let unprepared = 0;
-  const preparedKey = (request: RequestOf): string => `${request.target.base}\n${request.target.credential ?? ""}\n${request.modelId}`;
+  const waitingKey = (request: RequestOf): string => `${request.target.base}\n${request.modelId}`;
 
   if (options.headerHook) {
     api.on("before_provider_headers", async (event, ctx) => {
@@ -297,17 +313,18 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (!isObject(headers)) throw new Error("the request's headers are not a record the plugin can change");
         // The work decides and changes nothing; the headers change only if it finished in time.
         const work = async (): Promise<Guarded> => {
-          const request = await requestOf(ctx);
+          const request = await requestOf(ctx, headers);
           if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
-          return { request, decision: await client.decide(request.target, request.modelId, routePolicyIn(headers)) };
+          return { request, prepared: await client.decide(request.target, request.modelId, request.configured) };
         };
-        const { request, decision } = await withDeadline(work, (why) => blockWith(`preparing the request's headers failed: ${why}`));
-        if (request === null) throw new Error(decision.action === "block" ? decision.reason : "no request");
+        const { request, prepared } = await withDeadline(work, (why) => blockWith(`preparing the request's headers failed: ${why}`));
+        if (request === null) throw new Error(prepared.decision.action === "block" ? prepared.decision.reason : "no request");
+        const { decision } = prepared;
         // pi deletes a header set to null. Every line the configuration added goes, so only the plugin's remains.
         for (const name of Object.keys(headers)) if (name.toLowerCase() === "route-policy") headers[name] = null;
         if (decision.action === "send" && decision.header !== null) headers["Route-Policy"] = decision.header;
-        const key = preparedKey(request);
-        prepared.set(key, [...(prepared.get(key) ?? []), decision]);
+        const key = waitingKey(request);
+        waiting.set(key, [...(waiting.get(key) ?? []), prepared]);
       } catch {
         unprepared += 1;
       }
@@ -315,21 +332,23 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   }
 
   /** The header hook's decision for this request. Blocks when there is none, or when it cannot be told apart. */
-  const takePrepared = (request: RequestOf, payload: unknown): Decision => {
-    const key = preparedKey(request);
-    const queue = prepared.get(key) ?? [];
+  const takePrepared = (request: RequestOf, payload: unknown): Guarded => {
+    const key = waitingKey(request);
+    const queue = waiting.get(key) ?? [];
     const [first] = queue;
-    if (first === undefined) return { action: "block", reason: "the plugin did not see this request's headers, so it cannot tell which policy they carry" };
-    if (queue.some((decision) => wireOf(decision) !== wireOf(first))) {
-      prepared.delete(key);
-      return { action: "block", reason: "requests for this model were prepared with different policies at once; resend it" };
+    if (first === undefined) return blockWith("the plugin did not see this request's headers, so it cannot tell which policy they carry");
+    const same = (p: Prepared): boolean => wireOf(p.decision) === wireOf(first.decision) && p.target.credential === first.target.credential;
+    if (!queue.every(same)) {
+      waiting.delete(key);
+      return blockWith("requests for this model were prepared with different policies or keys at once; resend it");
     }
     queue.shift();
-    if (queue.length === 0) prepared.delete(key);
+    if (queue.length === 0) waiting.delete(key);
     // Some APIs name the model in the URL, not the body; a body that names one must name the prepared one.
     const model = member(payload, "model");
-    if (model !== undefined && model !== request.modelId) return { action: "block", reason: "the request's model is not the one its headers were prepared for" };
-    return first;
+    if (model !== undefined && model !== request.modelId) return blockWith("the request's model is not the one its headers were prepared for");
+    // `apply` checks the decision is still current: one prepared before a detection discard is not released.
+    return { request, prepared: first };
   };
 
   api.on("before_provider_request", async (event, ctx) => {
@@ -340,14 +359,14 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         // A header hook that ended without a decision: this payload, whatever it is, cannot be matched to headers.
         if (options.headerHook && unprepared > 0) {
           unprepared -= 1;
-          prepared.clear();
+          waiting.clear();
           return blockWith("the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable");
         }
         const request = await requestOf(ctx);
         if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
-        if (options.headerHook) return { request, decision: takePrepared(request, payload) };
+        if (options.headerHook) return takePrepared(request, payload);
         const model = member(payload, "model");
-        return { request, decision: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured) };
+        return { request, prepared: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured) };
       };
       return apply(await withDeadline(work, (why) => blockWith(`the plugin failed: ${why}`)), payload);
     } catch (error) {

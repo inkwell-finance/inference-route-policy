@@ -30,6 +30,8 @@ export class FakeHarness {
   /** What `modelRegistry.getApiKeyAndHeaders` does; tests replace it to make the plugin fail. */
   resolveAuth: () => Promise<unknown> = async () => ({ ok: true, apiKey: "demo-key" });
   uiThrows = false;
+  /** The key the transport puts on the wire; a harness can send another than the registry reported. */
+  wireKey = "demo-key";
   /** Replaces `ctx.model`, to hand the plugin a model the harness would never describe that way. */
   contextModel: unknown = undefined;
   readonly headerHook: boolean;
@@ -89,9 +91,15 @@ export class FakeHarness {
     } catch (error) {
       return { sent: false, error: error instanceof Error ? error.message : String(error), status: null };
     }
-    const wire: Record<string, string> = { "content-type": "application/json", authorization: "Bearer demo-key" };
-    for (const [name, value] of Object.entries(headers)) if (value !== null) wire[name] = value;
-    const response = await fetch(`${this.model.baseUrl}/chat/completions`, { method: "POST", headers: wire, body });
+    const wire = new Headers({ "content-type": "application/json", authorization: `Bearer ${this.wireKey}` });
+    for (const [name, value] of Object.entries(headers)) if (value !== null) wire.set(name, value);
+    let response: Response;
+    try {
+      response = await fetch(`${this.model.baseUrl}/chat/completions`, { method: "POST", headers: wire, body });
+    } catch (error) {
+      // The fetch gate stopped it: nothing was sent.
+      return { sent: false, error: error instanceof Error ? error.message : String(error), status: null };
+    }
     await response.text();
     return { sent: true, error: null, status: response.status };
   }

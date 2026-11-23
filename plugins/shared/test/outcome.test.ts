@@ -59,11 +59,17 @@ test("C5: any Route-Refused is a refusal, whatever else the response carries and
   assert.deepEqual(interpret(headers([], ["reason=unavailable", "reason=unavailable"]), { kind: "translated" }), { kind: "refused", reason: null, key: null });
 });
 
-test("C8: a translated request's result is unconfirmed, never applied, whatever headers come back", () => {
-  const report = interpret(headers(["provider=aurora"]), { kind: "translated" });
-  assert.deepEqual(report, { kind: "unconfirmed" });
-  assert.equal(isQuiet(report), false);
-  assert.match(describeReport(report), /unconfirmed, not applied/);
+test("C8: a translated request's success is unconfirmed, never applied: with no route headers, or with a misleading Route-Applied", () => {
+  for (const received of [headers(), headers(["provider=aurora"]), headers(["provider=aurora"], [], ["https://basalt.example/attestation"])]) {
+    const report = interpret(received, { kind: "translated" });
+    assert.deepEqual(report, { kind: "unconfirmed" });
+    assert.equal(isQuiet(report), false);
+    assert.match(describeReport(report), /unconfirmed, not applied/);
+  }
+});
+
+test("C5, C8: a translated request's response that carries Route-Refused is a refusal", () => {
+  assert.deepEqual(interpret(headers([], ["reason=unavailable"]), { kind: "translated" }), { kind: "refused", reason: "unavailable", key: null });
 });
 
 test("C11: a refusal is shown with its reason and its key", () => {

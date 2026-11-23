@@ -56,7 +56,8 @@ export async function request(base: string, probe: Probe, timeoutMs: number): Pr
         status: reply.statusCode ?? 0, contentType,
         applied: buckets.get("route-applied") ?? [], refused: buckets.get("route-refused") ?? [], evidence: buckets.get("route-evidence") ?? [],
       };
-      if (contentType?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream") {
+      const relay = probe.raw !== undefined && result.refused.length === 0 && (result.status < 400 || result.applied.length > 0);
+      if (relay && contentType?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream") {
         // No conformance check requires the contents of a streaming relay.
         reply.on("error", () => {});
         reply.destroy();
@@ -65,7 +66,10 @@ export async function request(base: string, probe: Probe, timeoutMs: number): Pr
       }
       const chunks: Buffer[] = [];
       reply.on("data", (chunk: Buffer) => { chunks.push(chunk); });
-      reply.on("error", reject);
+      reply.on("error", (error) => {
+        if (!relay) reject(error);
+        else resolve({ ...result, body: undefined, hasBody: false, received: JSON.stringify({ ...result, body: `<incomplete relay: ${error.message}>` }) });
+      });
       reply.on("end", () => {
         try {
           let bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
