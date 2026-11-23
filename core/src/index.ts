@@ -180,10 +180,11 @@ export function parsePolicy(text: string, support: Support = baselineSupport()):
 const listPair = (key: string, items: readonly string[]): string => `${key}=${items.join(",")}`;
 
 /**
- * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when there is no such string:
- * the policy says nothing, an intersection left `region` or `only` empty, a list is over a limit, or a field holds
- * a value its key does not allow. A combined policy is a decision and need not be writable (SPEC.md, Combining),
- * so a client that must send one checks here first.
+ * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when no string says exactly what
+ * the policy says: it says nothing, an intersection left `region` or `only` empty, a list is over a limit, or a
+ * field holds something its key does not allow, such as an item with a comma in it, which would read back as two.
+ * A combined policy is a decision and need not be writable (SPEC.md, Combining), so a client that must send one
+ * checks here first.
  */
 export function formatPolicy(policy: Policy): Result<string> {
   const out: string[] = [];
@@ -198,7 +199,10 @@ export function formatPolicy(policy: Policy): Result<string> {
   if (policy.order !== null) out.push(listPair("order", policy.order));
   const text = out.join("+");
   const parsed = parsePolicy(text);
-  return parsed.ok ? { ok: true, value: text } : parsed;
+  if (!parsed.ok) return parsed;
+  // Joining can change meaning without breaking the grammar, so the string must read back as the same policy.
+  const fields = (p: Policy): unknown[] => [p.zdr, p.notrain, p.bits, p.region, p.attest, p.only, p.ignore, p.sort, p.order];
+  return JSON.stringify(fields(parsed.value)) === JSON.stringify(fields(policy)) ? { ok: true, value: text } : fail(null, "holds a value that does not read back as written");
 }
 
 /** The keys a policy uses, for checking them against a detection reply. */
@@ -312,31 +316,17 @@ export function parseFacts(text: string): Result<Facts> {
 }
 
 /**
- * Checks facts a gateway is about to publish (S12): everything `parseFacts` checks, and nothing beyond the five
- * fact keys, with only the `attest` values the gateway accepts.
+ * Checks a facts string a gateway is about to publish (S12): everything `parseFacts` checks, and nothing beyond the
+ * five fact keys, with only the `attest` values this revision defines. What a gateway may publish does not depend
+ * on which keys it accepts in requests.
  */
-export function parsePublishedFacts(text: string, support: Support = baselineSupport()): Result<Facts> {
+export function parsePublishedFacts(text: string): Result<Facts> {
   const parsed = parseFacts(text);
   if (!parsed.ok) return parsed;
-  const attest = defined(support.attest, BASELINE_ATTEST);
-  const unknownAttest = parsed.value.attest.find((item) => !attest.has(item));
-  if (unknownAttest !== undefined) return fail("attest", `"${unknownAttest}" is not an attest value this gateway accepts`);
+  const unknownAttest = parsed.value.attest.find((item) => !BASELINE_ATTEST.includes(item));
+  if (unknownAttest !== undefined) return fail("attest", `"${unknownAttest}" is not an attest value`);
   const [unknownKey] = parsed.value.other.keys();
   return unknownKey === undefined ? parsed : fail(unknownKey, "is not a fact a gateway may publish");
-}
-
-export function formatFacts(facts: Facts): string {
-  const out: string[] = [];
-  if (facts.zdr) out.push("zdr");
-  if (facts.notrain) out.push("notrain");
-  if (facts.bits !== null) out.push(`bits=${facts.bits}`);
-  if (facts.region !== null) out.push(listPair("region", facts.region));
-  if (facts.attest.length > 0) out.push(listPair("attest", facts.attest));
-  for (const key of [...facts.other.keys()].sort()) {
-    const value = facts.other.get(key)!;
-    out.push(value === true ? key : listPair(key, value));
-  }
-  return out.join("+");
 }
 
 /** Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. */
@@ -373,14 +363,16 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
 export const isProviderId = (id: string): boolean => ITEM.test(id);
 
 /**
- * The `Route-Applied` value for the route whose response is relayed (S14). Throws on a provider id that is not an
- * item: a gateway checks its ids when it loads them, so one that reaches here is a programming error, and writing
- * it would produce a header no reader accepts.
+ * The `Route-Applied` value for the route whose response is relayed (S14), from that route's published facts
+ * string. Throws on a provider id that is not an item or facts that may not be published: a gateway checks both
+ * when it loads its routes, so either reaching here is a programming error, and writing it would produce a header
+ * no reader accepts or one that claims what the route does not.
  */
-export function formatApplied(provider: string, facts: Facts): string {
+export function formatApplied(provider: string, publishedFacts: string): string {
   if (!isProviderId(provider)) throw new RangeError(`"${provider}" is not a provider id`);
-  const rest = formatFacts(facts);
-  return rest === "" ? `provider=${provider}` : `provider=${provider}+${rest}`;
+  const facts = parsePublishedFacts(publishedFacts);
+  if (!facts.ok) throw new RangeError(`"${publishedFacts}" may not be published as facts: ${facts.detail}`);
+  return publishedFacts === "" ? `provider=${provider}` : `provider=${provider}+${publishedFacts}`;
 }
 
 /** Reads `Route-Applied` (S14): the provider first, then facts read as `parseFacts` reads them, under their own limits. */
@@ -402,12 +394,13 @@ export type RefusalReason = "unsupported" | "unsatisfiable" | "unavailable";
 export const REFUSAL_STATUS: Readonly<Record<RefusalReason, number>> = Object.freeze({ unsupported: 400, unsatisfiable: 400, unavailable: 503 });
 
 /**
- * The `Route-Refused` value (S15). Only an `unsupported` refusal names a key. Throws on a key that is not one,
- * for the same reason `formatApplied` throws.
+ * The `Route-Refused` value (S15). Only an `unsupported` refusal names a key. Throws on a reason or key that is
+ * not one, for the same reason `formatApplied` throws; the check is at run time, so it holds for untyped callers.
  */
 export function formatRefused(reason: "unsupported", key?: string | null): string;
 export function formatRefused(reason: "unsatisfiable" | "unavailable"): string;
 export function formatRefused(reason: RefusalReason, key: string | null = null): string {
+  if (!Object.hasOwn(REFUSAL_STATUS, reason)) throw new RangeError(`"${reason}" is not a refusal reason`);
   if (key === null) return `reason=${reason}`;
   if (reason !== "unsupported" || !KEY.test(key)) throw new RangeError(`cannot name key "${key}" in a "${reason}" refusal`);
   return `reason=${reason}+key=${key}`;
@@ -483,8 +476,15 @@ export function parseDetection(body: unknown): Result<Detection> {
   };
 }
 
-/** The detection reply body a gateway with this `support` sends. */
+/**
+ * The detection reply body a gateway with this `support` sends. Throws on a bound policy the gateway would refuse:
+ * it may not bind one (G10), and a client would treat the whole reply as no detection.
+ */
 export function formatDetection(support: Support, keyPolicy: string | null = null): Record<string, unknown> {
+  if (keyPolicy !== null) {
+    const bound = parsePolicy(keyPolicy, support);
+    if (!bound.ok) throw new RangeError(`key policy "${keyPolicy}" fails the order of checks: ${bound.detail}`);
+  }
   return {
     route_policy: 1,
     keys: [...support.keys],
@@ -492,4 +492,36 @@ export function formatDetection(support: Support, keyPolicy: string | null = nul
     sort: [...support.sort],
     ...(keyPolicy === null ? {} : { key_policy: keyPolicy }),
   };
+}
+
+/**
+ * Whether a client may send a request carrying these policies, by either carrier, to a base URL whose detection
+ * reply gave `support` (null when it has no valid reply) (C1, C2). With any requirement among them, the reply must
+ * list every key and every `attest` and `sort` value that any of them uses, preferences included.
+ */
+export function clearedToSend(support: Support | null, policies: readonly Policy[]): boolean {
+  if (!policies.some(hasRequirements)) return true;
+  return support !== null && policies.every((policy) => supports(support, policy));
+}
+
+export type Outcome =
+  | { outcome: "refused"; reason: RefusalReason | null; key: string | null }
+  | { outcome: "honored"; provider: string; facts: Facts }
+  | { outcome: "not-honored"; why: string };
+
+/**
+ * What a response says about the policy a client sent with a requirement (C3, C4, C5). `applied` and `refused` are
+ * the values of every `Route-Applied` and `Route-Refused` field line, or one joined value each where that is all
+ * the client can see. Any `Route-Refused` is a refusal, parsed or not, whatever else is there. Otherwise the policy
+ * is honored only by exactly one `Route-Applied` that parses, has valid facts, and meets `sent`.
+ */
+export function readOutcome(applied: readonly string[], refused: readonly string[], sent: Policy): Outcome {
+  if (refused.length > 0) {
+    const parsed = refused.length === 1 ? parseRefused(refused[0]!) : null;
+    return parsed?.ok ? { outcome: "refused", ...parsed.value } : { outcome: "refused", reason: null, key: null };
+  }
+  if (applied.length !== 1) return { outcome: "not-honored", why: applied.length === 0 ? "no Route-Applied" : "more than one Route-Applied" };
+  const parsed = parseApplied(applied[0]!);
+  if (!parsed.ok) return { outcome: "not-honored", why: `Route-Applied is not valid: ${parsed.detail}` };
+  return meets(parsed.value, sent) ? { outcome: "honored", ...parsed.value } : { outcome: "not-honored", why: `route "${parsed.value.provider}" does not meet the policy sent` };
 }

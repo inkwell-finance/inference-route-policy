@@ -4,10 +4,10 @@ import { test } from "node:test";
 import { COUNTRIES } from "../src/countries.ts";
 import {
   baselineSupport,
+  clearedToSend,
   combinePolicies,
   formatApplied,
   formatDetection,
-  formatFacts,
   formatPolicy,
   formatRefused,
   hasRequirements,
@@ -20,6 +20,7 @@ import {
   parsePolicy,
   parsePublishedFacts,
   parseRefused,
+  readOutcome,
   splitModel,
   supports,
   type Facts,
@@ -219,6 +220,10 @@ test("C10: a policy that cannot be written as a valid one fails to format instea
     ["undefined attest", { ...policy("zdr"), attest: ["custom"] }, "attest"],
     ["unassigned region", { ...policy("zdr"), region: ["ab"] }, "region"],
     ["malformed provider id", { ...policy("zdr"), only: ["Org/Provider"] }, "only"],
+    // These fit the grammar once joined, and would read back as a different, weaker policy.
+    ["comma inside an item", { ...policy("zdr"), only: ["a,b"] }, null],
+    ["plus inside an item", { ...policy("notrain"), region: ["us+zdr"] }, null],
+    ["a second sort", { ...policy("zdr"), sort: "price+order=a" }, null],
   ];
   for (const [name, value, key] of cases) {
     const formatted = formatPolicy(value);
@@ -305,6 +310,11 @@ test("combining: the most specific preference wins, per key", () => {
   const keyOnly = combinePolicies({ key: policy("sort=price+order=a") });
   assert.equal(keyOnly.sort, "price");
   assert.deepEqual(keyOnly.order, ["a"]);
+
+  // A suffix that states an order beats the header's and the key's.
+  const suffixOrder = combinePolicies({ key: policy("order=a"), header: policy("order=b"), suffix: policy("order=c,d") });
+  assert.deepEqual(suffixOrder.order, ["c", "d"]);
+  assert.equal(combinePolicies({ key: policy("sort=price"), suffix: policy("sort=latency") }).sort, "latency");
 });
 
 test("G13: no layer removes or weakens a requirement of another", () => {
@@ -356,17 +366,14 @@ test("S13: a reader ignores unknown fact keys and unknown attest items, and they
   assert.equal(facts("").other.get("constructor"), undefined);
   assert.equal(facts("").other.has("valueof"), false);
   assert.deepEqual(facts("constructor=x").other.get("constructor"), ["x"]);
-
-  const text = "zdr+notrain+bits=8+region=us,de+attest=weights,prompt+later=1";
-  assert.equal(formatFacts(facts(text)), text);
 });
 
 test("S13: facts are invalid when malformed, when a known key has an invalid value, or when they carry a key that is never a fact", () => {
   for (const text of ["only=x", "ignore=x", "ignore", "sort", "sort=price", "order=x", "provider=a", "provider", "zdr+order=x", "zdr+provider=a"]) assert.equal(parseFacts(text).ok, false, text);
-  for (const text of ["zdr=1", "notrain=x", "bits=0", "bits", "bits=8,16", "region=usa", "region=ab", "region", "attest", "zdr+zdr", "+", "zdr+", "Zdr", "attest=Weights"]) assert.equal(parseFacts(text).ok, false, text);
+  for (const text of ["zdr=1", "notrain=x", "bits=0", "bits", "bits=8,16", "region=usa", "region=ab", "region", "attest", "zdr+attest", "zdr+zdr", "+", "zdr+", "Zdr", "attest=Weights"]) assert.equal(parseFacts(text).ok, false, text);
 });
 
-test("S12: a gateway may publish only the five fact keys, with values it accepts", () => {
+test("S12: a gateway may publish only the five fact keys with defined values, whatever it accepts in requests", () => {
   assert.equal(parsePublishedFacts("").ok, true);
   assert.equal(parsePublishedFacts("zdr+notrain+bits=8+region=us+attest=weights,prompt").ok, true);
   const cases: [facts: string, key: string][] = [
@@ -384,10 +391,6 @@ test("S12: a gateway may publish only the five fact keys, with values it accepts
     assert.ok(!parsed.ok, text);
     assert.equal(parsed.key, key, text);
   }
-  const narrow: Support = { ...baselineSupport(), attest: new Set(["weights"]) };
-  assert.equal(parsePublishedFacts("attest=weights", narrow).ok, true);
-  assert.equal(parsePublishedFacts("attest=prompt", narrow).ok, false);
-  assert.equal(parsePublishedFacts("attest=weights,prompt", narrow).ok, false);
 });
 
 test("G6: each requirement is checked against the route's facts, and an absent fact is not met", () => {
@@ -409,10 +412,13 @@ test("G6: each requirement is checked against the route's facts, and an absent f
     ["attest=prompt,weights", "a", "attest=weights", false],
     ["attest=prompt", "a", "", false],
     ["only=a,b", "a", "", true],
+    ["only=a,b", "b", "", true],
     ["only=a,b", "c", "zdr", false],
     ["only=nosuch", "a", "", false],
     ["ignore=a", "a", "zdr", false],
     ["ignore=a", "b", "", true],
+    ["ignore=a,b", "b", "", false],
+    ["ignore=a,b,c", "c", "zdr", false],
     ["ignore=nosuch", "a", "", true],
     ["sort=price+order=z", "a", "", true],
     ["zdr+bits=8+region=us+only=a", "a", "zdr+bits=8+region=us", true],
@@ -424,23 +430,25 @@ test("G6: each requirement is checked against the route's facts, and an absent f
 });
 
 test("G7: order first as listed, then the rest by the rank of the requested sort, and unknown ids have no effect", () => {
-  // Price and throughput rank these routes in opposite directions, so using the wrong one shows.
+  // Each sort ranks these routes differently from the other two, so using the wrong one shows.
   const routes = [
-    { provider: "a", price: 3, throughput: 30 },
-    { provider: "b", price: 1, throughput: 10 },
-    { provider: "c", price: 2, throughput: 20 },
-    { provider: "d", price: 2, throughput: 20 },
+    { provider: "a", price: 3, latency: 2, throughput: 30 },
+    { provider: "b", price: 1, latency: 3, throughput: 10 },
+    { provider: "c", price: 2, latency: 1, throughput: 20 },
+    { provider: "d", price: 2, latency: 4, throughput: 20 },
   ];
-  const rank = (route: (typeof routes)[number], sort: string): number => (sort === "price" ? route.price : -route.throughput);
+  const rank = (route: (typeof routes)[number], sort: string): number => (sort === "price" ? route.price : sort === "latency" ? route.latency : -route.throughput);
   const ids = (p: string): string =>
     orderRoutes(routes, policy(p), rank)
       .map((route) => route.provider)
       .join("");
   assert.equal(ids("sort=price"), "bcda");
+  assert.equal(ids("sort=latency"), "cabd");
   assert.equal(ids("sort=throughput"), "acdb");
   assert.equal(ids("order=d,a"), "dabc");
   // The remainder (a, b, c) is not already in rank order, so it must be ranked after the ordered one.
   assert.equal(ids("order=d+sort=price"), "dbca");
+  assert.equal(ids("order=d+sort=latency"), "dcab");
   assert.equal(ids("order=d+sort=throughput"), "dacb");
   assert.equal(ids("order=c,nosuch+sort=price"), "cbda");
   assert.equal(ids("order=nosuch"), "abcd");
@@ -448,47 +456,62 @@ test("G7: order first as listed, then the rest by the rank of the requested sort
   assert.equal(routes.map((route) => route.provider).join(""), "abcd");
 });
 
-test("S14: Route-Applied names the provider first, then the facts, whose limits are their own", () => {
-  assert.equal(formatApplied("aurora", facts("")), "provider=aurora");
-  assert.equal(formatApplied("aurora", facts("zdr+bits=8+region=us")), "provider=aurora+zdr+bits=8+region=us");
+test("S14: Route-Applied is the provider, then the route's published facts exactly as published", () => {
+  assert.equal(formatApplied("aurora", ""), "provider=aurora");
+  const published = "zdr+notrain+bits=8+region=us,de+attest=weights,prompt";
+  assert.equal(formatApplied("aurora", published), `provider=aurora+${published}`);
 
   const bare = parseApplied("provider=aurora");
   assert.ok(bare.ok);
   assert.deepEqual(bare.value, { provider: "aurora", facts: facts("") });
 
-  const parsed = parseApplied("provider=aurora+zdr+bits=8+region=us+later=1");
-  assert.ok(parsed.ok);
-  assert.equal(parsed.value.provider, "aurora");
-  assert.deepEqual(parsed.value.facts, { zdr: true, notrain: false, bits: 8, region: ["us"], attest: [], other: new Map<string, Value>([["later", ["1"]]]) });
+  // Every published fact survives the header.
+  const full = parseApplied(formatApplied("aurora", published));
+  assert.ok(full.ok);
+  assert.deepEqual(full.value, { provider: "aurora", facts: facts(published) });
+  for (const requirement of ["zdr", "notrain", "bits=8", "region=us,de", "attest=weights,prompt"]) assert.equal(meets(full.value, policy(requirement)), true, requirement);
 
-  for (const text of ["", "zdr", "zdr+provider=a", "xrovider=a", "provide=aurora", "provider", "provider=", "provider=a,b", "provider=A", "provider=org/a", "provider=a+", "provider=a+provider=b", "provider=a+bits=0", "provider=a+order=b", "provider=a+only=b"]) {
+  // A reader accepts keys from a later revision behind the provider, and keeps them apart.
+  const later = parseApplied("provider=aurora+zdr+bits=8+region=us+later=1");
+  assert.ok(later.ok);
+  assert.deepEqual(later.value.facts, { zdr: true, notrain: false, bits: 8, region: ["us"], attest: [], other: new Map<string, Value>([["later", ["1"]]]) });
+
+  for (const text of ["", "zdr", "zdr+provider=a", "xrovider=a", "provide=aurora", "provider", "provider=", "provider=a,b", "provider=A", "provider=org/a", "provider=a+", "provider=a+provider=b", "provider=a+bits=0", "provider=a+order=b", "provider=a+only=b", "provider=a+attest"]) {
     assert.equal(parseApplied(text).ok, false, text);
   }
 
-  // Sixteen fact pairs and a 512-byte facts string are legal facts, so they round-trip behind the provider.
-  const sixteen = facts(Array.from({ length: 16 }, (_, i) => `k${i}`).join("+"));
-  const many = parseApplied(formatApplied("aurora", sixteen));
-  assert.ok(many.ok);
-  assert.equal(many.value.facts.other.size, 16);
-  const long = facts(`newkey=${Array.from({ length: 15 }, (_, i) => String.fromCharCode(97 + i).repeat(32)).join(",")},${"p".repeat(10)}`);
-  assert.equal(formatFacts(long).length, 512);
-  const wide = parseApplied(formatApplied("aurora", long));
-  assert.ok(wide.ok);
-  assert.equal(formatFacts(wide.value.facts).length, 512);
+  // Sixteen fact pairs and a 512-byte facts string are legal facts to read, so the limits are not the header's.
+  const sixteen = parseApplied(`provider=aurora+${Array.from({ length: 16 }, (_, i) => `k${i}`).join("+")}`);
+  assert.ok(sixteen.ok);
+  assert.equal(sixteen.value.facts.other.size, 16);
+  assert.equal(parseApplied(`provider=aurora+${Array.from({ length: 17 }, (_, i) => `k${i}`).join("+")}`).ok, false);
+  const long = `newkey=${Array.from({ length: 15 }, (_, i) => String.fromCharCode(97 + i).repeat(32)).join(",")},${"p".repeat(10)}`;
+  assert.equal(long.length, 512);
+  assert.equal(parseApplied(`provider=aurora+${long}`).ok, true);
+  assert.equal(parseApplied(`provider=aurora+${long}p`).ok, false);
 });
 
-test("S14, S15, S17: the writers refuse to write what a reader would refuse to read", () => {
+test("S14, S15, S17: the writers refuse to write what a reader would refuse or what a route may not claim", () => {
   for (const id of ["aurora", "a", "0", "data-east", "a.b_c", "constructor"]) {
     assert.equal(isProviderId(id), true, id);
-    const read = parseApplied(formatApplied(id, facts("zdr")));
+    const read = parseApplied(formatApplied(id, "zdr"));
     assert.ok(read.ok, id);
     assert.equal(read.value.provider, id);
   }
   for (const id of ["", "org/provider", "Data-East", "a b", "-a", "a".repeat(33)]) {
     assert.equal(isProviderId(id), false, id);
-    assert.throws(() => formatApplied(id, facts("")), RangeError, id);
+    assert.throws(() => formatApplied(id, ""), RangeError, id);
+  }
+  // Facts that are not publishable never reach the header, including ones that would smuggle in a claim.
+  for (const published of ["bits=0", "region=us+zdr+zdr", "later", "region=ab", "attest=custom", "only=a", "provider=b", "zdr+", "Zdr"]) {
+    assert.throws(() => formatApplied("aurora", published), RangeError, published);
   }
   for (const key of ["bad key", "Bad", "", "a.b", "k".repeat(17)]) assert.throws(() => formatRefused("unsupported", key), RangeError, key);
+  // The runtime check holds for callers the type checker does not see.
+  const untyped = formatRefused as (reason: string, key?: string) => string;
+  assert.throws(() => untyped("other"), RangeError);
+  assert.throws(() => untyped("constructor"), RangeError);
+  assert.throws(() => untyped("unavailable", "bits"), RangeError);
 });
 
 test("S15: Route-Refused is a reason, then a key only with unsupported, and nothing else", () => {
@@ -516,6 +539,7 @@ test("S15: Route-Refused is a reason, then a key only with unsupported, and noth
     "reason=unsatisfiable+key=bits",
     "reason=unavailable+key=bits",
     " reason=unsupported",
+    "reason=unsupported, reason=unsupported",
   ]) {
     assert.equal(parseRefused(text).ok, false, text);
   }
@@ -531,7 +555,23 @@ test("C6: a detection reply without lists means the baseline, and unknown member
   assert.equal(supports(minimal.value.support, policy("attest=weights,prompt+sort=throughput")), true);
 });
 
-test("C6: keys and values this revision does not define are dropped from what the client may use, and the reply stays valid", () => {
+test("C6: a reply that lists nothing grants nothing, unlike one that omits the lists", () => {
+  const none = parseDetection({ route_policy: 1, keys: [], attest: [], sort: [] });
+  assert.ok(none.ok);
+  assert.equal(none.value.support.keys.size, 0);
+  assert.equal(none.value.support.attest.size, 0);
+  assert.equal(none.value.support.sort.size, 0);
+  assert.equal(supports(none.value.support, policy("zdr")), false);
+  assert.equal(parsePolicy("zdr", none.value.support).ok, false);
+
+  const noValues = parseDetection({ route_policy: 1, attest: [], sort: [] });
+  assert.ok(noValues.ok);
+  assert.equal(noValues.value.support.keys.size, 9);
+  assert.equal(supports(noValues.value.support, policy("attest=weights")), false);
+  assert.equal(supports(noValues.value.support, policy("sort=price")), false);
+});
+
+test("C6, C12: keys and values this revision does not define are dropped from what the client may use, and the reply stays valid", () => {
   const newer = parseDetection({ route_policy: 1, keys: ["zdr", "later", "sort", "attest"], attest: ["weights", "later"], sort: ["price", "later"], key_policy: "zdr+later=x+sort=later+attest=later" });
   assert.ok(newer.ok);
   assert.deepEqual([...newer.value.support.keys], ["zdr", "attest", "sort"]);
@@ -539,7 +579,7 @@ test("C6: keys and values this revision does not define are dropped from what th
   assert.deepEqual([...newer.value.support.sort], ["price"]);
   assert.equal(supports(newer.value.support, policy("zdr")), true);
   assert.equal(supports(newer.value.support, policy("notrain")), false);
-  // The bound policy is kept as sent. This client cannot interpret it, and can tell that it cannot.
+  // The bound policy is kept as sent, to be shown. This client cannot interpret it, and can tell that it cannot.
   assert.equal(newer.value.keyPolicy, "zdr+later=x+sort=later+attest=later");
   assert.equal(parsePolicy(newer.value.keyPolicy, newer.value.support).ok, false);
 });
@@ -582,7 +622,7 @@ test("C6: a reply with any known member invalid is no detection", () => {
   for (const body of bodies) assert.equal(parseDetection(body).ok, false, JSON.stringify(body));
 });
 
-test("G20 to G22: what a gateway formats is what a client reads back, lists and key policy included", () => {
+test("G20 to G22: what a gateway formats is what a client reads back, and it cannot format a key policy it would refuse", () => {
   const support: Support = { keys: new Set(["zdr", "sort", "attest"]), attest: new Set(["prompt"]), sort: new Set(["latency", "price"]) };
   const body: unknown = JSON.parse(JSON.stringify(formatDetection(support, "zdr+sort=latency")));
   assert.deepEqual(body, { route_policy: 1, keys: ["zdr", "sort", "attest"], attest: ["prompt"], sort: ["latency", "price"], key_policy: "zdr+sort=latency" });
@@ -593,6 +633,70 @@ test("G20 to G22: what a gateway formats is what a client reads back, lists and 
   assert.deepEqual([...parsed.value.support.sort].sort(), ["latency", "price"]);
   assert.equal(parsed.value.keyPolicy, "zdr+sort=latency");
   assert.equal(Object.hasOwn(formatDetection(support), "key_policy"), false);
+
+  for (const bound of ["bits=0", "", "notrain", "sort=throughput", "attest=weights", "zdr+zdr", "later"]) {
+    assert.throws(() => formatDetection(support, bound), RangeError, bound);
+  }
+  // Whatever it does format, the client accepts.
+  for (const bound of ["zdr", "attest=prompt", "sort=price+zdr"]) {
+    const reply: unknown = JSON.parse(JSON.stringify(formatDetection(support, bound)));
+    assert.equal(parseDetection(reply).ok, true, bound);
+  }
+});
+
+test("C1, C2: a request is cleared only when detection covers every policy on it, preferences included", () => {
+  const support: Support = { keys: new Set(["zdr", "sort", "only"]), attest: new Set(), sort: new Set(["price"]) };
+  const p = (text: string): Policy => policy(text);
+  // Preferences alone need no detection, supported or not.
+  assert.equal(clearedToSend(null, []), true);
+  assert.equal(clearedToSend(null, [p("sort=latency")]), true);
+  assert.equal(clearedToSend(null, [p("sort=latency"), p("order=a")]), true);
+  assert.equal(clearedToSend(support, [p("sort=latency")]), true);
+  // A requirement needs a reply, and the reply must cover it.
+  assert.equal(clearedToSend(null, [p("zdr")]), false);
+  assert.equal(clearedToSend(support, [p("zdr")]), true);
+  assert.equal(clearedToSend(support, [p("notrain")]), false);
+  assert.equal(clearedToSend(support, [p("zdr+sort=price")]), true);
+  assert.equal(clearedToSend(support, [p("zdr+sort=latency")]), false);
+  // On two carriers the check is on both together: a supported requirement beside an unsupported preference blocks.
+  assert.equal(clearedToSend(support, [p("zdr"), p("sort=latency")]), false);
+  assert.equal(clearedToSend(support, [p("sort=latency"), p("zdr")]), false);
+  assert.equal(clearedToSend(support, [p("zdr"), p("order=a")]), false);
+  assert.equal(clearedToSend(support, [p("zdr"), p("sort=price")]), true);
+  assert.equal(clearedToSend(support, [p("sort=price"), p("only=a")]), true);
+  assert.equal(clearedToSend(null, [p("sort=price"), p("only=a")]), false);
+});
+
+test("C3, C4, C5: a response is a refusal, honored, or not honored, and only one valid matching Route-Applied honors", () => {
+  const sent = policy("zdr+region=us");
+  assert.deepEqual(readOutcome(["provider=aurora+zdr+region=us"], [], sent), { outcome: "honored", provider: "aurora", facts: facts("zdr+region=us") });
+
+  const notHonored: [applied: string[], name: string][] = [
+    [[], "none"],
+    [["provider=aurora+zdr+region=us", "provider=basalt"], "two lines"],
+    [["provider=aurora+zdr+region=us", "provider=aurora+zdr+region=us"], "two identical lines"],
+    [["provider=aurora+zdr+region=us, provider=basalt"], "two lines joined"],
+    [["provider=aurora"], "meets nothing"],
+    [["provider=aurora+zdr"], "one requirement missing"],
+    [["provider=aurora+zdr+region=us,de"], "wider region"],
+    [["provider=aurora+zdr+region=us+bits=0"], "invalid facts"],
+    [["zdr+region=us"], "no provider"],
+    [[""], "empty"],
+  ];
+  for (const [applied, name] of notHonored) assert.equal(readOutcome(applied, [], sent).outcome, "not-honored", name);
+
+  // The provider-id requirements are checked too.
+  assert.equal(readOutcome(["provider=aurora"], [], policy("only=aurora")).outcome, "honored");
+  assert.equal(readOutcome(["provider=basalt"], [], policy("only=aurora")).outcome, "not-honored");
+  assert.equal(readOutcome(["provider=aurora+zdr"], [], policy("zdr+ignore=aurora")).outcome, "not-honored");
+
+  // Any Route-Refused is a refusal: parsed, unparsed, repeated, or beside a Route-Applied that would otherwise honor.
+  assert.deepEqual(readOutcome([], ["reason=unsupported+key=bits"], sent), { outcome: "refused", reason: "unsupported", key: "bits" });
+  assert.deepEqual(readOutcome([], ["reason=unavailable"], sent), { outcome: "refused", reason: "unavailable", key: null });
+  assert.deepEqual(readOutcome([], ["garbage"], sent), { outcome: "refused", reason: null, key: null });
+  assert.deepEqual(readOutcome([], ["reason=unsupported", "reason=unavailable"], sent), { outcome: "refused", reason: null, key: null });
+  assert.deepEqual(readOutcome(["provider=aurora+zdr+region=us"], ["reason=unsatisfiable"], sent), { outcome: "refused", reason: "unsatisfiable", key: null });
+  assert.deepEqual(readOutcome(["provider=aurora+zdr+region=us"], [""], sent), { outcome: "refused", reason: null, key: null });
 });
 
 test("the baseline cannot be changed by a caller", () => {
