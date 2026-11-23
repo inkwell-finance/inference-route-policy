@@ -138,6 +138,21 @@ test("C14: pi: a request prepared before another came back not honored is not re
   assert.equal(gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length, 1);
 });
 
+test("C14: pi: preparations are taken in the order they were made: a stale one ahead of a fresh one blocks the first payload, and the fresh one serves the next", async () => {
+  const harness = await pi("zdr");
+  const headers = async (): Promise<unknown> => harness.emit("before_provider_headers", { type: "before_provider_headers", headers: {} });
+  const payload = async (): Promise<unknown> => harness.emit("before_provider_request", { type: "before_provider_request", payload: { model: "demo-model", messages: [] } }, "payload");
+  // Prepared on the first detection reply, then left waiting while a request comes back not honored.
+  await headers();
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  await harness.request();
+  // Prepared again, on a fresh reply: the queue is now [stale, fresh].
+  await headers();
+  const stale = await payload();
+  assert.throws(() => JSON.stringify(stale), /discarded since; it is not sent/);
+  assert.deepEqual(JSON.parse(JSON.stringify(await payload())), { model: "demo-model", messages: [] }, "the fresh preparation is released");
+});
+
 test("C14: pi: requests for one model prepared with different keys at once block the next payload", async () => {
   const harness = await pi("zdr");
   await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: { authorization: "Bearer demo-key" } });

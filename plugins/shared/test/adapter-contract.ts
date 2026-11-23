@@ -104,17 +104,21 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().inference().length, 0);
   });
 
-  test(`C5, C14: ${name}: with two sessions in one process, each response goes to the session that sent the request`, async () => {
+  test(`C5, C14: ${name}: with two sessions in one process and requests in flight together, each response goes to the session that sent the request`, async () => {
     const first = await make("zdr");
-    const second = await make("zdr");
-    gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
-    await second.request();
-    assert.match(notices(second).at(-1) ?? "", /refused by the gateway: unsatisfiable/);
-    assert.ok(!notices(first).some((text) => text.includes("refused")), "the other session hears nothing of it");
-    gateway().replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
-    await first.request();
-    assert.match(notices(first).at(-1) ?? "", /NOT honored/);
-    assert.ok(!notices(second).some((text) => text.includes("NOT honored")));
+    const second = await make("notrain");
+    // The first session's request leaves first and comes back last, not honored; the second's is refused at once.
+    gateway().replies.inference = (request) =>
+      (request.headers["route-policy"] ?? request.body).includes("notrain")
+        ? { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {}, delayMs: 20 }
+        : { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 200 };
+    const firstSent = first.request();
+    for (let i = 0; i < 400 && gateway().inference().length === 0; i++) await new Promise((wake) => setTimeout(wake, 5));
+    assert.equal(gateway().inference().length, 1, "the first request reached the gateway before the second left");
+    await Promise.all([firstSent, second.request()]);
+    const results = (harness: FakeHarness): string[] => notices(harness).filter((text) => /refused|honored/i.test(text));
+    assert.deepEqual(results(first).map((text) => text.replace(/:.*/, "")), ["route policy NOT honored"], "the first session hears only its own not-honored result");
+    assert.deepEqual(results(second), ["route policy refused by the gateway: unsatisfiable"], "the second session hears only its own refusal");
   });
 
   test(`C10: ${name}: a payload whose own toJSON names another model, or none, is blocked: what is checked is what would be sent`, async () => {

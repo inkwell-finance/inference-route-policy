@@ -112,26 +112,32 @@ function unlisted(support: Support, policies: readonly Policy[]): string[] {
   return [...missing];
 }
 
-function parsed(text: string): Policy {
-  const result = parsePolicy(text);
-  // Every string reaching here was parsed or written by the core already; failing here is a programming error.
-  if (!result.ok) throw new Error(`"${text}" stopped parsing: ${result.detail}`);
-  return result.value;
+/** The two carriers of a request, each parsed once: the suffix of the `model` it sends, and its `Route-Policy` header. */
+interface Carried {
+  onHeader: Policy | null;
+  onSuffix: Policy | null;
 }
 
-/**
- * The policy a request carries on the wire: the suffix of the `model` it sends (null when it sends none) and its
- * `Route-Policy` header, combined as a gateway combines them, the suffix the more specific. Null when it carries
- * none. A carrier that does not parse is reported, not dropped.
- */
-export function carriedPolicy(model: string | null, header: string | null): Read<Policy | null> {
+/** Parses a request's carriers; one that does not parse is reported, not dropped. */
+function readCarriers(model: string | null, header: string | null): Read<Carried> {
   const suffix = model === null ? null : splitModel(model).policy;
   const onSuffix = suffix === null ? null : parsePolicy(suffix);
   const onHeader = header === null ? null : parsePolicy(header);
   if (onSuffix !== null && !onSuffix.ok) return { ok: false, reason: `the model suffix "${suffix}" is not a valid policy` };
   if (onHeader !== null && !onHeader.ok) return { ok: false, reason: `the Route-Policy header "${header}" is not a valid policy` };
-  if (onSuffix === null && onHeader === null) return { ok: true, value: null };
-  return { ok: true, value: layered(null, onHeader?.value ?? null, onSuffix?.value ?? null) };
+  return { ok: true, value: { onHeader: onHeader?.value ?? null, onSuffix: onSuffix?.value ?? null } };
+}
+
+/** The carriers combined as a gateway combines them, the suffix the more specific; null when there are none. */
+const combined = ({ onHeader, onSuffix }: Carried): Policy | null => (onHeader === null && onSuffix === null ? null : layered(null, onHeader, onSuffix));
+
+/**
+ * The policy a request carries on the wire, null when none: what the release check reads off the serialized
+ * request, to compare with what the decision counted.
+ */
+export function carriedPolicy(model: string | null, header: string | null): Read<Policy | null> {
+  const carriers = readCarriers(model, header);
+  return carriers.ok ? { ok: true, value: combined(carriers.value) } : carriers;
 }
 
 /** The decision for one request. `carriers` says whether the harness lets the plugin set a header. */
@@ -162,10 +168,11 @@ export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState
     wireModel = `${splitModel(model).id}+${written.value}`;
   }
 
-  // From here the request is judged as it will go on the wire.
-  const onHeader = header === null ? null : parsed(header);
-  const suffix = splitModel(wireModel).policy;
-  const onSuffix = suffix === null ? null : parsed(suffix);
+  // From here the request is judged as it will go on the wire: each carrier parsed once, for the support check
+  // and for what is sent.
+  const onWire = readCarriers(wireModel, header);
+  if (!onWire.ok) return block(onWire.reason);
+  const { onHeader, onSuffix } = onWire.value;
   const carried = [onHeader, onSuffix].filter((p) => p !== null);
   const support = gateway.detection?.support ?? null;
   if (!clearedToSend(support, carried)) {
@@ -176,10 +183,8 @@ export function decide(layers: Layers, carriers: Carriers, gateway: GatewayState
     );
   }
 
-  // What the request carries, read the one way the release check reads it again on the serialized request.
-  const onWire = carriedPolicy(wireModel, header);
-  if (!onWire.ok) return block(onWire.reason);
-  const sent = onWire.value;
+  // Combined the one way the release check combines the serialized request's carriers.
+  const sent = combined(onWire.value);
   const routes = gateway.modelList === null ? null : publishedRoutes(gateway.modelList.list, wireModel);
   if (routes !== null) {
     // C16. The key's bound policy counts only when this client can interpret it (C12), and it counts whatever

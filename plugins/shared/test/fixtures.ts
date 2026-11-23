@@ -47,6 +47,8 @@ export interface Reply {
   status: number;
   headers?: Record<string, string | string[]>;
   body?: unknown;
+  /** Text sent as the body instead of `body` as JSON, for a reply that is not JSON. */
+  raw?: string;
   /** Milliseconds to wait before answering. */
   delayMs?: number;
 }
@@ -56,7 +58,8 @@ export interface FakeGatewayReplies {
   detection: Reply;
   /** One reply for every caller, or one chosen by the request's headers and path (its query included). */
   models: Reply | ((headers: IncomingHttpHeaders, path: string) => Reply);
-  inference: Reply;
+  /** One reply for every request, or one chosen by the request, so overlapping requests can be told apart. */
+  inference: Reply | ((request: Recorded) => Reply);
 }
 
 export interface FakeGateway {
@@ -81,10 +84,16 @@ export async function fakeGateway(): Promise<FakeGateway> {
     const path = request.url ?? "";
     requests.push({ method: request.method ?? "", path, headers: request.headers, body });
     const models = replies.models;
-    const reply = path.includes("/route-policy") ? replies.detection : path.includes("/models") ? (typeof models === "function" ? models(request.headers, path) : models) : replies.inference;
+    const inference = replies.inference;
+    const recorded = requests[requests.length - 1];
+    const reply = path.includes("/route-policy")
+      ? replies.detection
+      : path.includes("/models")
+        ? typeof models === "function" ? models(request.headers, path) : models
+        : typeof inference === "function" && recorded !== undefined ? inference(recorded) : typeof inference === "function" ? { status: 500 } : inference;
     if (reply.delayMs !== undefined) await new Promise((wake) => setTimeout(wake, reply.delayMs));
     response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
-    response.end(reply.body === undefined ? "" : JSON.stringify(reply.body));
+    response.end(reply.raw ?? (reply.body === undefined ? "" : JSON.stringify(reply.body)));
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");

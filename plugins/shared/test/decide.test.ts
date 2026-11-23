@@ -58,11 +58,22 @@ test("C1: the reply must list every key and every attest and sort value of every
     detection({ route_policy: "1", keys, attest, sort });
   const all = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"];
   const lacking = (key: string) => without(all.filter((k) => k !== key));
-  // The held policy on the header and the typed one on the suffix are both checked.
-  blockedFor(decideFor({ held: held("zdr"), model: "demo-model+bits=8", detection: lacking("bits") }), /does not list bits in its detection reply/);
-  blockedFor(decideFor({ held: held("zdr+order=aurora"), detection: lacking("order") }), /does not list order in its detection reply/);
-  blockedFor(decideFor({ held: held("zdr"), model: "demo-model+sort=price", detection: without(all, ["weights", "prompt"], ["latency"]) }), /does not list sort=price/);
-  blockedFor(decideFor({ held: held("attest=prompt"), detection: without(all, ["weights"]) }), /does not list attest=prompt/);
+  const uses: Record<string, string> = { zdr: "zdr", notrain: "notrain", bits: "bits=8", region: "region=us", attest: "attest=weights", only: "only=aurora", ignore: "ignore=cobalt", sort: "sort=price", order: "order=aurora" };
+  // Every key, on each carrier: the held policy on the header, the typed one on the suffix. Each block names its
+  // key. A requirement goes with each (zdr, or notrain beside zdr itself): preferences alone need no detection (C2).
+  const withRequirement = (key: string): string => (key === "zdr" ? "zdr+notrain" : `zdr+${uses[key] ?? ""}`);
+  for (const key of all) {
+    const missing = new RegExp(`does not list ${key} in its detection reply`);
+    blockedFor(decideFor({ held: held(withRequirement(key)), detection: lacking(key) }), missing);
+    blockedFor(decideFor({ model: `demo-model+${withRequirement(key)}`, detection: lacking(key) }), missing);
+  }
+  // Every attest value and every sort value, each the only one missing.
+  for (const item of ["weights", "prompt"]) {
+    blockedFor(decideFor({ held: held(`attest=${item}`), detection: without(all, ["weights", "prompt"].filter((a) => a !== item)) }), new RegExp(`does not list attest=${item} in`));
+  }
+  for (const order of ["price", "latency", "throughput"]) {
+    blockedFor(decideFor({ held: held("zdr"), model: `demo-model+sort=${order}`, detection: without(all, undefined, ["price", "latency", "throughput"].filter((s) => s !== order)) }), new RegExp(`does not list sort=${order} in`));
+  }
   sent(decideFor({ held: held("zdr+attest=prompt+sort=latency+order=aurora"), model: "demo-model+bits=8" }));
 });
 
@@ -170,9 +181,17 @@ test("C9: a gateway at the OpenRouter base that answers detection is spoken to i
   sent(decideFor({ base: `${OPENROUTER_BASE}/`, held: held("zdr") }));
 });
 
-test("C1: a request no policy reaches is sent as it is, whatever detection says", () => {
-  const decision = sent(decideFor({ detection: null }));
-  assert.deepEqual([decision.model, decision.header, decision.sent], ["demo-model", null, null]);
+test("C1: a request no policy reaches is sent as it is, whatever detection says: none, a full reply, an empty one, or one with a key policy", () => {
+  const replies: [string, Detection | null][] = [
+    ["none", null],
+    ["full", detection({ route_policy: "1" })],
+    ["empty", detection({ route_policy: "1", keys: [] })],
+    ["key policy", detection({ route_policy: "1", key_policy: "zdr" })],
+  ];
+  for (const [name, reply] of replies) {
+    const decision = sent(decideFor({ detection: reply }));
+    assert.deepEqual([decision.model, decision.header, decision.sent], ["demo-model", null, null], name);
+  }
   // To OpenRouter too: with nothing to translate, nothing is rewritten.
   assert.deepEqual(sent(decideFor({ base: OPENROUTER_BASE, detection: null, model: "vendor/model" })).model, "vendor/model");
 });

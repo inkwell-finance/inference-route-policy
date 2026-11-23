@@ -57,6 +57,10 @@ test("C5: any Route-Refused is a refusal, whatever else the response carries and
   // Also on a request the client sent no policy with: a key's own policy can be refused too.
   assert.deepEqual(interpret(headers([], ["reason=unsatisfiable"]), { kind: "protocol", policy: null, routes: null }), { kind: "refused", reason: "unsatisfiable", key: null });
   assert.deepEqual(interpret(headers([], ["reason=unavailable", "reason=unavailable"]), { kind: "translated" }), { kind: "refused", reason: null, key: null });
+  // With a valid Route-Applied and Route-Evidence beside it, on a policy they would have honored.
+  assert.deepEqual(interpret(headers(["provider=basalt"], ["reason=unavailable"], [EVIDENCE]), protocol("attest=weights")), { kind: "refused", reason: "unavailable", key: null });
+  // An empty value is still a Route-Refused line.
+  assert.deepEqual(interpret(headers(["provider=aurora"], [""]), protocol("zdr")), { kind: "refused", reason: null, key: null });
 });
 
 test("C8: a translated request's success is unconfirmed, never applied: with no route headers, or with a misleading Route-Applied", () => {
@@ -79,9 +83,12 @@ test("C11: a refusal is shown with its reason and its key", () => {
 });
 
 test("C7: an honored result never presents a fact or evidence as verified", () => {
+  // Every combination: compared with a list or not, with evidence or without.
   const reports: Report[] = [
     { kind: "honored", provider: "basalt", checked: true, evidence: EVIDENCE },
     { kind: "honored", provider: "aurora", checked: false, evidence: null },
+    { kind: "honored", provider: "aurora", checked: true, evidence: null },
+    { kind: "honored", provider: "basalt", checked: false, evidence: EVIDENCE },
   ];
   for (const report of reports) {
     const text = describeReport(report);
@@ -90,6 +97,8 @@ test("C7: an honored result never presents a fact or evidence as verified", () =
   }
   assert.match(describeReport(reports[0]!), /evidence at https:\/\/basalt\.example\/attestation, not verified by this client/);
   assert.match(describeReport(reports[1]!), /not compared: no model list was held/);
+  assert.doesNotMatch(describeReport(reports[2]!), /evidence|not compared/);
+  assert.match(describeReport(reports[3]!), /evidence at https:\/\/basalt\.example\/attestation, not verified by this client.*not compared: no model list was held|not compared: no model list was held.*evidence at https:\/\/basalt\.example\/attestation, not verified by this client/);
 });
 
 test("C3: a policy that was not honored is shown, never reported as applied", () => {

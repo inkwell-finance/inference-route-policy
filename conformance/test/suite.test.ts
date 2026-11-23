@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createServer, request as relayRequest } from "node:http";
+import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
-import { formatApplied, formatRefused, splitModel } from "../../core/src/index.ts";
+import { formatApplied, formatRefused, REFUSAL_STATUS, splitModel, type RefusalReason } from "../../core/src/index.ts";
 import { startDemo } from "../../gateway/src/demo.ts";
 import { createGateway, type RequestHandler, type Route } from "../../gateway/src/gateway.ts";
 import { serve } from "../../gateway/src/serve.ts";
@@ -55,7 +57,7 @@ function change(response: Response, { status = response.status, replace = {}, bo
   return new Response(body, { status, headers });
 }
 
-function fixture(mutate: Mutation): RequestHandler {
+function fixture(mutate: Mutation, target = good): RequestHandler {
   return async (request, transport) => {
     const path = new URL(request.url).pathname;
     const decoded: unknown = request.method === "POST" ? await request.clone().json().catch(() => null) : null;
@@ -64,7 +66,7 @@ function fixture(mutate: Mutation): RequestHandler {
     const headers = new Headers(request.headers);
     const header = headers.get("route-policy");
     const auth = headers.get("authorization") ?? headers.get("x-api-key");
-    const next = () => good(request, transport);
+    const next = () => target(request, transport);
     const rewrite: Exchange["rewrite"] = (edit) => {
       const changed = new Headers(headers);
       if (edit.header === null) changed.delete("route-policy");
@@ -74,7 +76,7 @@ function fixture(mutate: Mutation): RequestHandler {
         if (changed.has("authorization")) changed.set("authorization", `Bearer ${key}`);
       }
       const replaced = edit.suffix === undefined ? body : { ...body, model: edit.suffix === null ? id : `${id}+${edit.suffix}` };
-      return good(new Request(request.url, { method: request.method, headers: changed, body: JSON.stringify(replaced) }));
+      return target(new Request(request.url, { method: request.method, headers: changed, body: JSON.stringify(replaced) }));
     };
     return mutate({ request, transport, headers, path, header, suffix, id, body, auth, next, rewrite });
   };
@@ -136,13 +138,16 @@ const faults: Record<Id, Mutation> = {
   },
 };
 
-async function run(t: TestContext, handler: RequestHandler, endpoints: readonly Endpoint[] = ["chat/completions"]) {
-  const server = serve(handler, 0);
+async function baseAt(t: TestContext, server: ReturnType<typeof createServer>, path = "/v1"): Promise<string> {
   t.after(() => { server.closeAllConnections(); server.close(); });
   await once(server, "listening");
   const address = server.address();
   assert.ok(address !== null && typeof address !== "string");
-  return runConformance({ base: `http://127.0.0.1:${address.port}/v1`, key, policyKey, endpoints });
+  return `http://127.0.0.1:${address.port}${path}`;
+}
+
+async function run(t: TestContext, handler: RequestHandler, endpoints: readonly Endpoint[] = ["chat/completions"], path = "/v1") {
+  return runConformance({ base: await baseAt(t, serve(handler, 0), path), key, policyKey, endpoints });
 }
 
 test(`${idList.join(" ")}: the reference implementation passes every black-box check without model or provider assumptions`, async (t) => {
@@ -659,4 +664,323 @@ test("G9 G15 G17 G25 G34: the real demo passes on all requested endpoints with z
   const report = await runConformance({ base: `${base}/v1`, key: "demo-key", policyKey: "demo-key-zdr", endpoints: INFERENCE_ENDPOINTS });
   assert.deepEqual(report.checks.filter((c) => c.status !== "PASS"), []);
   for (const endpoint of INFERENCE_ENDPOINTS) for (const id of ["G9", "G15", "G17", "G25", "G34"]) assert.ok(report.checks.some((c) => c.endpoint === endpoint && c.id === id && c.status === "PASS"));
+});
+
+test("G7 G24: two unpublished order ids cannot make qualifying routes unsatisfiable", async (t) => {
+  const credentials = new Set<string | null>();
+  const report = await run(t, fixture(async ({ auth, header, next }) => {
+    const reply = await next();
+    if (header !== "order=0,a-b_c.d") return reply;
+    credentials.add(auth);
+    assert.ok(reply.headers.has(applied));
+    return Response.json({ error: { message: "no routes", type: "invalid_request_error" } },
+      { status: 400, headers: { [refusal]: formatRefused("unsatisfiable") } });
+  }));
+  assert.deepEqual(credentials, new Set([`Bearer ${key}`, `Bearer ${policyKey}`]));
+  for (const id of ["G3", "G7", "G24"]) {
+    const verdict = report.checks.find((check) => check.id === id);
+    assert.equal(verdict?.status, "FAIL");
+    assert.match(verdict.detail, /order=0,a-b_c\.d/);
+  }
+});
+
+const refusalEnvelope = { error: { message: "fixture refusal", type: "invalid_request_error" } };
+function protocolError(reason: RefusalReason, keyName?: string): Response {
+  const value = reason === "unsupported" ? formatRefused(reason, keyName) : formatRefused(reason);
+  return Response.json(refusalEnvelope, { status: REFUSAL_STATUS[reason], headers: { [refusal]: value } });
+}
+
+function responseFor(policy: string, edit: Parameters<typeof change>[1]): Mutation {
+  return async ({ header, suffix, next }) => {
+    const reply = await next();
+    return header === policy && suffix === null ? change(reply, edit) : reply;
+  };
+}
+
+function detectionResponse(value: unknown, { status = 200, credentialed = false }: { status?: number; credentialed?: boolean } = {}): Mutation {
+  return ({ path, auth, next }) => path === "/v1/route-policy" && (auth !== null) === credentialed
+    ? Response.json(value, { status }) : next();
+}
+
+function catalogResponse(value: unknown): Mutation {
+  return ({ path, next }) => path === "/v1/models" ? Response.json(value) : next();
+}
+
+const combinationTarget = createGateway({
+  models: { [model]: routes.map((route, i) => ({
+    ...route, evidence: `https://${route.provider}.example/evidence`,
+    facts: ["zdr+bits=8+region=us,de+attest=weights", "notrain+bits=16+region=de,jp+attest=prompt", "bits=16+region=de+attest=weights,prompt"][i]!,
+  })) },
+  keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+  fetch: () => Response.json({ output: "served" }),
+});
+const bitsKeyTarget = createGateway({
+  models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "bits=16" } },
+  fetch: () => Response.json({ output: "served" }),
+});
+
+interface Clause {
+  id: Id;
+  clause: string;
+  mutate: Mutation;
+  target?: RequestHandler;
+}
+
+const clauses: Clause[] = [
+  { id: "G1", clause: "unsupported must use HTTP 400", mutate: responseFor("bits=0", { status: 422 }) },
+  { id: "G1", clause: "failing syntax cannot be classified as unsatisfiable", mutate: responseFor("bits=0", { replace: { [refusal]: formatRefused("unsatisfiable") } }) },
+  { id: "G2", clause: "the first bad pair cannot omit its key", mutate: responseFor("bits=0+only=a,a", { replace: { [refusal]: formatRefused("unsupported") } }) },
+  { id: "G2", clause: "a malformed key cannot name a later key", mutate: responseFor("Bad+bits=0", { replace: { [refusal]: formatRefused("unsupported", "bits") } }) },
+  { id: "G3", clause: "unsatisfiable must use HTTP 400", mutate: responseFor("bits=64", { status: 422 }) },
+  { id: "G3", clause: "unsatisfiable cannot attribute a key", mutate: responseFor("bits=64", { replace: { [refusal]: "reason=unsatisfiable+key=bits" } }) },
+  { id: "G3", clause: "no qualifying provider cannot be relayed", mutate: ({ header, suffix, rewrite, next }) => header === "bits=64" && suffix === null ? rewrite({ header: "bits=1" }) : next() },
+  ...([
+    ["zdr", "cobalt", "missing retention fact"], ["notrain", "cobalt", "missing training fact"],
+    ["bits=9", "aurora", "bit precision below the floor"], ["region=us", "basalt", "route countries exceed allowed region"],
+    ["attest=weights", "aurora", "missing attestation item"], ["only=basalt", "aurora", "provider absent from only"],
+    ["ignore=aurora", "aurora", "provider named in ignore"],
+  ] as const).map(([policy, provider, clause]): Clause =>
+    ({ id: "G6", clause, mutate: responseFor(policy, { replace: { [applied]: formatApplied(provider) } }) })),
+  { id: "G7", clause: "a preference cannot admit an excluded provider", mutate: responseFor("zdr+order=basalt", { replace: { [applied]: formatApplied("basalt") } }) },
+  { id: "G7", clause: "a sort alone cannot make matching routes unsatisfiable", mutate: responseFor("sort=throughput", { status: 400, body: JSON.stringify(refusalEnvelope),
+    replace: { [applied]: null, [refusal]: formatRefused("unsatisfiable") } }) },
+  { id: "G8", clause: "a valid suffix must resolve through the base id", mutate: ({ suffix, header, next }) => header === null && suffix === "zdr"
+    ? Response.json(refusalEnvelope, { status: 404 }) : next() },
+  { id: "G9", clause: "duplicates cannot select the first field line", mutate: ({ transport, rewrite, next }) => transport?.repeatedRoutePolicy ? rewrite({ header: "zdr" }) : next() },
+  { id: "G9", clause: "duplicate lines must not name a key", mutate: async ({ transport, next }) => {
+    const reply = await next();
+    return transport?.repeatedRoutePolicy ? change(reply, { replace: { [refusal]: formatRefused("unsupported", "only") } }) : reply;
+  } },
+  { id: "G10", clause: "the key default also applies with an explicit filter", mutate: ({ auth, header, rewrite, next }) =>
+    auth === `Bearer ${policyKey}` && header === "only=basalt" ? rewrite({ neutralKey: true }) : next() },
+  { id: "G11", clause: "a valid header cannot bypass independent suffix validation", mutate: ({ header, suffix, rewrite, next }) =>
+    header === "zdr" && suffix === "bits=0" ? rewrite({ suffix: null }) : next() },
+  ...([
+    ["zdr", "notrain", "retain both boolean requirements", combinationTarget],
+    ["bits=1", "bits=9", "combine precision by maximum, not minimum", good],
+    ["region=us,de", "region=de,jp", "intersect overlapping regions instead of replacing the suffix", combinationTarget],
+    ["only=aurora,basalt", "only=basalt,cobalt", "intersect overlapping provider lists", good],
+    ["attest=weights", "attest=prompt", "union distinct attestation items", combinationTarget],
+    ["ignore=aurora", "ignore=basalt", "union exclusions", good],
+  ] as const).map(([head, tail, clause, target]): Clause => ({
+    id: "G11", clause, target, mutate: ({ header, suffix, rewrite, next }) => {
+      if (header !== head || suffix !== tail) return next();
+      const bad = head.startsWith("region=") ? "only=aurora+region=us,de" :
+        head.startsWith("attest=") ? "only=aurora+attest=weights" :
+        head.startsWith("only=") ? "only=aurora" : head;
+      return rewrite({ header: bad, suffix: null });
+    },
+  })),
+  { id: "G12", clause: "an empty only intersection must refuse independently of region", mutate: ({ header, suffix, rewrite, next }) =>
+    header === "only=aurora" && suffix === "only=basalt" ? rewrite({ suffix: null }) : next() },
+  { id: "G13", clause: "an explicit header cannot remove the bound requirement", mutate: ({ auth, header, suffix, rewrite, next }) =>
+    auth === `Bearer ${policyKey}` && header === "only=basalt" && suffix === null ? rewrite({ neutralKey: true }) : next() },
+  { id: "G13", clause: "an explicit suffix cannot remove the bound requirement", mutate: ({ auth, header, suffix, rewrite, next }) =>
+    auth === `Bearer ${policyKey}` && header === null && suffix === "only=basalt" ? rewrite({ neutralKey: true }) : next() },
+  { id: "G13", clause: "an explicit weaker precision cannot lower the bound minimum", target: bitsKeyTarget,
+    mutate: ({ auth, header, rewrite, next }) => auth === `Bearer ${policyKey}` && header === "bits=8" ? rewrite({ neutralKey: true }) : next() },
+  { id: "G15", clause: "a well-formed provider id must be published for the model", mutate: responseFor("zdr", { replace: { [applied]: formatApplied("unpublished") } }) },
+  { id: "G17", clause: "attested relays must supply evidence", mutate: responseFor("attest=weights", { replace: { [evidence]: null } }) },
+  { id: "G17", clause: "unattested relays cannot supply evidence", mutate: responseFor("zdr", { replace: { [evidence]: "https://aurora.example/evidence" } }) },
+  { id: "G19", clause: "a refusal cannot carry Route-Applied", mutate: responseFor("bits=64", { replace: { [applied]: formatApplied("aurora") } }) },
+  { id: "G19", clause: "a refusal cannot carry Route-Evidence", mutate: responseFor("bits=64", { replace: { [evidence]: "https://aurora.example/evidence" } }) },
+  { id: "G20", clause: "anonymous detection must return 200", mutate: detectionResponse({ route_policy: "1" }, { status: 401 }) },
+  { id: "G20", clause: "credentialed detection must return 200", mutate: detectionResponse({ route_policy: "1" }, { status: 201, credentialed: true }) },
+  { id: "G20", clause: "detection must be a JSON object", mutate: detectionResponse([]) },
+  { id: "G20", clause: "keys must be a list with valid key tokens", mutate: detectionResponse({ route_policy: "1", keys: ["Not-A-Key"] }) },
+  { id: "G20", clause: "attest must be a list with valid item tokens", mutate: detectionResponse({ route_policy: "1", attest: ["a,b"] }) },
+  { id: "G20", clause: "sort must be a list with valid item tokens", mutate: detectionResponse({ route_policy: "1", sort: "price" }) },
+  { id: "G21", clause: "unknown unlisted keys must be refused, not silently dropped", mutate: ({ header, rewrite, next }) =>
+    header === "probe0" ? rewrite({ header: "zdr" }) : next() },
+  { id: "G21", clause: "unlisted attest values must be refused", mutate: ({ header, rewrite, next }) =>
+    header === "attest=probe0" ? rewrite({ header: "attest=weights" }) : next() },
+  ...(["bits=32", "region=jp,de", "only=0,a-b_c.d", "ignore=0,a-b_c.d", "order=0,a-b_c.d"] as const)
+    .map((policy): Clause => ({
+      id: "G21", clause: `listed fixed domain must accept ${policy}`, mutate: ({ header, suffix, next }) => header === policy && suffix === null
+        ? protocolError("unsupported", policy.split("=")[0]) : next(),
+    })),
+  { id: "G22", clause: "a bound key policy must be a string", mutate: detectionResponse({ route_policy: "1", key_policy: 1 }, { credentialed: true }) },
+  { id: "G22", clause: "a bound policy cannot repeat a key", mutate: detectionResponse({ route_policy: "1", key_policy: "zdr+zdr" }, { credentialed: true }) },
+  { id: "G22", clause: "a bound policy cannot name an unlisted key", mutate: detectionResponse({ route_policy: "1", keys: ["zdr"], key_policy: "notrain" }, { credentialed: true }) },
+  ...([
+    ["top-level model list is an object", []],
+    ["data is an array", { data: { id: model, routes: published } }],
+    ["model entry is an object with an id", { data: [null] }],
+    ["model ids are unique", { data: [{ id: model, routes: [] }, { id: model, routes: [] }] }],
+    ["model has a routes array", { data: [{ id: model }] }],
+    ["provider id obeys the grammar", { data: [{ id: model, routes: [{ provider: "Aurora", facts: "" }] }] }],
+    ["route must publish facts", { data: [{ id: model, routes: [{ provider: "aurora" }] }] }],
+    ["published facts obey the grammar", { data: [{ id: model, routes: [{ provider: "aurora", facts: "zdr+zdr" }] }] }],
+    ["a route with attest publishes evidence", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights" }] }] }],
+    ["published evidence has an evidence URI", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights", evidence: "http://basalt.example/" }] }] }],
+  ] as const).map(([clause, value]): Clause => ({ id: "G23", clause, mutate: catalogResponse(value) })),
+  { id: "G24", clause: "unknown only must match nothing", mutate: ({ header, rewrite, next }) =>
+    header === "only=routeprobe0" ? rewrite({ header: "zdr" }) : next() },
+  { id: "G24", clause: "an unknown only entry cannot erase a known match", mutate: ({ header, rewrite, next }) =>
+    header === "only=routeprobe0,aurora" ? rewrite({ header: "only=routeprobe0" }) : next() },
+  { id: "G24", clause: "unknown ignore cannot remove other providers", mutate: ({ header, rewrite, next }) =>
+    header === "ignore=routeprobe0" ? rewrite({ header: "only=routeprobe0" }) : next() },
+  { id: "G24", clause: "unknown ignore cannot erase a known exclusion", mutate: ({ header, rewrite, next }) =>
+    header === "ignore=routeprobe0,aurora" ? rewrite({ header: "only=aurora" }) : next() },
+  { id: "G24", clause: "mixed order cannot reject an unknown id as invalid", mutate: ({ header, next }) =>
+    header === "order=routeprobe0,aurora" ? protocolError("unsupported", "order") : next() },
+  { id: "G25", clause: "nonstring model errors must precede policy validation", mutate: ({ header, body, next }) =>
+    header === "bits=0" && typeof body.model === "number" ? protocolError("unsupported", "bits") : next() },
+  ...([applied, refusal, evidence] as const).map((name): Clause => ({
+    id: "G25", clause: `an unreadable body must not return ${name}`, mutate: async ({ request, transport, header, body, next }) => {
+      const reply = await next();
+      if (request.method !== "POST" || !transport?.repeatedRoutePolicy || header === null || Object.keys(body).length > 0) return reply;
+      return change(reply, { replace: { [name]: name === applied ? formatApplied("aurora")
+        : name === refusal ? formatRefused("unsupported", "bits") : "https://aurora.example/evidence" } });
+    },
+  })),
+  { id: "G26", clause: "policy-free inference cannot carry a refusal", mutate: async ({ request, auth, header, suffix, next }) => {
+    const reply = await next();
+    return request.method === "POST" && auth === `Bearer ${key}` && header === null && suffix === null && reply.ok
+      ? protocolError("unavailable") : reply;
+  } },
+  { id: "G29", clause: "unsatisfiable takes precedence over unavailable", mutate: ({ header, suffix, next }) =>
+    header === "bits=64" && suffix === null ? protocolError("unavailable") : next() },
+  { id: "G29", clause: "an unsupported policy cannot be masked by unavailable", mutate: ({ header, suffix, next }) =>
+    header === "zdr" && suffix === "bits=0" ? protocolError("unavailable") : next() },
+];
+
+for (const { id, clause, mutate, target } of clauses) test(`${id}: clause matrix — ${clause}`, async (t) => {
+  let altered = 0;
+  const report = await run(t, fixture(async (exchange) => {
+    let original: Response | undefined;
+    const reply = await mutate({ ...exchange, next: async () => {
+      original = await exchange.next();
+      return original;
+    } });
+    if (reply !== original) altered++;
+    return reply;
+  }, target));
+  assert.ok(altered > 0, "the suite reached the deliberately broken branch");
+  const verdict = report.checks.find((entry) => entry.id === id);
+  assert.equal(verdict?.status, "FAIL", JSON.stringify(report.checks.filter((entry) => entry.status !== "PASS")));
+  assert.match(verdict.detail, /sent \{.*; received .*; required:/);
+});
+
+for (const name of [applied, refusal, evidence]) test(`G19: two raw ${name} field lines are not one result`, async (t) => {
+  const upstream = await baseAt(t, serve(good, 0), "");
+  let duplicated = 0;
+  const proxy = createServer((incoming, outgoing) => {
+    const target = new URL(incoming.url ?? "/", upstream);
+    const relay = relayRequest(target, { method: incoming.method, headers: incoming.rawHeaders }, (reply) => {
+      const headers = [...reply.rawHeaders];
+      for (let i = 0; i < headers.length; i += 2) {
+        if (headers[i]!.toLowerCase() === name) {
+          headers.push(name, headers[i + 1]!);
+          duplicated++;
+          break;
+        }
+      }
+      outgoing.writeHead(reply.statusCode!, headers);
+      reply.pipe(outgoing);
+      outgoing.on("close", () => reply.destroy());
+    });
+    relay.on("error", () => outgoing.destroy());
+    incoming.pipe(relay);
+  }).listen(0, "127.0.0.1");
+  const report = await runConformance({ base: await baseAt(t, proxy), key, policyKey, endpoints: ["chat/completions"] });
+  assert.ok(duplicated > 0);
+  const verdict = report.checks.find(({ id }) => id === "G19");
+  assert.equal(verdict?.status, "FAIL");
+  assert.match(verdict.detail, /at most one field line of each result header/);
+});
+
+for (const broken of [false, true]) test(`G25: a stable bound-key rate limit ${broken ? "cannot become a policy refusal" : "remains an ordinary error"}`, async (t) => {
+  let challengeSeen = false;
+  const report = await run(t, fixture(({ id, auth, header, suffix, next }) => {
+    if (id !== model || auth !== `Bearer ${policyKey}` || suffix !== null) return next();
+    if (header === "bits=0") {
+      challengeSeen = true;
+      if (broken) return protocolError("unsupported", "bits");
+    } else if (header !== null) return next();
+    return Response.json({ error: { message: "try later", type: "rate_limit" } }, { status: 429 });
+  }));
+  assert.ok(challengeSeen);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, broken ? "FAIL" : "PASS");
+  if (broken) assert.match(verdict.detail, /both bound-key controls are throttled/);
+  else assert.equal(report.failed, 0);
+});
+
+test("G2 G21: the audit catches unsupported and invented attribution on a separate streaming probe", async (t) => {
+  let broken = 0;
+  const report = await run(t, fixture(({ body, header, next }) => {
+    if (body.stream !== true || header !== "zdr") return next();
+    broken++;
+    return protocolError("unsupported", "zdr");
+  }));
+  assert.equal(broken, 1);
+  for (const id of ["G2", "G21"]) {
+    const verdict = report.checks.find((entry) => entry.id === id);
+    assert.equal(verdict?.status, "FAIL");
+    assert.match(verdict.detail, /stream\\":true/);
+  }
+});
+
+test("G20 G22: bad credentialed detection status does not itself invalidate an otherwise valid key policy", async (t) => {
+  const report = await run(t, fixture(async ({ path, auth, next }) => {
+    const reply = await next();
+    if (path !== "/v1/route-policy" || auth !== `Bearer ${policyKey}`) return reply;
+    return change(reply, { status: 201 });
+  }));
+  assert.equal(report.checks.find(({ id }) => id === "G20")?.status, "FAIL");
+  assert.equal(report.checks.find(({ id }) => id === "G22")?.status, "PASS");
+});
+
+test("G20 G23 G9: keep the exact tenant query on metadata and every inference endpoint", async (t) => {
+  const paths = new Set<string>();
+  const query = "?tenant=east&tag=a%2Bb&tag=a+b";
+  let missingQuery = 0;
+  const prefix = "/tenants/inference/v3";
+  const report = await run(t, async (request, transport) => {
+    const url = new URL(request.url);
+    paths.add(url.pathname);
+    if (url.search !== query) {
+      missingQuery++;
+      return new Response(null, { status: 404 });
+    }
+    url.pathname = `/v1${url.pathname.slice(prefix.length)}`;
+    return good(new Request(url, {
+      method: request.method, headers: request.headers, signal: request.signal,
+      ...(request.body === null ? {} : { body: request.body, duplex: "half" }),
+    }), transport);
+  }, INFERENCE_ENDPOINTS, `${prefix}/${query}`);
+  assert.equal(missingQuery, 0);
+  assert.deepEqual(paths, new Set(["route-policy", "models", ...INFERENCE_ENDPOINTS].map((path) => `${prefix}/${path}`)));
+  assert.equal(report.passed, 63);
+  assert.equal(report.failed + report.skipped, 0);
+});
+
+test("G20: reject fragments and URL userinfo before making metadata requests", async (t) => {
+  let requests = 0;
+  const base = await baseAt(t, serve((request, transport) => { requests++; return good(request, transport); }, 0));
+  for (const invalid of [`${base}#debug`, `${base}#`, base.replace("://", "://operator@"), base.replace("://", "://:secret@")]) {
+    await assert.rejects(runConformance({ base: invalid }), /without a fragment or credentials/);
+  }
+  assert.equal(requests, 0);
+});
+
+test("G15 G20: a single selected endpoint may commit a valid response slowly", async (t) => {
+  const inferred = new Set<string>();
+  let waited = false;
+  const report = await run(t, async (request, transport) => {
+    if (request.method !== "POST") return good(request, transport);
+    const path = new URL(request.url).pathname;
+    inferred.add(path);
+    if (path !== "/v1/responses") return new Response(null, { status: 404 });
+    if (!waited && request.headers.get("route-policy") === "zdr") {
+      waited = true;
+      await delay(120);
+    }
+    return good(request, transport);
+  }, ["responses"]);
+  assert.ok(waited);
+  assert.deepEqual(inferred, new Set(["/v1/responses"]));
+  assert.equal(report.passed, 23);
+  assert.equal(report.failed + report.skipped, 0);
 });

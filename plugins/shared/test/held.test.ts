@@ -18,9 +18,9 @@ test("C10: a stored entry restores the held policy, a cleared one restores none,
   assert.deepEqual(restored?.kind === "policy" ? [restored.text, restored.source] : null, ["notrain", "session"]);
   assert.deepEqual(heldFromEntry({ policy: null }), { kind: "none" });
   assert.equal(heldFromEntry({ policy: "bits=0" })?.kind, "invalid");
-  assert.equal(heldFromEntry({ policy: 3 }), null);
-  assert.equal(heldFromEntry("notrain"), null);
-  assert.equal(heldFromEntry(null), null);
+  for (const other of [{ policy: 3 }, { policy: true }, { policy: ["notrain"] }, {}, [], "notrain", 7, null, undefined]) {
+    assert.equal(heldFromEntry(other), null, JSON.stringify(other) ?? "undefined");
+  }
 });
 
 test("C10: a policy the user sets is parsed by the grammar of this revision, whatever a gateway accepts", () => {

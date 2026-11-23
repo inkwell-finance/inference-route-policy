@@ -79,6 +79,13 @@ test("C6: a valid detection reply clears a requirement; anything else, a failed 
     ["not JSON", () => (gateway.replies.detection = { status: 200 }), /not a JSON object/],
     ["keys not a list", () => (gateway.replies.detection = { status: 200, body: { route_policy: "1", keys: "zdr" } }), /keys is not a list of keys/],
     ["unknown members ignored", () => (gateway.replies.detection = { status: 200, body: { route_policy: "1", later: { x: 1 }, keys: ["zdr", "future"] } }), null],
+    ["status 500", () => (gateway.replies.detection = { status: 500, body: { route_policy: "1" } }), /status is 500, not 200/],
+    ["route_policy missing", () => (gateway.replies.detection = { status: 200, body: { keys: ["zdr"] } }), /route_policy is not the string "1"/],
+    ["route_policy another version", () => (gateway.replies.detection = { status: 200, body: { route_policy: "2" } }), /route_policy is not the string "1"/],
+    ["an array", () => (gateway.replies.detection = { status: 200, body: [{ route_policy: "1" }] }), /not a JSON object/],
+    ["a string", () => (gateway.replies.detection = { status: 200, body: "route_policy" }), /not a JSON object/],
+    ["null", () => (gateway.replies.detection = { status: 200, body: null }), /not a JSON object/],
+    ["text that is not JSON", () => (gateway.replies.detection = { status: 200, raw: "{route_policy" }), /not a JSON object/],
   ];
   for (const [name, arrange, refusal] of cases) {
     reset();
@@ -214,19 +221,21 @@ test("C1, C14: a request leaving with another context than the one it was checke
   assert.doesNotMatch(last.reason, /demo-key/, "names only, never values");
 });
 
-test("C14: a not-honored result discards the detection reply of its own credential, and only that one", async () => {
+test("C14: a not-honored result discards the detection reply of its own credential, and only that one, while another credential's request is in flight and finishes first", async () => {
   reset();
   const { client: c, reports } = client("zdr");
+  // k1's request leaves first and comes back last, not honored; k2's leaves second and comes back first, honored.
+  gateway.replies.inference = (request) =>
+    request.headers.authorization === "Bearer k1"
+      ? { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 200 }
+      : { status: 200, headers: { "route-applied": "provider=aurora" }, body: {}, delayMs: 20 };
   const sendOne = release(c, await decide(c, placed("k1")));
   const sendTwo = release(c, await decide(c, placed("k2")));
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
-  await sendText(sendTwo);
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
-  await sendText(sendOne);
-  assert.deepEqual(reports.map((r) => r.kind), ["not-honored", "honored"]);
+  await Promise.all([sendText(sendOne), sendText(sendTwo)]);
+  assert.deepEqual(reports.map((r) => r.kind), ["honored", "not-honored"]);
   await decide(c, placed("k1"));
   await decide(c, placed("k2"));
-  assert.deepEqual([detectionRequests("k1"), detectionRequests("k2")], [1, 2], "k2's reply was discarded and fetched again; k1's was kept");
+  assert.deepEqual([detectionRequests("k1"), detectionRequests("k2")], [2, 1], "k1's reply was discarded and fetched again; k2's was kept");
 });
 
 test("C14: a request decided before its detection reply was discarded is not current, and is stopped at fetch", async () => {
@@ -268,28 +277,72 @@ test("C14: a discard that lands while a decision is still reading the gateway ma
   assert.equal(c.isCurrent(prepared), false, "the generation is the one read before the wait");
 });
 
-test("C5: every one of many overlapping requests is read on its own call, and each refusal reported as one", async () => {
+test("C5: overlapping requests, completing in the reverse of the order they left, are each read by the session and against the policy that sent them", async () => {
   reset();
-  const { client: c, reports } = client("zdr");
-  const prepared = await decide(c, target());
-  const sends = Array.from({ length: 40 }, () => release(c, prepared));
-  gateway.replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
-  await Promise.all(sends.map(sendText));
-  assert.equal(reports.length, 40);
-  assert.ok(reports.every((r) => r.kind === "refused" && r.reason === "unsatisfiable"));
+  gateway.replies.models = {
+    status: 200,
+    body: { data: [{ id: "demo-model", routes: ["aurora", "basalt", "cobalt"].map((provider) => ({ provider, facts: "" })) }] },
+  };
+  // Each request names one provider in its policy, and the gateway serves it by that one: each response honors
+  // its own request's policy and no other's. The first to leave is answered last.
+  const order = ["aurora", "basalt", "cobalt"];
+  gateway.replies.inference = (request) => {
+    const provider = order.find((p) => request.headers["route-policy"] === `only=${p}`) ?? "none";
+    return { status: 200, headers: { "route-applied": `provider=${provider}` }, body: {}, delayMs: (order.length - order.indexOf(provider)) * 80 };
+  };
+  const first = client("only=aurora");
+  const sendAurora = release(first.client, await decide(first.client, target()));
+  first.client.set("only=basalt");
+  const sendBasalt = release(first.client, await decide(first.client, target()));
+  const second = client("only=cobalt");
+  const sendCobalt = release(second.client, await decide(second.client, target()));
+  const finished: string[] = [];
+  const track = async (name: string, send: () => Promise<Response>): Promise<void> => {
+    await sendText(send);
+    finished.push(name);
+  };
+  await Promise.all([track("aurora", sendAurora), track("basalt", sendBasalt), track("cobalt", sendCobalt)]);
+  assert.deepEqual(finished, ["cobalt", "basalt", "aurora"], "completed in the reverse of the order they left");
+  const seen = (reports: Report[]): string[] => reports.map((r) => (r.kind === "honored" ? `honored ${r.provider}` : r.kind));
+  assert.deepEqual(seen(first.reports), ["honored basalt", "honored aurora"], "the first session hears its own two, each against its own policy");
+  assert.deepEqual(seen(second.reports), ["honored cobalt"], "the second session hears its own one");
 });
 
-test("C4: each response is read against the routes of the list held when its own request was released, not a later one", async () => {
+test("C4: each response is read against the routes its own request was released with, while another request with other routes is in flight", async () => {
   reset();
   gateway.replies.models = {
     status: 200,
     body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr" }] }, { id: "other-model", routes: [{ provider: "cobalt", facts: "zdr" }] }] },
   };
+  // Each model's request is served by the one route its list publishes for it; the first to leave comes back last.
+  gateway.replies.inference = (request) =>
+    request.body.includes('"demo-model"')
+      ? { status: 200, headers: { "route-applied": "provider=aurora" }, body: {}, delayMs: 200 }
+      : { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 20 };
   const { client: c, reports } = client("zdr");
-  const sendFirst = release(c, await decide(c, target(), "demo-model"));
-  release(c, await decide(c, target(), "other-model"));
-  await sendText(sendFirst);
-  assert.deepEqual(reports, [{ kind: "honored", provider: "aurora", checked: true, evidence: null }]);
+  const sendDemo = release(c, await decide(c, target(), "demo-model"));
+  const sendOther = release(c, await decide(c, target(), "other-model"));
+  await Promise.all([sendText(sendDemo), sendText(sendOther)]);
+  assert.deepEqual(reports, [
+    { kind: "honored", provider: "cobalt", checked: true, evidence: null },
+    { kind: "honored", provider: "aurora", checked: true, evidence: null },
+  ]);
+});
+
+test("C1, C14: identical requests released in turn are matched in the order they were released: the one decided before a discard is stopped, the one after goes", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  const sendA = release(c, await decide(c, target()));
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  // B carries the same bytes as A, and is decided before A comes back not honored; C after, on a fresh reply.
+  const sendB = release(c, await decide(c, target()));
+  await sendText(sendA);
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
+  const sendC = release(c, await decide(c, target()));
+  // The first send of these bytes is B's, which relied on the discarded reply; the next is C's.
+  await assert.rejects(sendB(), /discarded before it left/);
+  await sendText(sendC);
+  assert.equal(gateway.inference().length, 2, "A and C went; B did not");
 });
 
 test("C1, C14: a released request answered with a redirect is not followed, is reported not honored, and drops the detection reply", async () => {
@@ -320,17 +373,24 @@ test("C5, C8: a redirect never outranks a refusal, and a translated request answ
   assert.equal(elsewhere.requests.length, 0);
 });
 
-test("C4, C16: any JSON value a model list reply holds is read as a list, null as {} does; only a reply that is no JSON is no list", async () => {
-  for (const [name, body, blocked] of [
-    ["null", null, true],
-    ["{}", {}, true],
-    ["a number", 7, true],
-    ["no JSON at all", undefined, false],
-  ] as const) {
+test("C4, C16: a model list reply of any JSON value is read as a list (object, array, string, number, true, false, null), and one that is not JSON is no list", async () => {
+  const cases: [string, { body?: unknown; raw?: string }, boolean][] = [
+    ["an object", { body: { data: "none" } }, true],
+    ["an array", { body: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "" }] }] }, true],
+    ["a string", { body: "aurora" }, true],
+    ["a number", { body: 7 }, true],
+    ["true", { body: true }, true],
+    ["false", { body: false }, true],
+    ["null", { body: null }, true],
+    ["text that is not JSON", { raw: "{not json" }, false],
+    ["an empty body", {}, false],
+  ];
+  for (const [name, reply, held] of cases) {
     reset();
-    gateway.replies.models = { status: 200, body };
+    gateway.replies.models = { status: 200, ...reply };
     const { decision } = await decide(client("only=aurora").client, target());
-    if (blocked) blockedFor(decision, /no route the model list publishes/);
+    assert.equal(listRequests(), 1, `${name}: the list was read`);
+    if (held) blockedFor(decision, /no route the model list publishes/);
     else assert.ok(decision.action === "send" && decision.routes === null, `${name}: no list is held, so the gateway decides`);
   }
 });
@@ -346,13 +406,19 @@ test("C4, C14: each base URL has its own model list, and the decision follows th
   assert.equal(elsewhere.requests.filter((r) => r.path.endsWith("/models")).length, 1, "the other base URL's list was read");
 });
 
-test("C14: failed reads are not kept, so the next request tries again", async () => {
+test("C14: failed reads are not kept, so the next request tries again: a detection reply and a model list each", async () => {
   reset();
   gateway.replies.detection = { status: 503 };
   const { client: c } = client("zdr");
   blockedFor((await decide(c, target())).decision, /status is 503/);
   gateway.replies.detection = { status: 200, body: { route_policy: "1" } };
-  assert.equal((await decide(c, target())).decision.action, "send");
+  gateway.replies.models = { status: 503 };
+  const withoutList = (await decide(c, target())).decision;
+  assert.ok(withoutList.action === "send" && withoutList.routes === null, "detection read again; no list held yet");
+  gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr" }] }] } };
+  const withList = (await decide(c, target())).decision;
+  assert.ok(withList.action === "send" && withList.routes !== null, "the list read again");
+  assert.deepEqual([detectionRequests(), listRequests()], [2, 2]);
 });
 
 test("C15: a new client, as in the next run, holds no detection reply or model list from the last", async () => {

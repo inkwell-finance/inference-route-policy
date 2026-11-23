@@ -113,6 +113,11 @@ function discover(body: unknown, support: Support): Model[] {
         for (const country of route.facts.region) texts.add(`region=${country}`);
       }
     }
+    const providers = [...routes.keys()].slice(0, 3);
+    if (providers.length === 3) {
+      texts.add(`only=${providers[0]},${providers[1]}`);
+      texts.add(`only=${providers[1]},${providers[2]}`);
+    }
     const policies = [];
     for (const text of texts) {
       const parsed = parsePolicy(text, support);
@@ -181,15 +186,24 @@ function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
     }
     layers[layer] = parsed.value;
   }
-  result.combined = combinePolicies(layers);
-  if (carriesPolicy === true && routeMap !== undefined && !someRouteMeets(routeMap, result.combined)) result.expectedRefusal = { reason: "unsatisfiable" };
+  if (layers.key !== undefined) result.bound = layers.key;
+  result.explicit = explicit;
+  const combined = combinePolicies(layers);
+  result.combined = combined;
+  if (carriesPolicy === true && routeMap !== undefined) {
+    result.qualifies = someRouteMeets(routeMap, combined);
+    if (!result.qualifies) result.expectedRefusal = { reason: "unsatisfiable" };
+    result.unknownProvider = [combined.only ?? [], combined.ignore, combined.order ?? []].some((ids) =>
+      ids.some((id) => !scope.models.some((entry) => entry.routes.has(id))));
+  }
   return result;
 }
 
 export async function runConformance(options: Options): Promise<Report> {
-  const url = new URL(options.base);
-  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.search || url.hash || url.username || url.password) throw new TypeError("base must be an HTTP(S) API base URL without a query, fragment, or credentials");
-  const base = url.href.replace(/\/+$/, "");
+  const base = new URL(options.base);
+  if ((base.protocol !== "http:" && base.protocol !== "https:") || base.href.includes("#") || base.username || base.password) {
+    throw new TypeError("base must be an HTTP(S) API base URL without a fragment or credentials");
+  }
   const endpoints = options.endpoints ?? INFERENCE_ENDPOINTS;
   if (endpoints.length === 0 || endpoints.some((endpoint) => !INFERENCE_ENDPOINTS.includes(endpoint))) throw new TypeError("provide at least one recognized inference endpoint");
   const checks: Check[] = [];
@@ -281,8 +295,19 @@ export async function runConformance(options: Options): Promise<Report> {
       const reply = current.detectionReply;
       if (reply === undefined) continue;
       inspected++;
-      if (member(reply.body, "key_policy") !== undefined && current.detection === undefined) {
-        throw mismatch(metadata("route-policy", current), reply.received, "key_policy absent for anonymous detection and valid under the advertised lists when present");
+      if (member(reply.body, "key_policy") === undefined) continue;
+      if (current.credential === undefined) {
+        throw mismatch(metadata("route-policy", current), reply.received, "key_policy absent for anonymous detection");
+      }
+      // Status and version belong to G20, not to the validity of this policy.
+      const body = { route_policy: "1", ...Object.fromEntries(["keys", "attest", "sort", "key_policy"]
+        .flatMap((name) => {
+          const value = member(reply.body, name);
+          return value === undefined ? [] : [[name, value]];
+        })) };
+      const parsed = parseDetection({ status: 200, body, credentialed: true });
+      if (!parsed.ok && parsed.key === "key_policy") {
+        throw mismatch(metadata("route-policy", current), reply.received, `key_policy valid under the advertised lists: ${parsed.detail}`);
       }
     }
     if (inspected !== detectionScopes.size) return "an inspectable detection reply under each supplied credential and anonymously";
@@ -455,24 +480,51 @@ export async function runConformance(options: Options): Promise<Report> {
         }
         break;
       }
+      for (const model of models) {
+        const zdr = positives.find((candidate) => candidate.model === model && candidate.text === "zdr");
+        const notrain = positives.find((candidate) => candidate.model === model && candidate.text === "notrain");
+        if (zdr === undefined || notrain === undefined) continue;
+        const allowed = qualifying(model, combinePolicies({ ...(bound === undefined ? {} : { key: bound }), header: zdr.policy, suffix: notrain.policy }));
+        if (allowed.length === zdr.allowed.length && allowed.length === notrain.allowed.length) continue;
+        for (const [header, suffix] of [["zdr", "notrain"], ["notrain", "zdr"]]) {
+          await expect(inference(model.id, header, suffix), "both retention and training requirements survive combination",
+            allowed.length ? allowedOrUnavailable(allowed) : unsatisfiable);
+        }
+        break;
+      }
       if (positive !== undefined) {
         const parsed = parsePolicy("bits=0", support);
         if (!parsed.ok) await expect(inference(positive.model.id, positive.text, "bits=0"), "a valid header does not bypass validation of the suffix", (r) => refusal(r, "unsupported", parsed.key));
         const { model, text, allowed } = positive;
         await expect(inference(model.id, text, text), "a valid policy repeated across carriers is not a duplicate within one carrier", allowedOrUnavailable(allowed));
       }
-      // When the facts distinguish the two values, check both orientations.
-      const witnessed = new Set<string>();
-      for (const left of positives) {
-        const key = keysOf(left.policy)[0]!;
-        if (witnessed.has(key)) continue;
-        const right = positives.find((candidate) => candidate.model === left.model && keysOf(candidate.policy)[0] === key
-          && (candidate.allowed.length !== left.allowed.length || candidate.allowed.some((id) => !left.allowed.includes(id))));
-        if (right === undefined) continue;
-        witnessed.add(key);
+      // Prefer probes that can distinguish losing either input, not just one.
+      const best = new Map<string, { left: (typeof positives)[number]; right: (typeof positives)[number]; allowed: string[]; score: number }>();
+      const groups = new Map<Model, Map<string, (typeof positives)[number][]>>();
+      for (const entry of positives) {
+        const key = keysOf(entry.policy)[0]!;
+        if (!["bits", "region", "only", "attest", "ignore"].includes(key)) continue;
+        let byKey = groups.get(entry.model);
+        if (byKey === undefined) groups.set(entry.model, byKey = new Map());
+        let group = byKey.get(key);
+        if (group === undefined) byKey.set(key, group = []);
+        group.push(entry);
+      }
+      for (const [model, byKey] of groups) for (const [key, group] of byKey) {
+        if (best.get(key)?.score === 3) continue;
+        pairs: for (const [i, left] of group.entries()) for (let j = i + 1; j < group.length; j++) {
+          const right = group[j]!;
+          const combined = combinePolicies({ ...(bound === undefined ? {} : { key: bound }), header: left.policy, suffix: right.policy });
+          const allowed = qualifying(model, combined);
+          const narrowed = Number(allowed.length < left.allowed.length) + Number(allowed.length < right.allowed.length);
+          const score = narrowed === 2 && allowed.length > 0 ? 3 : narrowed;
+          if (score <= (best.get(key)?.score ?? 0)) continue;
+          best.set(key, { left, right, allowed, score });
+          if (score === 3) break pairs;
+        }
+      }
+      for (const { left, right, allowed } of best.values()) {
         for (const [header, suffix] of [[left, right], [right, left]] as const) {
-          const combined = combinePolicies({ ...(bound === undefined ? {} : { key: bound }), header: header.policy, suffix: suffix.policy });
-          const allowed = qualifying(left.model, combined);
           await expect(inference(left.model.id, header.text, suffix.text), "matching routes reflect combined same-key requirements in either carrier order",
             allowed.length ? allowedOrUnavailable(allowed) : unsatisfiable);
         }
@@ -613,6 +665,11 @@ export async function runConformance(options: Options): Promise<Report> {
         if (key === "order") {
           const known = allowed[0]!;
           await expect(inference(model.id, `order=${model.unknown},${known}`), "an unknown provider beside a known provider does not invalidate order", allowedOrUnavailable(allowed));
+        } else {
+          const excluded = allowed[0]!;
+          const remaining = allowed.filter((id) => id !== excluded);
+          await expect(inference(model.id, `ignore=${model.unknown},${excluded}`), "an unknown provider beside a known provider does not change ignore",
+            remaining.length === 0 ? unsatisfiable : allowedOrUnavailable(remaining));
         }
       }
       if (model !== undefined && support.keys.has("only")) {
@@ -638,8 +695,7 @@ export async function runConformance(options: Options): Promise<Report> {
         // A catalog can omit a model that is nevertheless routable. Check for
         // a protocol routing result before treating the missing id as unknown.
         const witness = positive?.text ?? candidates[0]?.text;
-        const resolution = witness === undefined ? undefined
-          : await request(base, inference(unknownModel, witness), options.timeoutMs ?? 10_000).catch(() => undefined);
+        const resolution = witness === undefined ? undefined : (await observeControl(inference(unknownModel, witness)))?.reply;
         if (resolution === undefined) missing.push("unknown-model subcase: no accepted-policy control to test whether the unpublished model resolves");
         else if (applied(resolution) !== null || resolution.status < 400
           || refusal(resolution, "unavailable") || unsatisfiable(resolution)) {
@@ -666,6 +722,24 @@ export async function runConformance(options: Options): Promise<Report> {
             await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] });
           } else {
             missing.push(`bad-credentials subcase: headerless HTTP ${candidate.reply.status} did not distinguish credential rejection from a provider relay`);
+          }
+        }
+      }
+      const throttleModel = policyBound === undefined ? undefined : policyScope.models.find((model) => qualifying(model, policyBound).length > 0);
+      if (throttleModel !== undefined) {
+        const plain = policyInference(throttleModel.id);
+        const before = await observeControl(plain);
+        if (before !== undefined && before.reply.status === 429 && isBareError(before.reply)) {
+          // The bound policy means even a relayed 429 requires Route-Applied.
+          // Bracket the challenge; a throttle that has cleared proves nothing.
+          const probe = policyInference(throttleModel.id, INVALID_POLICY);
+          const challenged = await observeControl(probe);
+          if (challenged === undefined || challenged.reply.status !== 429 || !noResult(challenged.reply)) {
+            const after = await observeControl(plain);
+            if (after?.reply.status === 429 && isBareError(after.reply)) {
+              throw mismatch(probe, challenged?.reply.received ?? "no response", "ordinary HTTP 429 with no route headers while both bound-key controls are throttled");
+            }
+            missing.push("rate-limit subcase: the bound-key control was no longer throttled after the probe");
           }
         }
       }
@@ -701,7 +775,7 @@ export async function runConformance(options: Options): Promise<Report> {
       if (existing === undefined) checks.push(verdict);
       else if (failure !== undefined || (existing.status === "PASS" && missing !== undefined)) Object.assign(existing, verdict);
     };
-    for (const id of ["G1", "G2", "G3", "G29"] as const) if (audit.failures.has(id)) audited(id, "");
+    for (const [id] of audit.failures) audited(id, "");
     audited("G6", "observed relays met the combined policy");
     audited("G15", "observed policy relays named a published provider", audit.sawPolicyRelay ? undefined : "a relay for a request with a policy");
     audited("G17", "observed relays gave evidence exactly when required", audit.sawAttestationRelay ? undefined : "a relay for a policy with attest");

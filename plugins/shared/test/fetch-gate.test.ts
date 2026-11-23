@@ -51,6 +51,12 @@ function watchAll(): string[] {
   return stops;
 }
 
+/** Waits until `done` holds, for at most two seconds. */
+async function until(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 400 && !done(); i++) await new Promise((wake) => setTimeout(wake, 5));
+  assert.ok(done(), "timed out waiting");
+}
+
 const post = (init: { headers?: RequestInit["headers"]; body?: string; url?: string | undefined } = {}): Promise<Response> =>
   fetch(init.url ?? `${gateway.base}/chat/completions`, { method: "POST", headers: init.headers ?? { authorization: "Bearer k", "route-policy": "zdr" }, body: init.body ?? BODY });
 
@@ -119,7 +125,16 @@ test("C1: headers known not to identify the caller may come and go: each of them
 });
 
 test("C1: the release matches whatever form the headers take: an object in any case, an array, or a Headers", async () => {
-  for (const headers of [{ Authorization: "Bearer k", "ROUTE-POLICY": "zdr" }, [["authorization", "Bearer k"], ["route-policy", "zdr"]] as [string, string][], new Headers({ authorization: "Bearer k", "route-policy": "zdr" })]) {
+  const forms: RequestInit["headers"][] = [
+    { authorization: "Bearer k", "route-policy": "zdr" },
+    { Authorization: "Bearer k", "Route-Policy": "zdr" },
+    { AUTHORIZATION: "Bearer k", "ROUTE-POLICY": "zdr" },
+    { aUtHoRiZaTiOn: "Bearer k", "rOuTe-PoLiCy": "zdr" },
+    [["authorization", "Bearer k"], ["route-policy", "zdr"]],
+    [["Authorization", "Bearer k"], ["ROUTE-POLICY", "zdr"]],
+    new Headers({ Authorization: "Bearer k", "Route-Policy": "zdr" }),
+  ];
+  for (const headers of forms) {
     const owner = release();
     await (await post({ headers })).text();
     assert.equal(owner.completions.length, 1);
@@ -142,11 +157,19 @@ test("C1, C5: when two sessions released the same bytes, whose call it is cannot
   assert.deepEqual([first.stops.length, second.stops.length], [1, 1]);
 });
 
-test("C5: of two sessions, only the one whose release matched hears the response", async () => {
+test("C5: of two sessions with requests in flight together, each hears only its own response, the first to leave finishing last", async () => {
+  const OTHER = JSON.stringify({ model: "other-model", messages: [] });
   const mine = release({ owner: { session: 1 } });
-  const theirs = release({ owner: { session: 2 }, body: JSON.stringify({ model: "other-model" }) });
-  await (await post()).text();
-  assert.deepEqual([mine.completions.length, theirs.completions.length], [1, 0]);
+  const theirs = release({ owner: { session: 2 }, body: OTHER });
+  gateway.replies.inference = (request) =>
+    request.body === BODY
+      ? { status: 200, headers: { "route-applied": "provider=aurora" }, body: {}, delayMs: 200 }
+      : { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {}, delayMs: 20 };
+  const first = post();
+  await until(() => gateway.inference().length === 1);
+  await Promise.all([first.then((r) => r.text()), post({ body: OTHER }).then((r) => r.text())]);
+  assert.deepEqual(mine.completions.map((c) => [c.status, c.result.applied]), [[200, ["provider=aurora"]]]);
+  assert.deepEqual(theirs.completions.map((c) => [c.status, c.result.refused]), [[400, ["reason=unsatisfiable"]]]);
 });
 
 test("C1: a released request does not follow a redirect: its body goes nowhere else", async () => {

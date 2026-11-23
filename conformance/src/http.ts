@@ -28,8 +28,9 @@ export interface Observation {
 
 const policyHeader = (index: number, mixedFirst = false): string => (index % 2 === 0) !== mixedFirst ? "Route-Policy" : "rOuTe-PoLiCy";
 
-export async function request(base: string, probe: Probe, timeoutMs: number): Promise<Observation> {
-  const target = new URL(`${base}/${probe.path}`);
+export async function request(base: URL, probe: Probe, timeoutMs: number): Promise<Observation> {
+  const target = new URL(base);
+  target.pathname = `${base.pathname.replace(/\/+$/, "")}/${probe.path}`;
   const headers = ["host", target.host, "accept-encoding", "identity"];
   if (probe.credential !== undefined) {
     const { key, header } = probe.credential;

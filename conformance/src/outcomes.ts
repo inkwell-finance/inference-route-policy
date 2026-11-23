@@ -11,11 +11,15 @@ export interface Exchange {
 export interface ResultContext {
   carriesPolicy: boolean | undefined;
   combined?: Policy;
+  bound?: Policy;
+  explicit?: boolean;
   routes?: ReadonlyMap<string, PublishedRoute | null>;
+  qualifies?: boolean;
+  unknownProvider?: boolean;
   expectedRefusal?: { reason: "unsupported"; key: string | null } | { reason: "unsatisfiable" };
 }
 
-export type AuditId = "G1" | "G2" | "G3" | "G6" | "G15" | "G17" | "G19" | "G26" | "G29" | "G34";
+export type AuditId = "G1" | "G2" | "G3" | "G6" | "G7" | "G10" | "G13" | "G15" | "G17" | "G19" | "G21" | "G24" | "G26" | "G29" | "G34";
 export interface ResultAudit {
   failures: Map<AuditId, string>;
   sawPolicyRelay: boolean;
@@ -91,7 +95,8 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     const provider = applied(reply);
     if (reply.applied.length !== 0 && provider === null) fail("G15", "S14: a Route-Applied value is exactly provider=<provider id>");
     if (reply.evidence.some((uri) => !isEvidenceUri(uri))) fail("G17", "S18: every Route-Evidence value is an evidence URI");
-    const { carriesPolicy, combined, routes, expectedRefusal } = contextFor(probe);
+    const { carriesPolicy, combined, bound, explicit, routes, qualifies, unknownProvider, expectedRefusal } = contextFor(probe);
+    const hasPreference = combined !== undefined && (combined.sort !== null || combined.order !== null);
     if (carriesPolicy === false && (reply.refused.length > 0 || reply.evidence.length > 0)) fail("G26", "no Route-Refused or Route-Evidence without a policy");
 
     if (reply.refused.length > 0) {
@@ -110,6 +115,19 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
           fail("G2", `the first failure names ${expectedRefusal.key ?? "no key"}`);
         }
         if (parsed.ok && precedence[parsed.value.reason] > precedence[reason]) fail("G29", `${reason} takes precedence over ${parsed.value.reason}`);
+        if (reason === "unsatisfiable" && parsed.ok && parsed.value.reason !== reason && unknownProvider) {
+          fail("G24", "a valid selector containing an unknown provider is not unsupported and cannot make a nonexistent route available");
+        }
+      }
+      if (carriesPolicy === true && parsed.ok && parsed.value.reason === "unsupported" && combined !== undefined) {
+        fail("G21", "advertised support accepts every key and value sent; unsupported is not justified");
+        if (parsed.value.key !== null) fail("G2", "no accepted key can be named as a failing key");
+        if (unknownProvider) fail("G24", "a syntactically valid unknown provider id is not an unsupported value");
+      }
+      if (parsed.ok && parsed.value.reason === "unsatisfiable" && qualifies === true) {
+        fail("G3", "unsatisfiable requires that no published route meet the combined policy");
+        if (hasPreference) fail("G7", "an accepted preference cannot disqualify the matching published routes");
+        if (unknownProvider) fail("G24", "an unknown provider id does not remove the remaining matching routes");
       }
       if (!reply.hasBody) fail("G34", "a refusal has a nonempty error body");
       const references = ordinary.filter((entry) => sameCredential(entry.probe, probe));
@@ -130,15 +148,21 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     const relay = reply.applied.length > 0 || reply.evidence.length > 0 || reply.status < 400;
     if (expectedRefusal !== undefined && (relay || missingRefusal)) {
       fail(expectedRefusal.reason === "unsupported" ? "G1" : "G3", `the policy must be refused as ${expectedRefusal.reason}`);
+      if (unknownProvider && expectedRefusal.reason === "unsatisfiable") fail("G24", "an unknown provider id does not make an excluded route qualify");
     }
     if (!relay || carriesPolicy !== true) continue;
     audit.sawPolicyRelay = true;
     audit.sawPolicyResult = true;
     if (provider === null || (routes !== undefined && !routes.has(provider))) fail("G15", "one valid Route-Applied naming a published provider for this model");
     const route = provider === null ? undefined : routes?.get(provider);
+    if (provider !== null && route != null && bound !== undefined && !meets({ provider, facts: route.facts }, bound)) {
+      fail("G10", "the relayed route must meet the detected key default even in the presence of explicit carriers");
+      if (explicit) fail("G13", "neither explicit carrier can weaken the detected key default");
+    }
     if (combined !== undefined) {
       if (routes !== undefined && (provider === null || route == null || !meets({ provider, facts: route.facts }, combined))) {
         fail("G6", "a named published route with valid facts meets the combined policy");
+        if (hasPreference) fail("G7", "a preference cannot admit a route that fails the combined requirements");
       }
       if (combined.attest.length === 0) {
         if (reply.evidence.length !== 0) fail("G17", "no Route-Evidence when the combined policy does not require attest");

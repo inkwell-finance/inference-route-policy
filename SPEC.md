@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 15.
+Draft 16.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -404,7 +404,12 @@ GET {base}/route-policy
 ```
 
 `{base}` is the API base URL the client already has, the one it
-appends `/models` to. Detection does not require credentials. The reply
+appends `/models` to. A path such as `/route-policy` or `/models` is
+appended to the base URL's path, and a query the base URL has is kept
+on every endpoint: under `https://gateway.example/v1?tenant=east`,
+detection is `https://gateway.example/v1/route-policy?tenant=east`. Two
+base URLs that differ in their query are different base URLs.
+Detection does not require credentials. The reply
 has status `200` and a JSON object as its body:
 
 - `route_policy` is the string `"1"`. It is a string so that no JSON

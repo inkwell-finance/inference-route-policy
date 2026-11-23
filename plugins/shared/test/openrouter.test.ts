@@ -21,6 +21,7 @@ test("C9: only and ignore map to the documented provider filters, and sort and o
   assert.deepEqual(provider("ignore=cobalt"), { ignore: ["cobalt"] });
   assert.deepEqual(provider("sort=throughput+order=basalt,aurora"), { sort: "throughput", order: ["basalt", "aurora"] });
   assert.deepEqual(provider("only=aurora+ignore=cobalt+sort=price"), { only: ["aurora"], ignore: ["cobalt"], sort: "price" });
+  assert.deepEqual(provider("sort=latency"), { sort: "latency" });
 });
 
 test("C9: each requirement with no documented hard filter refuses the whole policy, for its own reason", () => {

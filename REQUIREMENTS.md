@@ -60,7 +60,7 @@ own-error checks of G25.
 | G8  | The model-suffix carrier works: the id resolves as it would without the suffix, and the suffix is applied as a policy. | BB | Carriers |
 | G9  | The `Route-Policy` header carrier works on every inference endpoint. More than one `Route-Policy` field line is refused as `unsupported` with no key. | BB | Carriers |
 | G10 | A key-default policy applies to every request made with that key. | BB | Carriers |
-| G11 | Carriers combine by the Combining table. The header is checked first and the suffix second, each on its own; the first that fails decides the refusal. | BB | Carriers, Combining |
+| G11 | Carriers combine by the Combining table; a black-box check sees this for requirements. The header is checked first and the suffix second, each on its own; the first that fails decides the refusal. | BB | Carriers, Combining |
 | G12 | An empty `region` or `only` intersection is `unsatisfiable`. | BB | Combining |
 | G13 | No request removes or weakens a requirement of its key's policy. | BB | Combining |
 | G14 | The provider receives a body whose top-level object has exactly one `model` member, holding the model id without the suffix, and no `Route-Policy` header. A `model` member elsewhere in the body is forwarded as it came. | WB | Carriers |
@@ -84,7 +84,7 @@ own-error checks of G25.
 | G32 | The published facts are the facts routing uses. | WB | Facts |
 | G33 | A relayed response has the status and the body of the route's response. A refusal never carries a provider's body. | WB | Result |
 | G34 | A refusal's body is an error in the shape the gateway uses for its own errors on that endpoint. | BB | Refusal |
-| G35 | A gateway that tries qualifying routes tries them in order: `order` providers first as listed, then the rest by `sort`, or in the gateway's default order without it. If it tries another after one fails, it is the next in that order. | WB | Keys, Result |
+| G35 | A gateway that tries qualifying routes tries them in order: `order` providers first as listed, then the rest by `sort`, or in the gateway's default order without it, with `sort` and `order` taken from the carriers as the Combining table says. If it tries another after one fails, it is the next in that order. | WB | Keys, Result |
 | G36 | A gateway does not bind to a key a policy that fails the order of checks. | WB | Carriers |
 | G37 | The provider `Route-Applied` names is the one whose response is relayed. | WB | Result |
 | G38 | `key_policy` is present exactly when the request carries credentials whose key has a policy bound, and equals that policy. | WB | Detection |
