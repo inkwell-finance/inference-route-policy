@@ -25,6 +25,7 @@ import {
   parseRefused,
   publishedRoutes,
   readOutcome,
+  someRouteMeets,
   splitModel,
   supports,
   type Facts,
@@ -982,14 +983,81 @@ test("C3, C4: a policy with attest is honored only with exactly one valid Route-
   assert.deepEqual(readOutcome(response([uri], "aurora"), policy("zdr"), routes), { outcome: "honored", provider: "aurora", evidence: null, checked: true });
 });
 
-test("the baseline cannot be changed by a caller", () => {
+test("the baseline cannot be changed by a caller, in any of its three sets", () => {
   const first = baselineSupport();
   (first.attest as Set<string>).add("custom");
+  (first.attest as Set<string>).delete("prompt");
   (first.keys as Set<string>).delete("zdr");
+  (first.sort as Set<string>).delete("throughput");
+  (first.sort as Set<string>).add("custom");
   assert.equal(parsePolicy("attest=custom").ok, false);
-  assert.equal(parsePolicy("zdr").ok, true);
-  assert.equal(baselineSupport().keys.has("zdr"), true);
-  assert.equal(baselineSupport().attest.has("custom"), false);
+  assert.equal(parsePolicy("sort=custom").ok, false);
+  for (const text of ["zdr", "attest=prompt", "sort=throughput"]) assert.equal(parsePolicy(text).ok, true, text);
+  const fresh = baselineSupport();
+  assert.deepEqual([...fresh.keys], ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"]);
+  assert.deepEqual([...fresh.attest], ["weights", "prompt"]);
+  assert.deepEqual([...fresh.sort], ["price", "latency", "throughput"]);
+  // A detection reply that omits a list gets the same untouched defaults.
+  const minimal = parseDetection({ route_policy: "1" });
+  assert.ok(minimal.ok);
+  assert.equal(supports(minimal.value.support, policy("zdr+attest=prompt+sort=throughput")), true);
+});
+
+test("C6: each list a detection reply omits takes its default, whichever others it gives", () => {
+  const cases: [body: Record<string, unknown>, policy: string, cleared: boolean][] = [
+    [{ keys: ["attest", "sort"] }, "attest=prompt", true],
+    [{ keys: ["attest", "sort"] }, "attest=weights+sort=throughput", true],
+    [{ keys: ["attest"], sort: ["price"] }, "attest=weights,prompt", true],
+    [{ keys: ["attest"], attest: ["weights"] }, "attest=prompt", false],
+    [{ attest: ["weights"] }, "zdr+sort=latency", true],
+    [{ attest: ["weights"] }, "attest=prompt", false],
+    [{ sort: ["price"] }, "attest=prompt", true],
+    [{ sort: ["price"] }, "zdr+sort=latency", false],
+    [{ keys: ["zdr"] }, "zdr", true],
+    [{ keys: ["zdr"] }, "attest=prompt", false],
+  ];
+  for (const [body, text, cleared] of cases) {
+    const reply = parseDetection({ route_policy: "1", ...body });
+    assert.ok(reply.ok, JSON.stringify(body));
+    assert.equal(clearedToSend(reply.value.support, [policy(text)]), cleared, `${JSON.stringify(body)} ${text}`);
+  }
+});
+
+test("S5, S12: a flag given a value is not a fact, to a gateway publishing as to a client reading", () => {
+  for (const text of ["zdr=no", "notrain=no", "zdr=no+notrain=no", "zdr=yes", "notrain=1+zdr", "zdr+notrain=0"]) {
+    const published = parsePublishedFacts(text);
+    assert.ok(!published.ok, text);
+    assert.ok(published.key === "zdr" || published.key === "notrain", text);
+    assert.equal(parseFacts(text).ok, false, text);
+  }
+  const first = parsePublishedFacts("zdr=no+notrain=no");
+  assert.ok(!first.ok);
+  assert.equal(first.key, "zdr");
+});
+
+test("S15: the key in Route-Refused fits the key grammar from its first character to its last", () => {
+  for (const key of ["a", "zone7", "a".repeat(16)]) assert.deepEqual(parseRefused(`reason=unsupported+key=${key}`), { ok: true, value: { reason: "unsupported", key } });
+  for (const key of ["7zone", "7", "_a", "-a", "A", "a_b", "a-b", "a.b", "a".repeat(17), "a b", "a+b"]) assert.equal(parseRefused(`reason=unsupported+key=${key}`).ok, false, key);
+});
+
+test("C16: a client holding the model list can tell that no published route meets a policy before sending it", () => {
+  const routes = parseRoutes([
+    { provider: "aurora", facts: "zdr+notrain+bits=8+region=us" },
+    { provider: "basalt", facts: "bits=16+region=ca" },
+    { provider: "broken", facts: "zdr+region=de+bits=0" },
+    { provider: "twice", facts: "zdr+region=fr" },
+    { provider: "twice", facts: "zdr+region=fr" },
+  ]);
+  for (const text of ["zdr", "zdr+region=us", "region=ca", "bits=16", "only=basalt", "ignore=aurora", "sort=price"]) assert.equal(someRouteMeets(routes, policy(text)), true, text);
+  // The sole route in the wrong country, an unpublished provider, and routes that cannot be relied on.
+  for (const text of ["zdr+region=ca", "zdr+bits=16", "attest=weights", "only=nosuch", "region=de", "region=fr", "only=broken", "only=twice"]) {
+    assert.equal(someRouteMeets(routes, policy(text)), false, text);
+  }
+  assert.equal(someRouteMeets(parseRoutes([]), policy("sort=price")), false);
+  assert.equal(someRouteMeets(routes, combinePolicies({ header: policy("region=us"), suffix: policy("region=ca") })), false);
+  const forged: Policy = { ...policy("zdr") };
+  assert.throws(() => someRouteMeets(routes, forged), { name: "TypeError", message: /^policy was not made by/ });
+  assert.throws(() => someRouteMeets(parseRoutes([]), forged), { name: "TypeError", message: /^policy was not made by/ });
 });
 
 test("G11, G13: a requirement that only one carrier states survives, whichever carrier it is", () => {

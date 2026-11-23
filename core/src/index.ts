@@ -630,6 +630,16 @@ export function publishedRoutes(modelList: unknown, model: string): Map<string, 
 }
 
 /**
+ * Whether any route the model list publishes for the model meets the policy (C16): what a client that holds the
+ * list checks before sending a requirement, since a gateway would refuse the request only after receiving it.
+ * `routes` is what `publishedRoutes` returned; a provider it maps to null cannot be relied on and meets nothing.
+ */
+export function someRouteMeets(routes: ReadonlyMap<string, PublishedRoute | null>, policy: Policy): boolean {
+  requirePolicy(policy);
+  return [...routes].some(([provider, published]) => published !== null && meets({ provider, facts: published.facts }, policy));
+}
+
+/**
  * What a response says about the policy a client sent with a requirement (C3, C4, C5). Any `Route-Refused` is a
  * refusal, parsed or not, whatever else is there. Otherwise the policy is honored only by exactly one valid
  * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the model's

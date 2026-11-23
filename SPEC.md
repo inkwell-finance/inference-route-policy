@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 10.
+Draft 11.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -148,8 +148,10 @@ suffix second, each on its own; the first that fails decides the
 refusal.
 
 A gateway MUST remove the suffix and the header before forwarding the
-request to a provider. The provider receives the model id the gateway
-would have sent without a policy, and no `Route-Policy` header.
+request to a provider. The provider receives exactly one `model`
+member, holding the model id the gateway would have sent without a
+policy, and no `Route-Policy` header. No other occurrence of `model`
+from the request body is forwarded.
 
 ## Keys
 
@@ -161,7 +163,11 @@ Requirements decide which routes qualify. There are three kinds, and
 they differ in whom they constrain.
 
 **On everyone who receives the content**: the gateway itself, the
-route's provider, and any party behind either.
+route's provider, and any party behind either. The gateway receives
+the content of every request, including one it then refuses, before it
+knows which route would serve it. So a gateway that publishes one of
+these facts for any route MUST itself meet it for every request it
+receives, served or refused.
 
 | Key       | Valid value | A route qualifies when |
 | --------- | ----------- | ---------------------- |
@@ -257,10 +263,12 @@ port     := an integer from 1 to 65535, no leading zero
 rest     := [A-Za-z0-9._~/?=&-]*
 ```
 
-The last label of the host is not all digits: a host is a name, not an
-address. This is a narrow subset of `https` URIs, chosen so that a
-reader can check one exactly and compare two as strings. Two evidence
-URIs are the same only when they are the same string.
+The last label of the host is not all digits, which keeps
+dotted-decimal addresses out. The grammar is lexical: it says which
+strings are evidence URIs, not how any URL library would resolve one.
+It is a narrow subset of `https` URIs, chosen so that a reader can
+check one exactly and compare two as strings. Two evidence URIs are the
+same only when they are the same string.
 
 A route meets a policy when all of these hold:
 
@@ -304,8 +312,8 @@ informational (1xx) response is not the final response. When a route
 fails, the gateway MAY try another qualifying route; when it does, it
 takes the next in the order the policy's preferences give. Once it has
 committed its final response it MUST NOT move the request to another
-route. How many qualifying routes a gateway tries is its choice,
-including none when it already knows that none can serve.
+route. How many qualifying routes a gateway tries, including none, is
+its choice.
 
 Every request ends in exactly one of these outcomes. They are listed in
 the order a gateway decides them:
@@ -419,11 +427,15 @@ values to check.
 A gateway MUST refuse, as `unsupported`, any key it did not list and
 any `attest` or `sort` value it did not list.
 
-A reply is **valid** when its status is `200` and its body is a JSON
-object whose own members satisfy every rule above, where `key_policy`
-is checked against the reply's lists exactly as given. It is not valid
-when it carries `key_policy` in answer to a request that carried no
-credentials. A client MUST treat anything else, including a
+A reply is **valid** to a client when all of these hold, each of which
+the client can see: its status is `200`; its body is a JSON object;
+`route_policy` is the string `"1"`; `keys`, `attest`, and `sort`, where
+present, are lists whose entries fit the grammar named above; and
+`key_policy`, where present, answers a request that carried credentials
+and passes the order of checks under the reply's lists exactly as
+given. Whether the reply tells the truth, for instance by omitting a
+policy that is bound to the key, is the gateway's obligation and no
+part of validity. A client MUST treat anything else, including a
 reply it cannot fetch, as no detection. Within a valid reply a client
 MUST ignore members it does not know, keys this revision does not
 define, and `attest` and `sort` values this revision does not define.
@@ -460,6 +472,12 @@ reply from that base URL. The reply has to list every key, and every
 on both carriers together, preferences included. Without such a reply
 it does not send the request: no content leaves the client. A request
 whose policies contain only preferences MAY be sent without detection.
+
+Detection says what a gateway accepts, not what its routes meet. A
+client that holds the model list SHOULD NOT send a request whose
+requirements no published route of the model meets: the gateway would
+refuse it as `unsatisfiable`, having received the content, and no
+published fact says how the gateway itself would have handled it.
 
 A client MAY reuse a valid reply for later requests to the same base
 URL with the same credentials, and MUST NOT use it for any other base
