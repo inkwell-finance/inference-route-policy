@@ -1314,3 +1314,82 @@ test("S18: the last label of an evidence URI's host is not all digits", () => {
     assert.equal(isEvidenceUri(`https://${host}:8443/report`), false, host);
   }
 });
+
+test("C16: the pre-send check reads every route until one meets, and stops there", () => {
+  // Routes that cannot be relied on come first; the only one that meets comes last.
+  const routes = parseRoutes([
+    { provider: "broken", facts: "zdr+bits=0" },
+    { provider: "twice", facts: "zdr" },
+    { provider: "twice", facts: "zdr" },
+    { provider: "cobalt", facts: "" },
+    { provider: "aurora", facts: "zdr" },
+  ]);
+  assert.equal(someRouteMeets(routes, policy("zdr")), true);
+  assert.equal(someRouteMeets(routes, policy("zdr+only=aurora")), true);
+  assert.equal(someRouteMeets(routes, policy("zdr+ignore=aurora")), false);
+
+  // Once a route meets, later entries are not read at all.
+  const visited: string[] = [];
+  const counting = new Map(routes);
+  const original = counting[Symbol.iterator].bind(counting);
+  counting[Symbol.iterator] = () => {
+    const iterator = original();
+    const next = iterator.next.bind(iterator);
+    iterator.next = () => {
+      const step = next();
+      if (!step.done) visited.push(step.value[0]);
+      return step;
+    };
+    return iterator;
+  };
+  assert.equal(someRouteMeets(counting, policy("only=cobalt")), true);
+  assert.deepEqual(visited, ["broken", "twice", "cobalt"]);
+});
+
+test("C16: a route meets an attest requirement before sending only when it publishes a valid evidence URI", () => {
+  const uri = "https://basalt.example/attestation";
+  const withEvidence = parseRoutes([{ provider: "basalt", facts: "attest=weights,prompt", evidence: uri }]);
+  const without = parseRoutes([{ provider: "basalt", facts: "attest=weights,prompt" }]);
+  const badUri = parseRoutes([{ provider: "basalt", facts: "attest=weights,prompt", evidence: "bad URI" }]);
+  for (const text of ["attest=prompt", "attest=weights,prompt", "attest=weights+only=basalt"]) {
+    assert.equal(someRouteMeets(withEvidence, policy(text)), true, text);
+    assert.equal(someRouteMeets(without, policy(text)), false, text);
+    assert.equal(someRouteMeets(badUri, policy(text)), false, text);
+  }
+  // Without attest in the policy, evidence plays no part.
+  for (const routes of [withEvidence, without, badUri]) assert.equal(someRouteMeets(routes, policy("only=basalt")), true);
+  // What the check admits, the outcome can confirm; what it turns away, no response could have confirmed.
+  const response = { applied: ["provider=basalt"], refused: [], evidence: [uri] };
+  assert.equal(readOutcome(response, policy("attest=prompt"), withEvidence).outcome, "honored");
+  assert.equal(readOutcome(response, policy("attest=prompt"), without).outcome, "not-honored");
+  assert.equal(readOutcome(response, policy("attest=prompt"), badUri).outcome, "not-honored");
+});
+
+test("C16: the key's bound policy counts toward the pre-send check when the client can interpret it", () => {
+  const routes = parseRoutes([
+    { provider: "slow", facts: "" },
+    { provider: "other", facts: "zdr" },
+  ]);
+  const header = policy("zdr");
+  assert.equal(someRouteMeets(routes, header), true);
+  // The key binds only=slow, and slow does not publish zdr: nothing meets both.
+  const reply = parseDetection({ route_policy: "1", key_policy: "only=slow" });
+  assert.ok(reply.ok);
+  const bound = parsePolicy(reply.value.keyPolicy ?? "", reply.value.support);
+  assert.ok(bound.ok);
+  assert.equal(someRouteMeets(routes, combinePolicies({ key: bound.value, header })), false);
+  assert.equal(someRouteMeets(routes, combinePolicies({ key: bound.value })), true);
+  // A bound policy from a later revision cannot be interpreted, so it plays no part.
+  const newer = parseDetection({ route_policy: "1", keys: ["zdr", "later"], key_policy: "later=slow" });
+  assert.ok(newer.ok);
+  assert.equal(parsePolicy(newer.value.keyPolicy ?? "", newer.value.support).ok, false);
+});
+
+test("C6: a bound policy that repeats a key or an item makes the reply no detection", () => {
+  for (const bound of ["zdr+zdr", "only=a+only=b", "only=a,a", "sort=price+sort=price", "zdr+notrain+zdr"]) {
+    const reply = parseDetection({ route_policy: "1", key_policy: bound });
+    assert.ok(!reply.ok, bound);
+    assert.equal(reply.key, "key_policy", bound);
+  }
+  assert.equal(parseDetection({ route_policy: "1", key_policy: "zdr+notrain" }).ok, true);
+});

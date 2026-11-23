@@ -28,7 +28,7 @@ const ITEM = /^[a-z0-9][a-z0-9_.-]{0,31}$/;
 const BITS = /^[1-9][0-9]?$/;
 const REFUSED = new RegExp(`^reason=(unsupported|unsatisfiable|unavailable)(?:\\+key=(${KEY_SOURCE}))?$`);
 const LABEL = "(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,61}[a-z0-9])";
-// The lookahead keeps the host's last label from being all digits: a host is a name, not an address.
+// The lookahead keeps the host's last label from being all digits, which keeps dotted-decimal addresses out.
 const EVIDENCE = new RegExp(`^https://(?:${LABEL}\\.)*(?![0-9]+(?:[:/]|$))${LABEL}(?::([1-9][0-9]{0,4}))?(?:/[A-Za-z0-9._~/?=&-]*)?$`);
 
 /** A flag (`true`) or a list, as written. */
@@ -630,13 +630,20 @@ export function publishedRoutes(modelList: unknown, model: string): Map<string, 
 }
 
 /**
- * Whether any route the model list publishes for the model meets the policy (C16): what a client that holds the
- * list checks before sending a requirement, since a gateway would refuse the request only after receiving it.
- * `routes` is what `publishedRoutes` returned; a provider it maps to null cannot be relied on and meets nothing.
+ * Whether any one route the model list publishes for the model meets all of the policy (C16): what a client that
+ * holds the list checks before sending a requirement, since a gateway would refuse the request only after
+ * receiving it. `policy` is everything that will reach the request: the policies it carries, combined with the
+ * key's bound policy when the client can interpret it. `routes` is what `publishedRoutes` returned; a provider it
+ * maps to null cannot be relied on and meets nothing. A route meets an `attest` requirement here only when it
+ * also publishes a valid evidence URI, without which the client could not confirm the result.
  */
 export function someRouteMeets(routes: ReadonlyMap<string, PublishedRoute | null>, policy: Policy): boolean {
   requirePolicy(policy);
-  return [...routes].some(([provider, published]) => published !== null && meets({ provider, facts: published.facts }, policy));
+  for (const [provider, published] of routes) {
+    if (published === null || (policy.attest.length > 0 && published.evidence === null)) continue;
+    if (meets({ provider, facts: published.facts }, policy)) return true;
+  }
+  return false;
 }
 
 /**

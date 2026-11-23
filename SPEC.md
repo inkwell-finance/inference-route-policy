@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 11.
+Draft 12.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -148,10 +148,11 @@ suffix second, each on its own; the first that fails decides the
 refusal.
 
 A gateway MUST remove the suffix and the header before forwarding the
-request to a provider. The provider receives exactly one `model`
-member, holding the model id the gateway would have sent without a
-policy, and no `Route-Policy` header. No other occurrence of `model`
-from the request body is forwarded.
+request to a provider. The provider receives a body whose top-level
+object has exactly one `model` member, holding the model id the gateway
+would have sent without a policy, and no `Route-Policy` header. A
+`model` member anywhere else in the body is the caller's data and is
+forwarded as it came.
 
 ## Keys
 
@@ -474,17 +475,24 @@ it does not send the request: no content leaves the client. A request
 whose policies contain only preferences MAY be sent without detection.
 
 Detection says what a gateway accepts, not what its routes meet. A
-client that holds the model list SHOULD NOT send a request whose
-requirements no published route of the model meets: the gateway would
-refuse it as `unsatisfiable`, having received the content, and no
-published fact says how the gateway itself would have handled it.
+client that holds the model list SHOULD NOT send a request when no one
+route that list publishes for the model meets all of its requirements:
+the gateway would refuse it as `unsatisfiable`, having received the
+content. The requirements here are those of the policies the request
+carries, combined with the key's bound policy when detection reported
+one the client can interpret; a bound policy it cannot interpret plays
+no part. A route meets an `attest` requirement for this purpose only
+when it also publishes a valid `evidence` URI, since without one the
+client could not confirm the result.
 
-A client MAY reuse a valid reply for later requests to the same base
-URL with the same credentials, and MUST NOT use it for any other base
-URL or credentials. It MUST discard the reply when a request
-it sent with a requirement comes back not honored, and fetch a new one
-before it sends another requirement there. It SHOULD NOT keep a reply
-from one run of the client to the next.
+A detection reply and a model list each belong to the base URL and
+credentials they were fetched with. A client MAY reuse them for later
+requests to that base URL with those credentials, and MUST NOT use
+either for any other base URL or credentials. It MUST discard the
+detection reply when a request it sent with a requirement comes back
+not honored, and fetch a new one before it sends another requirement
+there. It SHOULD NOT keep either from one run of the client to the
+next.
 
 **Holding a policy.** A client that holds a policy of its own, and
 finds another typed into the model id as a suffix, applies both. Where

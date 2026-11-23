@@ -63,7 +63,7 @@ own-error checks of G25.
 | G11 | Carriers combine by the Combining table. The header is checked first and the suffix second, each on its own; the first that fails decides the refusal. | BB | Carriers, Combining |
 | G12 | An empty `region` or `only` intersection is `unsatisfiable`. | BB | Combining |
 | G13 | No request removes or weakens a requirement of its key's policy. | BB | Combining |
-| G14 | The provider receives exactly one `model` member, holding the model id without the suffix, no other occurrence of `model` from the request body, and no `Route-Policy` header. | WB | Carriers |
+| G14 | The provider receives a body whose top-level object has exactly one `model` member, holding the model id without the suffix, and no `Route-Policy` header. A `model` member elsewhere in the body is forwarded as it came. | WB | Carriers |
 | G15 | Every relayed response to a request a policy reached carries `Route-Applied`, naming a provider id published for the model. | BB | Result |
 | G16 | A gateway may try another qualifying route when one fails before it has committed the status and headers of its final response, and does not move a request to another route after that. A 1xx response is not the final response. | WB | Result |
 | G17 | A relayed response to a request a policy reached carries `Route-Evidence` exactly when the combined policy has `attest`, and its value is the same string as the `evidence` published for the applied route. | BB | Result, Facts |
@@ -108,6 +108,6 @@ own-error checks of G25.
 | C11 | SHOULD | The client tells its user a refusal's reason, and the key when there is one. | Clients |
 | C12 | MUST NOT | Nothing in a `key_policy` the client cannot interpret is relied on. | Detection |
 | C13 | SHOULD | A `key_policy` the client cannot interpret is still shown, as text. | Detection |
-| C14 | MUST | A detection reply is reused only for the same base URL and credentials. It is discarded when a request sent with a requirement comes back not honored, and a new one is fetched before another requirement is sent there. | Clients |
-| C15 | SHOULD NOT | A detection reply is not kept from one run of the client to the next. | Clients |
-| C16 | SHOULD NOT | A client that holds the model list does not send a request whose requirements no published route of the model meets. | Clients |
+| C14 | MUST | A detection reply and a model list are each used only for the base URL and credentials they were fetched with. The detection reply is discarded when a request sent with a requirement comes back not honored, and a new one is fetched before another requirement is sent there. | Clients |
+| C15 | SHOULD NOT | Neither a detection reply nor a model list is kept from one run of the client to the next. | Clients |
+| C16 | SHOULD NOT | A client that holds the model list does not send a request when no one published route of the model meets all of its requirements: those of the policies the request carries, combined with the key's bound policy when detection reported one the client can interpret. A route meets an `attest` requirement for this purpose only when it also publishes a valid `evidence` URI. | Clients |
