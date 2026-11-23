@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 8.
+Draft 9.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -56,6 +56,9 @@ serving one model. A **client** sends requests: a harness, an SDK, a
 plugin, or a script. **Content** is the request and response bodies:
 prompts, tool definitions, outputs. Token counts, timings, digests, and
 a policy carried in the `model` field are not content.
+
+Wherever a JSON object defined here repeats a member name, the last
+occurrence is the member.
 
 ## Syntax
 
@@ -118,7 +121,9 @@ model, and the gateway answers as it does for any unknown model id
 (see [Result](#result)). This carrier works in any
 harness that lets the user type a model id, which is why it exists. A
 gateway SHOULD list the suffixed ids it expects to be popular in its
-model list, so they appear in pickers with their metadata.
+model list, so they appear in pickers with their metadata. Such an
+entry is an alias for display: the model's own entry is the one whose
+`id` has no suffix.
 
 **Header.** `Route-Policy: <policy>` on the inference request. It is
 independent of the API surface and of the request body schema. A
@@ -166,7 +171,7 @@ route's provider, and any party behind either.
 
 | Key      | Valid value | A route qualifies when |
 | -------- | ----------- | ---------------------- |
-| `bits`   | one integer, `1` to `64`, no leading zero | The weights are served at this many bits per parameter or more. A route that does not publish its precision does not qualify. |
+| `bits`   | one integer, `1` to `64`, no leading zero | Every weight of the model is stored, as served, at this many bits or more. A route publishes the lowest precision among its weights, rounded down to an integer, so a model that mixes 4-bit and 12-bit weights publishes `bits=4`. A route that does not publish its precision does not qualify. |
 | `attest` | list drawn from `weights`, `prompt`, each also listed in detection | The model server can produce, for this request, evidence rooted in hardware that the client can verify without trusting the gateway. `weights`: a digest of the weights that served it. `prompt`: digests of the request as the model server received it and of the response as it produced it, bound to the same environment. |
 
 **On the route's provider id**, and on nothing else. These select
@@ -216,9 +221,13 @@ model list, the requirements that route meets, in the same grammar:
 The response to `GET {base}/models` is a JSON object whose `data`
 member is the list of model objects. Each has an `id`, which appears at
 most once in the list, and `routes`, among which a provider id appears
-at most once. To a reader, a model list that is not of that shape, in
-which the model is absent or appears more than once, or in which the
-model's `routes` is not a list, publishes no routes for that model.
+at most once.
+
+A reader looks for the model by its id with no suffix, and only at the
+entries of `data` that are objects with that `id`; whatever else the
+list holds does not concern it. The list publishes no routes for the
+model when `data` is not a list, when no entry or more than one has
+that `id`, or when that entry's `routes` is not a list.
 
 A gateway MUST publish facts that:
 
@@ -383,7 +392,7 @@ GET {base}/route-policy
 
 `{base}` is the API base URL the client already has, the one it
 appends `/models` to. Detection does not require credentials. The reply
-is `200` with a JSON object:
+has status `200` and a JSON object as its body:
 
 - `route_policy` is the string `"1"`. It is a string so that no JSON
   decoder can round another number to it.
@@ -406,12 +415,11 @@ values to check.
 A gateway MUST refuse, as `unsupported`, any key it did not list and
 any `attest` or `sort` value it did not list.
 
-A reply is **valid** when it is a JSON object whose own members satisfy
-every rule above, where `key_policy` is checked against the reply's
-lists exactly as given, and is not valid when it carries `key_policy`
-in answer to a request that carried no credentials. Where the object
-repeats a member name, the last occurrence is the member. A client MUST
-treat anything else, including a
+A reply is **valid** when its status is `200` and its body is a JSON
+object whose own members satisfy every rule above, where `key_policy`
+is checked against the reply's lists exactly as given. It is not valid
+when it carries `key_policy` in answer to a request that carried no
+credentials. A client MUST treat anything else, including a
 reply it cannot fetch, as no detection. Within a valid reply a client
 MUST ignore members it does not know, keys this revision does not
 define, and `attest` and `sort` values this revision does not define.

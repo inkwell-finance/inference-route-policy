@@ -53,8 +53,8 @@ function refusedKey(text: string, support?: Support): string | null {
 /** The routes a model list publishes for its one model, `m`. */
 const parseRoutes = (rows: unknown) => publishedRoutes({ data: [{ id: "m", routes: rows }] }, "m");
 
-/** A detection reply read as the answer to a request that carried credentials. */
-const parseDetection = (body: unknown) => readDetection(body, true);
+/** A detection body read as a 200 reply to a request that carried credentials. */
+const parseDetection = (body: unknown) => readDetection({ status: 200, body, credentialed: true });
 
 test("S1: a policy with every key parses to its meaning", () => {
   assert.deepEqual(policy("zdr+notrain+bits=8+region=us,de+attest=weights,prompt+only=a,b+ignore=c+sort=latency+order=b,a"), {
@@ -1064,17 +1064,103 @@ test("C3: policies that combine to one no route can meet are never honored, with
 
 test("C6, G22: a key policy in a reply to a request without credentials makes the reply no detection", () => {
   const body = { route_policy: "1", key_policy: "zdr" };
-  const withCredentials = readDetection(body, true);
+  const withCredentials = readDetection({ status: 200, body, credentialed: true });
   assert.ok(withCredentials.ok);
   assert.equal(withCredentials.value.keyPolicy, "zdr");
-  const anonymous = readDetection(body, false);
+  const anonymous = readDetection({ status: 200, body, credentialed: false });
   assert.ok(!anonymous.ok);
   assert.equal(anonymous.key, "key_policy");
   // Without the member, an anonymous reply is as valid as any.
-  const plain = readDetection({ route_policy: "1" }, false);
+  const plain = readDetection({ status: 200, body: { route_policy: "1" }, credentialed: false });
   assert.ok(plain.ok);
   assert.equal(plain.value.keyPolicy, null);
   assert.equal(clearedToSend(plain.value.support, [policy("zdr")]), true);
+});
+
+test("C6, G20: only a 200 reply is detection, whatever its body says", () => {
+  const body = { route_policy: "1" };
+  for (const credentialed of [true, false]) {
+    assert.equal(readDetection({ status: 200, body, credentialed }).ok, true);
+    for (const status of [201, 204, 206, 301, 304, 400, 401, 403, 404, 500, 503, 0, 2000, Number.NaN]) {
+      const reply = readDetection({ status, body, credentialed });
+      assert.ok(!reply.ok, String(status));
+      assert.equal(reply.key, null, String(status));
+    }
+  }
+});
+
+test("G23, C4: the model is looked up by its id with no suffix, and a suffixed entry is only an alias", () => {
+  const list = {
+    data: [
+      { id: "m", routes: [{ provider: "p", facts: "zdr" }] },
+      { id: "m+zdr", routes: [{ provider: "p", facts: "notrain" }] },
+      { id: "n", routes: [{ provider: "p", facts: "notrain" }] },
+    ],
+  };
+  const response = { applied: ["provider=p"], refused: [], evidence: [] };
+  for (const requested of ["m", "m+zdr", "m+zdr+sort=price", "m+"]) {
+    assert.deepEqual(publishedRoutes(list, requested).get("p"), { facts: facts("zdr"), evidence: null }, requested);
+    assert.equal(readOutcome(response, policy("zdr"), publishedRoutes(list, requested)).outcome, "honored", requested);
+    assert.equal(readOutcome(response, policy("notrain"), publishedRoutes(list, requested)).outcome, "not-honored", requested);
+  }
+  // The same provider under another model has that model's facts, wherever the model stands in the list.
+  assert.deepEqual(publishedRoutes(list, "n").get("p"), { facts: facts("notrain"), evidence: null });
+  assert.equal(readOutcome(response, policy("zdr"), publishedRoutes(list, "n")).outcome, "not-honored");
+  assert.equal(readOutcome(response, policy("notrain"), publishedRoutes(list, "n+sort=price")).outcome, "honored");
+  // A list holding only the alias publishes no routes for the model.
+  assert.equal(publishedRoutes({ data: [{ id: "m+zdr", routes: [{ provider: "p", facts: "zdr" }] }] }, "m+zdr").size, 0);
+});
+
+test("C4: only the model's own entries decide; whatever else the list holds does not concern the reader", () => {
+  const target = { id: "m", routes: [{ provider: "p", facts: "zdr" }] };
+  const response = { applied: ["provider=p"], refused: [], evidence: [] };
+  const siblings: unknown[][] = [
+    [null, target],
+    [target, "text", 5, []],
+    [{ id: "other", routes: 7 }, target],
+    [{ id: "twin", routes: [] }, { id: "twin", routes: [] }, target],
+    [{ routes: [{ provider: "p", facts: "notrain" }] }, target],
+    [{ id: ["m"], routes: [{ provider: "p", facts: "notrain" }] }, target],
+  ];
+  for (const data of siblings) {
+    assert.equal(readOutcome(response, policy("zdr"), publishedRoutes({ data }, "m")).outcome, "honored", JSON.stringify(data));
+  }
+});
+
+test("S19: a repeated member name reads as its last occurrence, in the model list as in detection", () => {
+  const list: unknown = JSON.parse('{"data":[],"data":[{"id":"x","id":"m","routes":[],"routes":[{"provider":"q","provider":"p","facts":"notrain","facts":"zdr"}]}]}');
+  const routes = publishedRoutes(list, "m");
+  assert.deepEqual([...routes.keys()], ["p"]);
+  assert.deepEqual(routes.get("p"), { facts: facts("zdr"), evidence: null });
+  const reply: unknown = JSON.parse('{"route_policy":"2","route_policy":"1","sort":["price"],"sort":[]}');
+  const detection = parseDetection(reply);
+  assert.ok(detection.ok);
+  assert.equal(detection.value.support.sort.size, 0);
+});
+
+test("G35: explicit order beats rank for the providers it names, and a refusal beats everything", () => {
+  const routes = [
+    { provider: "a", price: 3 },
+    { provider: "b", price: 1 },
+    { provider: "c", price: 2 },
+  ];
+  const ids = (p: string): string =>
+    orderRoutes(routes, policy(p), (route) => route.price)
+      .map((route) => route.provider)
+      .join("");
+  // The order given is the opposite of the price order, and it stands.
+  assert.equal(ids("order=c,b,a+sort=price"), "cba");
+  assert.equal(ids("order=a,c+sort=price"), "acb");
+  assert.equal(ids("order=c,b,a"), "cba");
+  assert.equal(ids("sort=price"), "bca");
+});
+
+test("C5: a refusal of an attest policy is a refusal, although it carries no evidence", () => {
+  const sent = policy("attest=weights,prompt");
+  const refusal = { applied: [], refused: ["reason=unsatisfiable"], evidence: [] };
+  assert.deepEqual(readOutcome(refusal, sent, null), { outcome: "refused", reason: "unsatisfiable", key: null });
+  assert.deepEqual(readOutcome(refusal, sent, publishedRoutes({ data: [] }, "m")), { outcome: "refused", reason: "unsatisfiable", key: null });
+  assert.deepEqual(readOutcome({ applied: ["provider=p"], refused: ["garbage"], evidence: [] }, sent, null), { outcome: "refused", reason: null, key: null });
 });
 
 test("G23, C4: a model list publishes routes for a model only when it has the shape and names the model once", () => {

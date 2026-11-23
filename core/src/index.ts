@@ -483,14 +483,22 @@ function ownList(reply: object, name: string, shape: RegExp, fallback: readonly 
   return entries.every((entry): entry is string => typeof entry === "string" && shape.test(entry)) ? entries : null;
 }
 
+/** A detection reply as the client received it: its status, its body as a JSON decoder returned it, and whether the request carried credentials. */
+export interface DetectionReply {
+  status: number;
+  body: unknown;
+  credentialed: boolean;
+}
+
 /**
- * Reads a detection reply body (SPEC.md, Detection), as a JSON decoder returned it. `credentialed` says whether the
- * detection request carried credentials: a reply that binds a policy to no one is not valid. A reply is valid only
- * when every known member is: anything else is no detection. From a valid one, members, keys, and `attest`/`sort`
- * values this revision does not define are dropped from `support`, since this client cannot use them. Members are
- * read as the object's own, never inherited. The version is a string, so no decoder can round another number to it.
+ * Reads a detection reply (SPEC.md, Detection). A reply is valid only when its status is 200 and every known
+ * member of its body is valid; one that binds a policy to no one, because the request carried no credentials, is
+ * not. Anything else is no detection. From a valid one, members, keys, and `attest`/`sort` values this revision
+ * does not define are dropped from `support`, since this client cannot use them. Members are read as the object's
+ * own, never inherited. The version is a string, so no decoder can round another number to it.
  */
-export function parseDetection(body: unknown, credentialed: boolean): Result<Detection> {
+export function parseDetection({ status, body, credentialed }: DetectionReply): Result<Detection> {
+  if (status !== 200) return fail(null, `status is ${status}, not 200`);
   if (typeof body !== "object" || body === null || Array.isArray(body)) return fail(null, "not a JSON object");
   if (!Object.hasOwn(body, "route_policy") || Reflect.get(body, "route_policy") !== "1") return fail("route_policy", `is not the string "1"`);
   const keys = ownList(body, "keys", KEY, BASELINE_KEYS);
@@ -588,17 +596,20 @@ const ownMember = (value: unknown, name: string): unknown => (typeof value === "
 
 /**
  * Reads, from a model list the client holds, the routes it publishes for one model, by provider id (SPEC.md,
- * Facts). A provider maps to null when it is published but cannot be relied on: it appears more than once, or its
- * facts are invalid. Entries with no usable provider id are skipped, since no `Route-Applied` can name them. The
- * map is empty when the list publishes no routes for the model: it is not a JSON object with a `data` list, the
- * model is absent or appears more than once, or its `routes` is not a list. That is not the same as holding no
- * model list: for that, pass null to `readOutcome` instead of calling this.
+ * Facts). `model` is the model as the request names it: it is looked up by its id with no suffix, among the
+ * entries of `data` that are objects with that `id`, whatever else the list holds. A provider maps to null when it
+ * is published but cannot be relied on: it appears more than once, or its facts are invalid. Entries with no
+ * usable provider id are skipped, since no `Route-Applied` can name them. The map is empty when the list publishes
+ * no routes for the model: `data` is not a list, no entry or more than one has that id, or that entry's `routes`
+ * is not a list. That is not the same as holding no model list: for that, pass null to `readOutcome` instead of
+ * calling this.
  */
-export function publishedRoutes(modelList: unknown, modelId: string): Map<string, PublishedRoute | null> {
+export function publishedRoutes(modelList: unknown, model: string): Map<string, PublishedRoute | null> {
   const byProvider = new Map<string, PublishedRoute | null>();
   const data = ownMember(modelList, "data");
   if (!Array.isArray(data)) return byProvider;
-  const models: unknown[] = Array.from(data).filter((model) => ownMember(model, "id") === modelId);
+  const { id } = splitModel(model);
+  const models: unknown[] = Array.from(data).filter((entry) => ownMember(entry, "id") === id);
   const routes = models.length === 1 ? ownMember(models[0], "routes") : undefined;
   if (!Array.isArray(routes)) return byProvider;
   const entries: unknown[] = Array.from(routes);
