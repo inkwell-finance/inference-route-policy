@@ -105,6 +105,7 @@ export class FakeHarness {
     // The registry's key goes where this API's transport puts it; configured headers then replace or add to it.
     const wire = new Headers({ "content-type": "application/json" });
     if (this.model.api === "anthropic-messages") wire.set("x-api-key", this.wireKey);
+    else if (this.model.api === "google-generative-ai") wire.set("x-goog-api-key", this.wireKey);
     else wire.set("authorization", `Bearer ${this.wireKey}`);
     for (const [name, value] of Object.entries(this.extraWireHeaders)) wire.set(name, value);
     for (const [name, value] of Object.entries(headers)) if (value !== null) wire.set(name, value);

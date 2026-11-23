@@ -12,7 +12,7 @@ import { fetchDetection, fetchModelList, normalizeBase, type DetectionResult, ty
 import { describeHeld, heldFromEnv, holdPolicy, type Held } from "./held.ts";
 import { isOpenRouter } from "./openrouter.ts";
 import { describeReport, interpret, type Report, type Sent } from "./outcome.ts";
-import { authKey, modelIn, type Completion, type Outgoing } from "./request.ts";
+import { contextKey, modelIn, type Completion, type Outgoing } from "./request.ts";
 
 export interface RouteClientOptions {
   carriers: Carriers;
@@ -67,7 +67,7 @@ export class RouteClient {
 
   #fetch: Fetch = (input, init) => (this.#options.fetch ?? globalThis.fetch)(input, init);
 
-  #key = (target: Target): string => `${normalizeBase(target.base)}\n${authKey(target.auth)}`;
+  #key = (target: Target): string => `${normalizeBase(target.base)}\n${target.query}\n${contextKey(target.context)}`;
 
   /** The detection result for a target, fetching it when none is held or in flight. */
   #detection(target: Target): Promise<DetectionResult> {
@@ -165,7 +165,8 @@ export class RouteClient {
       addRelease({
         owner: this,
         base: target.base,
-        auth: target.auth,
+        query: target.query,
+        context: target.context,
         header,
         body,
         current: () => this.isCurrent(prepared),
@@ -187,19 +188,28 @@ export class RouteClient {
    * leave if a policy could be at stake: one is held, or the request carries one, or its model cannot be read.
    */
   check(outgoing: Outgoing): string | null {
-    const base = [...this.#bases].find((b) => outgoing.url.startsWith(`${b}/`));
+    const base = [...this.#bases].find((b) => outgoing.path.startsWith(`${b}/`));
     if (base === undefined) return null;
     const model = modelIn(outgoing.body);
     const atStake = this.held.kind !== "none" || outgoing.header !== null || model === undefined || (model ?? "").includes("+");
-    return atStake ? `this request to ${base} is not one the plugin released: its key, body, or Route-Policy header differs from what was checked, or it was already sent once` : null;
+    if (!atStake) return null;
+    // Names only: the values may be keys.
+    const carried = outgoing.context.map(([name]) => name).join(", ") || "none";
+    return `this request to ${base} is not one the plugin released: its URL, headers (it carries ${carried} besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once`;
   }
 
-  /** Reads the response to one released request (C3, C4, C5). */
+  /**
+   * Reads the response to one released request (C3, C4, C5, C8), in the spec's order: a refusal is a refusal
+   * whatever else holds; a translated request's result is unconfirmed whatever else holds; only then is a
+   * redirect, which the plugin never follows, a policy not honored.
+   */
   #complete(cacheKey: string, sent: Sent, requirement: boolean, completion: Completion): void {
-    const report: Report =
-      completion.status >= 300 && completion.status < 400 && completion.result.refused.length === 0
-        ? { kind: "not-honored", why: `the gateway answered with a redirect (status ${completion.status}), which the plugin does not follow with content` }
-        : interpret(completion.result, sent);
+    const read = interpret(completion.result, sent);
+    const redirected = completion.status >= 300 && completion.status < 400;
+    const redirect = `the gateway answered with a redirect (status ${completion.status}), which the plugin does not follow with content`;
+    let report: Report = read;
+    if (redirected && read.kind === "unconfirmed") report = { kind: "unconfirmed", note: redirect };
+    else if (redirected && read.kind !== "refused" && sent.kind === "protocol" && sent.policy !== null) report = { kind: "not-honored", why: redirect };
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
     if (report.kind === "not-honored" && requirement) this.#discardDetection(cacheKey);
     this.#report(report);

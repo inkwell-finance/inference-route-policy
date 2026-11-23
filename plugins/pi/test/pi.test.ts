@@ -148,6 +148,21 @@ test("C14: pi: requests for one model prepared with different keys at once block
 
 adapterContract("pi", pi, () => gateway);
 
+test("C1: pi: headers prepared for one model are not taken by another model's payload", async () => {
+  const harness = await pi("zdr");
+  await harness.emit("before_provider_headers", { type: "before_provider_headers", headers: {} });
+  harness.model.id = "other-model";
+  const payload = await harness.emit("before_provider_request", { type: "before_provider_request", payload: { model: "other-model", messages: [] } }, "payload");
+  assert.throws(() => JSON.stringify(payload), /did not see this request's headers/);
+});
+
+test("C1, C14: pi: a Google API request carries its key in x-goog-api-key, which the plugin reads detection with and the gate expects", async () => {
+  const harness = await pi("zdr");
+  harness.model.api = "google-generative-ai";
+  assert.ok((await harness.request({ contents: [] })).sent);
+  assert.ok(gateway.requests.filter((r) => r.method === "GET").every((r) => r.headers["x-goog-api-key"] === "demo-key" && r.headers.authorization === undefined));
+});
+
 test("C10: pi: the held policy survives a session resume", async () => {
   const first = await pi("notrain");
   const resumed = new FakeHarness(gateway.base, { headerHook: true });

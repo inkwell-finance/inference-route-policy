@@ -359,7 +359,7 @@ const CASES: readonly Case[] = [
     policy: "zdr",
     fault: "key",
     check: (observed) => [
-      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its key, body, or Route-Policy header differs/),
+      ...expectShown(observed, "notify", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its URL, headers/),
       ...expectNoProviderContent(observed),
     ],
   },

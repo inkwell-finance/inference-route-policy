@@ -5,14 +5,18 @@
  */
 
 import { parseDetection, type Detection } from "../../../core/src/index.ts";
-import type { AuthContext } from "./request.ts";
+import type { RequestContext } from "./request.ts";
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
-/** Where a request goes, and the credential headers it carries there (empty when none). */
+/**
+ * Where a request goes and what identifies its caller there: the base URL without its query, the query every
+ * request there carries, and the request's context (every header but the few known not to identify anyone).
+ */
 export interface Target {
   base: string;
-  auth: AuthContext;
+  query: string;
+  context: RequestContext;
 }
 
 export type DetectionResult = { ok: true; detection: Detection } | { ok: false; why: string };
@@ -21,10 +25,10 @@ export type DetectionResult = { ok: true; detection: Detection } | { ok: false; 
 export const normalizeBase = (base: string): string => base.replace(/\/+$/, "");
 
 function headersFor(target: Target): Record<string, string> {
-  // The same credential headers the request will carry, all of them: whichever the gateway takes the key from,
-  // detection and the model list answer for that key. Detection needs none, but a bound policy is reported only
-  // to its key's holder.
-  return { accept: "application/json", ...Object.fromEntries(target.auth) };
+  // The whole context the request will carry: whichever header or cookie the gateway knows its caller by,
+  // detection and the model list answer for that caller. Detection needs none, but a bound policy is reported
+  // only to its key's holder.
+  return { ...Object.fromEntries(target.context), accept: "application/json" };
 }
 
 async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs: number): Promise<{ status: number; body: unknown }> {
@@ -44,8 +48,8 @@ async function getJson(fetchImpl: Fetch, url: string, target: Target, timeoutMs:
 /** Fetches and reads a detection reply. Anything that is not a valid reply, a failed fetch included, is no detection (C6). */
 export async function fetchDetection(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<DetectionResult> {
   try {
-    const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/route-policy`, target, timeoutMs);
-    const read = parseDetection({ status, body, credentialed: target.auth.length > 0 });
+    const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/route-policy${target.query}`, target, timeoutMs);
+    const read = parseDetection({ status, body, credentialed: target.context.length > 0 });
     return read.ok ? { ok: true, detection: read.value } : { ok: false, why: `detection reply is not valid: ${read.key === null ? "" : `${read.key} `}${read.detail}` };
   } catch (error) {
     return { ok: false, why: `detection could not be fetched: ${error instanceof Error ? error.message : String(error)}` };
@@ -55,7 +59,7 @@ export async function fetchDetection(fetchImpl: Fetch, target: Target, timeoutMs
 /** Fetches the model list as the gateway sent it; `publishedRoutes` reads it. Null when there is no list to hold. */
 export async function fetchModelList(fetchImpl: Fetch, target: Target, timeoutMs: number): Promise<unknown> {
   try {
-    const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/models`, target, timeoutMs);
+    const { status, body } = await getJson(fetchImpl, `${normalizeBase(target.base)}/models${target.query}`, target, timeoutMs);
     return status === 200 && body !== undefined ? body : null;
   } catch {
     return null;

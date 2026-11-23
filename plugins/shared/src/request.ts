@@ -1,38 +1,75 @@
 /**
  * What a request is, as far as a policy decision depends on it, read the same way where the plugin decides and
- * where the request leaves: its authentication context, its policy header, and its body as serialized.
+ * where the request leaves: its URL, its context (every header but a few known not to identify the caller), its
+ * policy header, and its body as serialized.
  */
 
 import type { ResultHeaders } from "../../../core/src/index.ts";
 
 /**
- * Every header a gateway may take a key from. The authentication context is all of them, not one picked out:
- * which one a gateway honors is its business, so metadata is read with the same set the request will carry.
+ * Headers that do not say who is asking, so they are left out of a request's context. Everything else a request
+ * carries (a key in any header, a cookie, a proxy credential, a custom token) is context: the plugin reads
+ * metadata with all of it and lets the request leave only with exactly that.
  */
-const CREDENTIAL_HEADERS: readonly string[] = ["api-key", "authorization", "x-api-key", "x-goog-api-key"];
+const NOT_CONTEXT: readonly string[] = [
+  // Content negotiation: what the client accepts back.
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  // Describe the body, which is bound byte for byte on its own.
+  "content-length",
+  "content-type",
+  // Names the client software; both harnesses set their own.
+  "user-agent",
+  // The policy carrier, bound on its own.
+  "route-policy",
+  // The OpenAI SDK's description of itself and of the attempt, seen on pi's requests (and the timeout on omp's).
+  "x-stainless-arch",
+  "x-stainless-lang",
+  "x-stainless-os",
+  "x-stainless-package-version",
+  "x-stainless-retry-count",
+  "x-stainless-runtime",
+  "x-stainless-runtime-version",
+  "x-stainless-timeout",
+];
 
-/** A request's credential headers, by lowercase name, in a fixed order. Empty when it carries none. */
-export type AuthContext = readonly (readonly [string, string])[];
+/** A request's context: every header it carries but those above, by lowercase name in order. */
+export type RequestContext = readonly (readonly [string, string])[];
 
-export function authOf(headers: Headers): AuthContext {
-  const auth: [string, string][] = [];
-  for (const name of CREDENTIAL_HEADERS) {
-    const value = headers.get(name);
-    if (value !== null) auth.push([name, value]);
-  }
-  return auth;
+export function contextOf(headers: Headers): RequestContext {
+  const context: [string, string][] = [];
+  // Headers iterates lowercase names in order, repeated lines joined into one value.
+  for (const [name, value] of headers) if (!NOT_CONTEXT.includes(name)) context.push([name, value]);
+  return context;
 }
 
-export const authKey = (auth: AuthContext): string => JSON.stringify(auth);
+export const contextKey = (context: RequestContext): string => JSON.stringify(context);
 
-/** Whether a header name is one a credential travels in. */
-export const isCredentialHeader = (name: string): boolean => CREDENTIAL_HEADERS.includes(name.toLowerCase());
+/** Where a request goes: the base URL without its query, and the query, which every request there carries too. */
+export interface Place {
+  base: string;
+  query: string;
+}
+
+/** A base URL as a place, or null when it is not an absolute URL. Trailing slashes are dropped from the path. */
+export function placeOf(baseUrl: string): Place | null {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  return { base: `${url.origin}${url.pathname}`.replace(/\/+$/, ""), query: url.search };
+}
 
 /** A request as it leaves through `fetch`, before anything is sent. */
 export interface Outgoing {
-  url: string;
+  /** The URL without its query. */
+  path: string;
+  query: string;
   method: string;
-  auth: AuthContext;
+  context: RequestContext;
   /** The `Route-Policy` value as it will be sent: repeated lines are joined, and so never equal one released value. */
   header: string | null;
   /** The body as it will be sent, when it is text; null when it is bytes or a stream this reader cannot compare. */
@@ -42,12 +79,14 @@ export interface Outgoing {
 /** Reads a request as it leaves. `init` overrides a `Request` input's headers and body, as `fetch` does. */
 export function outgoingOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): Outgoing {
   const request = input instanceof Request ? input : null;
+  const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
   const headers = new Headers(init?.headers ?? request?.headers);
   const body = init !== undefined && "body" in init ? init.body : request?.body;
   return {
-    url: typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+    path: `${url.origin}${url.pathname}`,
+    query: url.search,
     method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
-    auth: authOf(headers),
+    context: contextOf(headers),
     header: headers.get("route-policy"),
     body: typeof body === "string" ? body : body === undefined || body === null ? "" : null,
   };

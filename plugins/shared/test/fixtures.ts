@@ -54,7 +54,8 @@ export interface Reply {
 /** What the fake gateway answers; a test changes these between requests. */
 export interface FakeGatewayReplies {
   detection: Reply;
-  models: Reply;
+  /** One reply for every caller, or one chosen by the request's headers. */
+  models: Reply | ((headers: IncomingHttpHeaders) => Reply);
   inference: Reply;
 }
 
@@ -79,7 +80,8 @@ export async function fakeGateway(): Promise<FakeGateway> {
     for await (const chunk of request) body += String(chunk);
     const path = request.url ?? "";
     requests.push({ method: request.method ?? "", path, headers: request.headers, body });
-    const reply = path.endsWith("/route-policy") ? replies.detection : path.endsWith("/models") ? replies.models : replies.inference;
+    const models = replies.models;
+    const reply = path.includes("/route-policy") ? replies.detection : path.includes("/models") ? (typeof models === "function" ? models(request.headers) : models) : replies.inference;
     if (reply.delayMs !== undefined) await new Promise((wake) => setTimeout(wake, reply.delayMs));
     response.writeHead(reply.status, { "content-type": "application/json", ...reply.headers });
     response.end(reply.body === undefined ? "" : JSON.stringify(reply.body));

@@ -3,7 +3,8 @@
  *
  * Both harnesses send provider requests through the process's `fetch`, which this wraps once per process. One
  * release table serves every plugin session in the process. A session releases a request by its exact bytes:
- * base URL, authentication context, `Route-Policy` header, and serialized body. A POST that matches exactly one
+ * base URL and query, context (every header but those known not to identify the caller), `Route-Policy`
+ * header, and serialized body. A POST that matches exactly one
  * session's release goes, once: the release is used up, so a harness's resend of the same request is not
  * released again. It goes with redirects off, so a gateway cannot move the body elsewhere, and the response to
  * that very call goes back to the session that released it. A POST no release matches goes untouched unless a
@@ -13,14 +14,15 @@
  * and both harnesses skip their response hook for a non-2xx response, which is how a refusal arrives.
  */
 
-import { authKey, completionOf, outgoingOf, type Completion, type Outgoing } from "./request.ts";
+import { completionOf, contextKey, outgoingOf, type Completion, type Outgoing } from "./request.ts";
 
 /** A request a session let go, as it must leave, and what to do with it. */
 export interface Release {
   /** The session that released it; its responses and stops go there and nowhere else. */
   owner: object;
   base: string;
-  auth: Outgoing["auth"];
+  query: string;
+  context: Outgoing["context"];
   header: string | null;
   body: string;
   /** Whether what the decision relied on still holds at the moment it leaves. */
@@ -45,8 +47,14 @@ const REGISTRY = Symbol.for("inference-route-policy.fetch-gate");
  */
 const RELEASE_TTL_MS = 30_000;
 
+/** A release while it waits. Used or withdrawn, it lets go of the release, and with it the body. */
+interface Entry {
+  release: Release | null;
+  expires: number;
+}
+
 interface Registry {
-  releases: { release: Release; expires: number }[];
+  releases: Entry[];
   watchers: Set<Watcher>;
 }
 
@@ -55,10 +63,18 @@ function isRegistry(value: unknown): value is Registry {
 }
 
 const matches = (release: Release, outgoing: Outgoing): boolean =>
-  outgoing.url.startsWith(`${release.base}/`) &&
+  outgoing.path.startsWith(`${release.base}/`) &&
+  outgoing.query === release.query &&
   outgoing.body === release.body &&
   outgoing.header === release.header &&
-  authKey(outgoing.auth) === authKey(release.auth);
+  contextKey(outgoing.context) === contextKey(release.context);
+
+/** Takes an entry out of the table and lets go of its release. */
+function drop(registry: Registry, entry: Entry): void {
+  entry.release = null;
+  const index = registry.releases.indexOf(entry);
+  if (index >= 0) registry.releases.splice(index, 1);
+}
 
 const tell = (notify: () => void): void => {
   try {
@@ -74,16 +90,18 @@ type Plan = { kind: "pass" } | { kind: "stop"; reason: string } | { kind: "send"
 function plan(registry: Registry, outgoing: Outgoing): Plan {
   try {
     const now = Date.now();
-    registry.releases = registry.releases.filter((entry) => entry.expires > now);
-    const candidates = registry.releases.filter((entry) => matches(entry.release, outgoing)).map((entry) => entry.release);
+    for (const entry of registry.releases.filter((e) => e.expires <= now)) drop(registry, entry);
+    const found = registry.releases.filter((entry) => entry.release !== null && matches(entry.release, outgoing));
+    const candidates = found.flatMap((entry) => (entry.release === null ? [] : [entry.release]));
     const owners = new Set(candidates.map((release) => release.owner));
     if (owners.size > 1) {
       for (const release of candidates) tell(() => release.stopped("two sessions released this same request, so whose it is cannot be told"));
       return { kind: "stop", reason: "two sessions released this same request, so whose it is cannot be told" };
     }
     const [release] = candidates;
-    if (release !== undefined) {
-      registry.releases.splice(registry.releases.findIndex((entry) => entry.release === release), 1);
+    const [entry] = found;
+    if (release !== undefined && entry !== undefined) {
+      drop(registry, entry);
       if (!release.current()) {
         const reason = "the detection reply this request was checked against was discarded before it left; send it again";
         tell(() => release.stopped(reason));
@@ -135,12 +153,9 @@ function install(): Registry {
 /** Adds a release to the process's table. Returns the function that withdraws it, if it is still unused. */
 export function addRelease(release: Release): () => void {
   const registry = install();
-  const entry = { release, expires: Date.now() + RELEASE_TTL_MS };
+  const entry: Entry = { release, expires: Date.now() + RELEASE_TTL_MS };
   registry.releases.push(entry);
-  return () => {
-    const index = registry.releases.indexOf(entry);
-    if (index >= 0) registry.releases.splice(index, 1);
-  };
+  return () => drop(registry, entry);
 }
 
 /** Puts a session's watcher in front of every `fetch`. Returns the function that removes it. */
@@ -153,5 +168,5 @@ export function addWatcher(watcher: Watcher): () => void {
 /** Withdraws every unused release of a session, as when it ends. */
 export function withdrawReleases(owner: object): void {
   const registry = install();
-  registry.releases = registry.releases.filter((entry) => entry.release.owner !== owner);
+  for (const entry of registry.releases.filter((e) => e.release?.owner === owner)) drop(registry, entry);
 }

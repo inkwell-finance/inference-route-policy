@@ -10,13 +10,14 @@
  * payload. Then, at `fetch`, the gate lets a request out only as the plugin released it (see fetch-gate.ts).
  */
 
+import { splitModel } from "../../../core/src/index.ts";
 import type { Decision } from "./decide.ts";
 import { addWatcher, withdrawReleases } from "./fetch-gate.ts";
-import { normalizeBase, type Target } from "./gateway-client.ts";
+import type { Target } from "./gateway-client.ts";
 import { heldFromEntry, heldFromEnv, holdPolicy, type Held, type HeldEntry } from "./held.ts";
 import { OPENROUTER_PROVIDER_APIS } from "./openrouter.ts";
 import { describeReport, isQuiet, type Report } from "./outcome.ts";
-import { authKey, authOf } from "./request.ts";
+import { contextKey, contextOf, placeOf } from "./request.ts";
 import { RouteClient, type Prepared } from "./route-client.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -112,8 +113,10 @@ async function requestOf(ctx: unknown, wire?: Record<string, unknown>): Promise<
     const [name, value] = keyHeader(requestApi, apiKey);
     if (!configured.has(name)) configured.set(name, value);
   }
+  const place = placeOf(typeof authBase === "string" ? authBase : baseUrl);
+  if (place === null) return null;
   return {
-    target: { base: normalizeBase(typeof authBase === "string" ? authBase : baseUrl), auth: authOf(configured) },
+    target: { ...place, context: contextOf(configured) },
     modelId: id,
     api: requestApi,
     configured: configured.get("route-policy"),
@@ -185,7 +188,7 @@ interface Guarded {
   prepared: Prepared;
 }
 
-const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", auth: [] }, generation: 0 } });
+const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", query: "", context: [] }, generation: 0 } });
 
 export interface PluginOptions {
   /** True where `before_provider_headers` lets the plugin set request headers (pi); false where it cannot (omp). */
@@ -358,7 +361,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     const queue = waiting.get(key) ?? [];
     const [first] = queue;
     if (first === undefined) return blockWith("the plugin did not see this request's headers, so it cannot tell which policy they carry");
-    const same = (p: Prepared): boolean => wireOf(p.decision) === wireOf(first.decision) && authKey(p.target.auth) === authKey(first.target.auth);
+    const same = (p: Prepared): boolean => wireOf(p.decision) === wireOf(first.decision) && contextKey(p.target.context) === contextKey(first.target.context);
     if (!queue.every(same)) {
       waiting.delete(key);
       return blockWith("requests for this model were prepared with different policies or keys at once; resend it");
@@ -387,6 +390,11 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
         if (request === null) return blockWith("the harness did not say which model and base URL the request is for");
         if (options.headerHook) return takePrepared(request, payload);
         const model = member(payload, "model");
+        // A suffix the user typed into the selected model is a policy; a payload that names the model without it
+        // (or with another) would drop it, so the two must agree on it before either is trusted.
+        if (typeof model === "string" && splitModel(model).policy !== splitModel(request.modelId).policy) {
+          return blockWith(`the request names the model "${model}" while "${request.modelId}" is selected; the policy typed into one is not in the other`);
+        }
         return { request, prepared: await client.decide(request.target, typeof model === "string" ? model : request.modelId, request.configured) };
       };
       return apply(await withDeadline(work, (why) => blockWith(`the plugin failed: ${why}`)), payload);

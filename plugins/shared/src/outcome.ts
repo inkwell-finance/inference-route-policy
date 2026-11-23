@@ -16,7 +16,8 @@ export type Report =
   | { kind: "served"; provider: string | null }
   | { kind: "refused"; reason: RefusalReason | null; key: string | null }
   | { kind: "not-honored"; why: string }
-  | { kind: "unconfirmed" }
+  /** `note` says what else is known of the response, such as a redirect that was not followed. */
+  | { kind: "unconfirmed"; note?: string }
   | { kind: "blocked"; reason: string };
 
 /** Reads a response's result headers against what was sent (C3, C4, C5, C8). */
@@ -61,7 +62,7 @@ export function describeReport(report: Report): string {
     case "not-honored":
       return `route policy NOT honored: ${report.why}`;
     case "unconfirmed":
-      return "route policy translated into the gateway's own fields; the result is unconfirmed, not applied";
+      return `route policy translated into the gateway's own fields; the result is unconfirmed, not applied${report.note === undefined ? "" : ` (${report.note})`}`;
     case "blocked":
       return `request blocked by the route policy plugin, nothing was sent: ${report.reason}`;
   }

@@ -4,7 +4,7 @@ import type { Decision } from "../src/decide.ts";
 import { addWatcher } from "../src/fetch-gate.ts";
 import type { Target } from "../src/gateway-client.ts";
 import type { Report } from "../src/outcome.ts";
-import type { AuthContext } from "../src/request.ts";
+import type { RequestContext } from "../src/request.ts";
 import { RouteClient, type Prepared } from "../src/route-client.ts";
 import { fakeGateway, type FakeGateway } from "./fixtures.ts";
 
@@ -29,8 +29,8 @@ function client(policy = "zdr", timeoutMs = 2000): { client: RouteClient; report
   return { client: c, reports };
 }
 
-const bearer = (key: string): AuthContext => [["authorization", `Bearer ${key}`]];
-const target = (key: string | null = "k", base = gateway.base): Target => ({ base, auth: key === null ? [] : bearer(key) });
+const bearer = (key: string): RequestContext => [["authorization", `Bearer ${key}`]];
+const target = (key: string | null = "k", base = gateway.base): Target => ({ base, query: "", context: key === null ? [] : bearer(key) });
 
 // Counted by credential: a request an earlier test abandoned on a timeout can still land after `reset`.
 const reads = (path: string, credentials: readonly string[]): number =>
@@ -60,9 +60,9 @@ function release(c: RouteClient, prepared: Prepared): () => Promise<Response> {
   const header = decision.action === "send" ? decision.header : null;
   const body = JSON.stringify({ model: decision.model, messages: [] });
   c.release({ ...prepared, decision }, header, body);
-  const headers = new Headers(Object.fromEntries(prepared.target.auth));
+  const headers = new Headers(Object.fromEntries(prepared.target.context));
   if (header !== null) headers.set("route-policy", header);
-  return async () => fetch(`${prepared.target.base}/chat/completions`, { method: "POST", headers, body });
+  return async () => fetch(`${prepared.target.base}/chat/completions${prepared.target.query}`, { method: "POST", headers, body });
 }
 
 const sendText = async (send: () => Promise<Response>): Promise<void> => {
@@ -131,27 +131,59 @@ test("C14: a detection reply and a model list are kept per base URL and credenti
   blockedFor((await decide(c, target("k2", "http://127.0.0.1:9/v1"))).decision, /127\.0\.0\.1:9\/v1 has no valid detection reply/);
 });
 
-test("C1, C14: metadata is read with the whole authentication context the request carries, and kept by all of it", async () => {
+test("C1, C14: detection and the model list are read with the whole context, and each context gets its own catalog and decision", async () => {
   reset();
-  const { client: c } = client("zdr");
-  const both = (apiKey: string): Target => ({ base: gateway.base, auth: [["authorization", "Bearer a"], ["x-api-key", apiKey]] });
-  await decide(c, both("b"));
-  await decide(c, both("c"));
-  const gets = gateway.requests.filter((r) => r.path.endsWith("/route-policy"));
-  assert.deepEqual(gets.map((r) => [r.headers.authorization, r.headers["x-api-key"]]), [["Bearer a", "b"], ["Bearer a", "c"]], "a different x-api-key is another context, read again");
+  const { client: c } = client("only=aurora");
+  // The same bearer with two cookies: the gateway knows two callers, and shows each its own catalog.
+  const as = (cookie: string): Target => ({ base: gateway.base, query: "", context: [["authorization", "Bearer a"], ["cookie", cookie]] });
+  gateway.replies.models = (headers) => ({
+    status: 200,
+    body: { data: [{ id: "demo-model", routes: [{ provider: headers.cookie === "who=east" ? "aurora" : "cobalt", facts: "" }] }] },
+  });
+  assert.equal((await decide(c, as("who=east"))).decision.action, "send", "aurora is in east's catalog");
+  blockedFor((await decide(c, as("who=west"))).decision, /no route the model list publishes/);
+  for (const path of ["/route-policy", "/models"]) {
+    const gets = gateway.requests.filter((r) => r.path.endsWith(path));
+    assert.deepEqual(gets.map((r) => [r.headers.authorization, r.headers.cookie]), [["Bearer a", "who=east"], ["Bearer a", "who=west"]], `${path} read once per context, with all of it`);
+  }
 });
 
-test("C1, C14: a request leaving with another authentication context than the one it was checked for is stopped at fetch", async () => {
+test("C1, C14: a query string in the base URL is part of where the request goes: read with it, and required on the request", async () => {
+  reset();
+  const { client: c } = client("zdr");
+  const t: Target = { base: gateway.base, query: "?tenant=east", context: bearer("k") };
+  const send = release(c, await decide(c, t));
+  assert.ok(gateway.requests.some((r) => r.path.endsWith("/route-policy?tenant=east")) && gateway.requests.some((r) => r.path.endsWith("/models?tenant=east")));
+  // The same base URL without the query is another place: what was read with the query does not serve it.
+  await decide(c, { ...t, query: "" });
+  assert.equal(gateway.requests.filter((r) => r.path.endsWith("/route-policy")).length, 1, "read again without the query");
+  await sendText(send);
+  assert.ok(gateway.inference()[0]?.path.endsWith("/chat/completions?tenant=east"));
+  release(c, await decide(c, t));
+  const body = JSON.stringify({ model: "demo-model", messages: [] });
+  await assert.rejects(fetch(`${gateway.base}/chat/completions?tenant=west`, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body }), /not one the plugin released/);
+});
+
+test("C1, C14: a request leaving with another context than the one it was checked for is stopped at fetch, and the user is told which headers it carried", async () => {
   reset();
   const { client: c, reports } = client("zdr");
   const prepared = await decide(c, target("demo-key"));
   release(c, prepared);
   const body = JSON.stringify({ model: "demo-model", messages: [] });
-  for (const headers of [{ authorization: "Bearer demo-key-zdr", "route-policy": "zdr" }, { authorization: "Bearer demo-key", "x-api-key": "demo-key-zdr", "route-policy": "zdr" }]) {
+  for (const headers of [
+    { authorization: "Bearer demo-key-zdr", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", "x-api-key": "demo-key-zdr", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", cookie: "session=1", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", "proxy-authorization": "Basic eA==", "route-policy": "zdr" },
+    { authorization: "Bearer demo-key", "x-tenant-token": "t", "route-policy": "zdr" },
+  ]) {
     await assert.rejects(fetch(`${gateway.base}/chat/completions`, { method: "POST", headers, body }), /is not one the plugin released/);
   }
   assert.equal(gateway.inference().length, 0);
-  assert.equal(reports.at(-1)?.kind, "blocked", "the user is told");
+  const last = reports.at(-1);
+  assert.ok(last?.kind === "blocked");
+  assert.match(last.reason, /it carries authorization, x-tenant-token besides the usual ones/);
+  assert.doesNotMatch(last.reason, /demo-key/, "names only, never values");
 });
 
 test("C14: a not-honored result discards the detection reply of its own credential, and only that one", async () => {
@@ -243,6 +275,21 @@ test("C1, C14: a released request answered with a redirect is not followed, is r
   assert.match(last.why, /redirect \(status 307\)/);
   await decide(c, target());
   assert.equal(detectionRequests(), 2);
+});
+
+test("C5, C8: a redirect never outranks a refusal, and a translated request answered with one is still unconfirmed", async () => {
+  reset();
+  const { client: c, reports } = client("only=aurora");
+  const policy = c.held.kind === "policy" ? c.held.policy : assert.fail("held");
+  gateway.replies.inference = { status: 308, headers: { location: `${elsewhere.base}/chat/completions` } };
+  await sendText(release(c, { decision: { action: "translate", model: "vendor/model", provider: { only: ["aurora"] }, sent: policy }, target: target(), generation: 0 }));
+  const translated = reports.at(-1);
+  assert.ok(translated?.kind === "unconfirmed");
+  assert.match(translated.note ?? "", /redirect \(status 308\)/);
+  gateway.replies.inference = { status: 307, headers: { location: `${elsewhere.base}/chat/completions`, "route-refused": "reason=unavailable" } };
+  await sendText(release(c, await decide(c, target())));
+  assert.deepEqual(reports.at(-1), { kind: "refused", reason: "unavailable", key: null });
+  assert.equal(elsewhere.requests.length, 0);
 });
 
 test("C14: failed reads are not kept, so the next request tries again", async () => {

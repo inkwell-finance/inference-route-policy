@@ -31,7 +31,8 @@ function release(overrides: Partial<Release> = {}): { completions: Completion[];
     addRelease({
       owner: overrides.owner ?? seen,
       base: gateway.base,
-      auth: [["authorization", "Bearer k"]],
+      query: "",
+      context: [["authorization", "Bearer k"]],
       header: "zdr",
       body: BODY,
       current: () => true,
@@ -43,14 +44,14 @@ function release(overrides: Partial<Release> = {}): { completions: Completion[];
   return seen;
 }
 
-/** A watcher that stops every POST to the fake gateway no release matched. */
+/** A watcher that stops every POST to the fake gateway's origin that no release matched. */
 function watchAll(): string[] {
   const stops: string[] = [];
-  removals.push(addWatcher({ check: (o) => (o.url.startsWith(gateway.base) ? "not released" : null), stopped: (r) => stops.push(r) }));
+  removals.push(addWatcher({ check: (o) => (o.path.startsWith(new URL(gateway.base).origin) ? "not released" : null), stopped: (r) => stops.push(r) }));
   return stops;
 }
 
-const post = (init: { headers?: RequestInit["headers"]; body?: string; url?: string } = {}): Promise<Response> =>
+const post = (init: { headers?: RequestInit["headers"]; body?: string; url?: string | undefined } = {}): Promise<Response> =>
   fetch(init.url ?? `${gateway.base}/chat/completions`, { method: "POST", headers: init.headers ?? { authorization: "Bearer k", "route-policy": "zdr" }, body: init.body ?? BODY });
 
 test("C1: a POST no release matches fails in fetch, before anything reaches the gateway, when a watcher says a policy is at stake", async () => {
@@ -89,9 +90,13 @@ test("C1, C14: a release whose decision is no longer current is stopped and its 
 test("C1, C9, C14: only the released bytes go: another key, an added credential header, another policy header, or another body is not the release", async () => {
   watchAll();
   release();
-  const variants: { headers?: RequestInit["headers"]; body?: string }[] = [
+  const variants: { headers?: RequestInit["headers"]; body?: string; url?: string }[] = [
     { headers: { authorization: "Bearer other", "route-policy": "zdr" } },
     { headers: { authorization: "Bearer k", "x-api-key": "k2", "route-policy": "zdr" } },
+    { headers: { authorization: "Bearer k", cookie: "session=1", "route-policy": "zdr" } },
+    { headers: { authorization: "Bearer k", "x-tenant-token": "t", "route-policy": "zdr" } },
+    { url: `${gateway.base}/chat/completions?key=1` },
+    { url: `${new URL(gateway.base).origin}/other/chat/completions` },
     { headers: { authorization: "Bearer k", "route-policy": "zdr+notrain" } },
     { headers: { authorization: "Bearer k" } },
     { headers: [["authorization", "Bearer k"], ["route-policy", "zdr"], ["route-policy", "zdr"]] },
@@ -100,6 +105,17 @@ test("C1, C9, C14: only the released bytes go: another key, an added credential 
   ];
   for (const variant of variants) await assert.rejects(post(variant), /not released/, JSON.stringify(variant));
   assert.equal(gateway.requests.length, 0);
+});
+
+test("C1: headers known not to identify the caller may come and go: each of them, on the wire, still matches the release", async () => {
+  const usual = ["accept", "accept-encoding", "accept-language", "content-length", "content-type", "user-agent", "x-stainless-arch", "x-stainless-lang", "x-stainless-os", "x-stainless-package-version", "x-stainless-retry-count", "x-stainless-runtime", "x-stainless-runtime-version", "x-stainless-timeout"];
+  watchAll();
+  for (const name of usual) {
+    const owner = release();
+    // fetch computes content-length itself; any value given here is replaced, so the header is still present.
+    await (await post({ headers: { authorization: "Bearer k", "route-policy": "zdr", [name]: name === "content-length" ? String(BODY.length) : "x" } })).text();
+    assert.equal(owner.completions.length, 1, name);
+  }
 });
 
 test("C1: the release matches whatever form the headers take: an object in any case, an array, or a Headers", async () => {
@@ -149,7 +165,7 @@ test("C3: repeated Route-Applied lines reach the reader as one joined value", as
   assert.deepEqual(owner.completions[0]?.result.applied, ["provider=aurora, provider=basalt"]);
 });
 
-test("C1: a GET is never stopped, and a POST elsewhere is not a watcher's", async () => {
+test("C1: a GET is never stopped, and a POST no watcher claims goes", async () => {
   watchAll();
   await (await fetch(`${gateway.base}/models`)).text();
   await (await post({ url: `${elsewhere.base}/chat/completions` })).text();

@@ -149,6 +149,14 @@ test("C15: omp: the session records the held policy and nothing a gateway said",
 
 adapterContract("omp", omp, () => gateway);
 
+test("C10: omp: a payload that names the selected model without its typed suffix is blocked, not sent with the held policy alone", async () => {
+  const harness = await omp("only=west");
+  harness.model.id = "demo-model+only=east";
+  const result = await harness.request({ model: "demo-model", messages: [] });
+  assert.match(result.error ?? "", /the request names the model "demo-model" while "demo-model\+only=east" is selected/);
+  assert.equal(gateway.inference().length, 0);
+});
+
 test("C10: omp: a request with no model field to carry the policy in is blocked", async () => {
   const harness = await omp("zdr");
   const result = await harness.request({ messages: [] });

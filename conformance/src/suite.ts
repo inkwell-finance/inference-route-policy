@@ -153,7 +153,10 @@ function withoutExplicitPolicy(probe: Probe): Probe {
   return { path: probe.path, ...(raw === undefined ? {} : { raw }), ...(probe.credential === undefined ? {} : { credential: probe.credential }) };
 }
 
-// These statuses can vary between the probe and its control even with the same input.
+const isHttpError = (status: number): boolean => status >= 400 && status < 600;
+const isOwnErrorControl = (reply: Observation): boolean => isHttpError(reply.status) && noResult(reply);
+// Bare rate-limit and service-unavailable responses can be transient. A 503
+// with Route-Refused is a separate, protocol-defined outcome.
 const transientOwnError = (reply: Observation): boolean => noResult(reply) && (reply.status === 429 || reply.status === 503);
 
 function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
@@ -202,7 +205,7 @@ export async function runConformance(options: Options): Promise<Report> {
     const exchange = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
     const { reply } = exchange;
     if (matches(reply)) return reply;
-    if (probe.raw !== undefined && reply.status >= 400 && noResult(reply)) {
+    if (probe.raw !== undefined && isOwnErrorControl(reply)) {
       const plain = withoutExplicitPolicy(probe);
       const control = await observe(plain).catch(() => undefined);
       if (control !== undefined && control.reply.status === reply.status && noResult(control.reply)) {
@@ -289,7 +292,7 @@ export async function runConformance(options: Options): Promise<Report> {
       const probe = metadata("models", current);
       try {
         const reply = await expect(probe, "a successful model list", () => true);
-        if (noResult(reply) && (reply.status === 401 || reply.status === 403 || transientOwnError(reply))) continue;
+        if (isOwnErrorControl(reply)) continue;
         const problem = schemaProblem(reply.body);
         if (problem !== undefined || reply.status < 200 || reply.status >= 300) throw mismatch(probe, reply.received, problem ?? "a successful model list");
         current.models = discover(reply.body, current.detection?.support ?? BASELINE);
@@ -334,18 +337,22 @@ export async function runConformance(options: Options): Promise<Report> {
     // Ordinary-error samples serve both G25 and the final error-shape audit.
     async function ordinaryError(probe: Probe): Promise<Exchange> {
       const sample = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), "an ordinary error response"); });
-      if (sample.reply.status < 400 || !noResult(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
+      if (!isOwnErrorControl(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
       return sample;
     }
     async function compareOwn(before: Exchange, probe: Probe): Promise<void> {
       before.ordinaryControl = true;
-      const { reply } = await ordinaryError(probe);
+      const requirement = `the same ordinary error status ${before.reply.status} as the no-policy control, with no result headers`;
+      const { reply } = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
+      if (!noResult(reply)) throw mismatch(probe, reply.received, requirement);
       if (reply.status === before.reply.status) return;
-      if (transientOwnError(before.reply) || transientOwnError(reply)) {
-        precondition ??= `a stable ordinary error; the two probes returned HTTP ${before.reply.status} and ${reply.status}`;
+      const repeated = await observe(before.probe).catch(() => undefined);
+      if (repeated === undefined || !isOwnErrorControl(repeated.reply) || repeated.reply.status !== before.reply.status) {
+        const last = repeated === undefined ? "no response" : `HTTP ${repeated.reply.status}`;
+        precondition ??= `a stable ordinary error; the two no-policy controls returned HTTP ${before.reply.status} and ${last}`;
         return;
       }
-      throw mismatch(probe, reply.received, `the same ordinary error status ${before.reply.status} as the no-policy control`);
+      throw mismatch(probe, reply.received, requirement);
     }
     await run("G1", "invalid policies are refused, not ignored", async () => {
       if (first === undefined) return needModel;
@@ -620,20 +627,22 @@ export async function runConformance(options: Options): Promise<Report> {
       for (const [plain, policy] of samples) {
         await compareOwn(await ordinaryError(plain), policy);
       }
-      // Absence from /models alone doesn't prove that a model id won't resolve.
-      const unknown = await observe(inference(unknownModel));
-      if (unknown.reply.status === 404 && noResult(unknown.reply)) {
-        await compareOwn(unknown, inference(unknownModel, INVALID_POLICY, INVALID_POLICY));
+      // Catalog absence and an invented credential are not themselves evidence of rejection.
+      const missing: string[] = [];
+      async function compareIfRejected(plain: Probe, policy: Probe, label: string): Promise<void> {
+        const control = await observe(plain).catch(() => undefined);
+        if (control !== undefined && isOwnErrorControl(control.reply)) return compareOwn(control, policy);
+        const observed = control === undefined ? "no response" : `HTTP ${control.reply.status}${noResult(control.reply) ? "" : " with Route-* headers"}`;
+        missing.push(`${label}: no-policy control did not establish an ordinary error (${observed})`);
       }
-      if (first !== undefined) {
+      await compareIfRejected(inference(unknownModel), inference(unknownModel, INVALID_POLICY, INVALID_POLICY), "unknown-model subcase");
+      if (first === undefined) missing.push("bad-credentials subcase: no published base model");
+      else {
         const wrongKey = `route-conformance-invalid-${crypto.randomUUID()}`;
-        const beforeProbe = { ...inference(first.id), credential: { key: wrongKey, header: authHeaderFor(endpoint) } };
-        const before = await observe(beforeProbe);
-        if (before.reply.status === 401 || before.reply.status === 403) {
-          if (!noResult(before.reply)) throw mismatch(beforeProbe, before.reply.received, "a credential error carries no result headers");
-          await compareOwn(before, { ...beforeProbe, policies: [INVALID_POLICY] });
-        }
+        const plain = { ...inference(first.id), credential: { key: wrongKey, header: authHeaderFor(endpoint) } };
+        await compareIfRejected(plain, { ...plain, policies: [INVALID_POLICY] }, "bad-credentials subcase");
       }
+      if (missing.length > 0) return missing.join("; ");
     });
     await run("G26", "ordinary traffic without a policy carries neither refusal nor evidence", async () => {
       if (detection?.keyPolicy !== null || first === undefined) return "a known unbound ordinary credential and a published base model";
@@ -652,7 +661,7 @@ export async function runConformance(options: Options): Promise<Report> {
     for (const credential of unmatched) {
       for (const raw of ["{", '{"model":4}']) {
         const sample = await observe({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) }).catch(() => undefined);
-        if (sample !== undefined && sample.reply.status >= 400 && noResult(sample.reply)) sample.ordinaryControl = true;
+        if (sample !== undefined && isOwnErrorControl(sample.reply)) sample.ordinaryControl = true;
       }
     }
     const audit = auditResults(exchanges.slice(firstExchange), (probe) => resultContext(probe, scopeFor(probe)));

@@ -326,7 +326,7 @@ test("G10 G13 G23: an inaccessible policy-key catalog does not borrow models fro
   const report = await run(t, async (request, transport) => {
     if (new URL(request.url).pathname === "/v1/models" && request.headers.get("authorization") === `Bearer ${policyKey}`) {
       catalogDenied++;
-      return Response.json({ error: { type: "access_denied", message: "no catalog permission" } }, { status: 403 });
+      return Response.json({ error: { type: "access_denied", message: "catalog access requires an entitlement" } }, { status: 402 });
     }
     return good(request, transport);
   });
@@ -383,7 +383,57 @@ test("G25: a model not published in the catalog can still resolve", async (t) =>
     return good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model: resolved }) }), transport);
   }));
   assert.equal(undisclosedRequests, 1);
-  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+  assert.equal(report.failed, 0);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, /unknown-model subcase: no-policy control did not establish an ordinary error \(HTTP 200\)/);
+});
+
+for (const sample of [
+  { label: "unknown model", status: 422 },
+  { label: "unrecognized credential", status: 418 },
+] as const) {
+  for (const defect of [false, true]) test(`G25: ${sample.label} HTTP ${sample.status} ${defect ? "cannot become a policy refusal" : "can remain an ordinary error"}`, async (t) => {
+    const requests: (string | null)[] = [];
+    const report = await run(t, fixture(({ id, auth, header, next }) => {
+      const selected = sample.label === "unknown model" ? id.startsWith("route-conformance-unknown-") : auth?.startsWith("Bearer route-conformance-invalid-");
+      if (!selected) return next();
+      requests.push(header);
+      const mutated = defect && header !== null;
+      const body = { error: { type: "invalid_request_error", message: mutated ? "bad policy" : sample.label } };
+      return mutated
+        ? Response.json(body, { status: 400, headers: { [refusal]: formatRefused("unsupported", "bits") } })
+        : Response.json(body, { status: sample.status });
+    }));
+    assert.deepEqual(requests, [null, "bits=0"]);
+    const verdict = report.checks.find(({ id }) => id === "G25");
+    assert.equal(verdict?.status, defect ? "FAIL" : "PASS");
+    if (defect) assert.match(verdict.detail, /reason=unsupported/);
+    else assert.equal(report.failed, 0);
+  });
+}
+
+test("G25: different ordinary statuses do not establish a violation if the no-policy control changes too", async (t) => {
+  let plain = 0;
+  const report = await run(t, fixture(({ id, header, next }) => {
+    if (!id.startsWith("route-conformance-unknown-")) return next();
+    const status = header === null && plain++ === 0 ? 422 : 409;
+    return Response.json({ error: { type: "invalid_request_error", message: "could not resolve model" } }, { status });
+  }));
+  assert.equal(plain, 2);
+  assert.equal(report.failed, 0);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, /two no-policy controls returned HTTP 422 and HTTP 409/);
+});
+
+test("G25: a stable nonstandard ordinary status is not interchangeable with another ordinary error", async (t) => {
+  const report = await run(t, fixture(({ id, header, next }) => id.startsWith("route-conformance-unknown-")
+    ? Response.json({ error: { type: "invalid_request_error", message: "could not resolve model" } }, { status: header === null ? 422 : 409 })
+    : next()));
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "FAIL");
+  assert.match(verdict.detail, /same ordinary error status 422 as the no-policy control/);
 });
 
 test("G6: pinning a second provider catches a gateway that always uses the first one for only", async (t) => {

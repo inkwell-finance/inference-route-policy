@@ -25,7 +25,7 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     harness.wireKey = "demo-key-zdr";
     const result = await harness.request();
     assert.equal(result.sent, false);
-    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its key, body, or Route-Policy header differs/);
+    assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released: its URL, headers/);
     assert.equal(gateway().inference().length, 0);
     assert.match(notices(harness).at(-1) ?? "", /^request blocked by the route policy plugin, nothing was sent: this request to .* is not one the plugin released/, "the user is told");
     assert.deepEqual(
@@ -44,17 +44,17 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().inference().length, 1);
   });
 
-  test(`C1, C14: ${name}: every credential header the request carries is in the metadata reads and must leave as read`, async () => {
+  test(`C1, C14: ${name}: every header the request carries is in the metadata reads, a cookie and a second key included, and must leave as read`, async () => {
     const harness = await make("zdr");
-    harness.model.headers = { "x-api-key": "demo-key-zdr" };
-    assert.ok((await harness.request()).sent, "bearer and x-api-key both leave as they were read");
+    harness.model.headers = { "x-api-key": "demo-key-zdr", Cookie: "session=east" };
+    assert.ok((await harness.request()).sent, "bearer, x-api-key and cookie all leave as they were read");
     const gets = gateway().requests.filter((r) => r.method === "GET");
-    assert.ok(gets.length > 0 && gets.every((r) => r.headers.authorization === "Bearer demo-key" && r.headers["x-api-key"] === "demo-key-zdr"));
-    // A transport that sends another x-api-key than the one detection was read with is stopped.
+    assert.ok(gets.length > 0 && gets.every((r) => r.headers.authorization === "Bearer demo-key" && r.headers["x-api-key"] === "demo-key-zdr" && r.headers.cookie === "session=east"));
+    // A transport that adds a cookie the metadata was not read with is stopped.
     harness.model.headers = {};
-    harness.extraWireHeaders = { "x-api-key": "demo-key-zdr" };
+    harness.extraWireHeaders = { cookie: "session=west" };
     const result = await harness.request();
-    assert.match(result.error ?? "", /is not one the plugin released/);
+    assert.match(result.error ?? "", /is not one the plugin released: .*it carries authorization, cookie besides the usual ones/);
     assert.equal(gateway().inference().length, 1);
   });
 
@@ -134,8 +134,10 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     const result = await harness.request({ model: "vendor/model", contents: [] });
     assert.match(result.error ?? "", /OpenRouter documents its provider field for openai-completions, openai-responses, anthropic-messages requests, not google-generative-ai/);
     assert.equal(gateway().inference().length, 0);
-    // The Messages API is one of them.
+    // The Chat Completions, Responses, and Messages APIs are the ones.
     harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "anthropic-messages" };
     assert.ok((await harness.request({ model: "vendor/model", messages: [], max_tokens: 1 })).sent);
+    harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-responses" };
+    assert.ok((await harness.request({ model: "vendor/model", input: [] })).sent);
   });
 }
