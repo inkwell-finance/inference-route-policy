@@ -40,7 +40,7 @@ bound by them.
 | S15 | `Route-Refused` is `reason=<unsupported\|unsatisfiable\|unavailable>`, optionally followed by `+key=<key>`, and nothing else. `key` appears only with `unsupported`. | Refusal |
 | S16 | Order of checks: the whole string first (over 512 bytes or over 16 pairs, no key named); then each pair in the order written. The first pair that fails, for any reason, is the offending pair, and its key is named when the key fits the `key` grammar. | Order of checks |
 | S17 | Every provider id a gateway publishes or reports is an `item`. | Keys |
-| S18 | An evidence URI (`evidence`, and the `Route-Evidence` value) is an `https` URI per RFC 3986 with a host, containing no comma, no whitespace, and no character RFC 3986 does not allow. | Facts, Result |
+| S18 | An evidence URI (`evidence`, and the `Route-Evidence` value) fits the `evidence` grammar: `https://`, a lowercase host name, an optional port, an optional path of `[A-Za-z0-9._~/?=&-]`, at most 512 bytes. Two are the same only when they are the same string. | Facts |
 
 ## Gateway (G)
 
@@ -63,12 +63,12 @@ own-error checks of G25.
 | G12 | An empty `region` or `only` intersection is `unsatisfiable`. | BB | Combining |
 | G13 | No request removes or weakens a requirement of its key's policy. | BB | Combining |
 | G14 | The provider receives the model id without the suffix and no `Route-Policy` header. | WB | Carriers |
-| G15 | Every relayed response to a request a policy reached carries `Route-Applied`, naming the provider id of the route whose response it is. | BB | Result |
+| G15 | Every relayed response to a request a policy reached carries `Route-Applied`, naming a provider id published for the model. | BB | Result |
 | G16 | A gateway may try another qualifying route when one fails before it has committed the status and headers of its final response, and does not move a request to another route after that. A 1xx response is not the final response. | WB | Result |
-| G17 | A relayed response to a request a policy reached carries `Route-Evidence` exactly when the combined policy has `attest`, and its value is the `evidence` URI published for the applied route. | BB | Result, Facts |
+| G17 | A relayed response to a request a policy reached carries `Route-Evidence` exactly when the combined policy has `attest`, and its value is the same string as the `evidence` published for the applied route. | BB | Result, Facts |
 | G18 | `Route-Applied`, `Route-Refused`, and `Route-Evidence` headers received from a provider are never passed to the client. | WB | Result |
 | G19 | A refusal carries `Route-Refused` and neither `Route-Applied` nor `Route-Evidence`. A relayed response carries no `Route-Refused`. A response carries at most one field line of each of the three. | BB | Result |
-| G20 | `GET {base}/route-policy` returns 200 and a valid detection reply with `route_policy: 1`, without credentials. | BB | Detection |
+| G20 | `GET {base}/route-policy` returns 200 and a valid detection reply with `route_policy: "1"`, with credentials or without. | BB | Detection |
 | G21 | The gateway refuses, as `unsupported`, any key it did not list and any `attest` or `sort` value it did not list. For `bits`, `region`, `only`, `ignore`, `order` it accepts every valid value of a listed key. | BB | Detection |
 | G22 | `key_policy` is present exactly when the request carries credentials whose key has a policy bound, equals that policy, and passes the order of checks under the reply's own lists. | BB | Detection |
 | G23 | Each model in `GET {base}/models` carries `routes`, each with `provider` (S17) and `facts` (S12), and with `evidence` (S18) when the facts include `attest`. A provider id appears at most once among a model's routes. | BB | Facts |
@@ -85,6 +85,7 @@ own-error checks of G25.
 | G34 | A refusal's body is an error in the shape the gateway uses for its own errors on that endpoint. | BB | Refusal |
 | G35 | A gateway that tries qualifying routes tries them in order: `order` providers first as listed, then the rest by `sort`, or in the gateway's default order without it. If it tries another after one fails, it is the next in that order. | WB | Keys, Result |
 | G36 | A gateway does not bind to a key a policy that fails the order of checks. | WB | Carriers |
+| G37 | The provider `Route-Applied` names is the one whose response is relayed. | WB | Result |
 
 ## Client (C)
 
@@ -95,7 +96,7 @@ own-error checks of G25.
 | C1  | MUST NOT | A request carrying a requirement by the model suffix or the header is not sent to a base URL without a valid detection reply from it that lists every key, and every `attest` and `sort` value, used by every policy the request carries on both carriers together, preferences included. Without one the request is not sent and no content leaves the client. | Clients |
 | C2  | MAY | A request whose policies contain only preferences may be sent without detection. | Clients |
 | C3  | MUST | For a request sent with a requirement, a response with no `Route-Refused` is not honored unless it has exactly one `Route-Applied` value that fits the grammar and, when the policy sent has `attest`, exactly one `Route-Evidence` value that is an evidence URI (S18). A policy that was not honored is not reported as applied. | Clients |
-| C4  | SHOULD | The client checks the provider named against the model list it held when it sent the request, and treats the policy as not honored when the provider is not published for the model or is published more than once, when its published facts are invalid or with the provider id do not meet the requirements sent, or when the policy has `attest` and `Route-Evidence` is not the `evidence` published for that route. | Clients |
+| C4  | SHOULD | The client checks the provider named against the model list it held when it sent the request, and treats the policy as not honored when the provider is not among the routes that list publishes for the model or appears there more than once, when its published facts are invalid or with the provider id do not meet the requirements sent, or when the policy has `attest` and `Route-Evidence` is not the same string as the `evidence` published for that route. A list in which the model is absent, or its `routes` is not a list, publishes no routes for it. | Clients, Facts |
 | C5  | MUST | A response that carries `Route-Refused` is treated as a refusal, even when the value cannot be parsed and whatever else the response carries. | Clients |
 | C6  | MUST | A detection reply that is not valid, or cannot be fetched, is no detection. Where the reply's object repeats a member name, the last occurrence is the member. In a valid reply, unknown members, keys this revision does not define, and `attest` and `sort` values it does not define are ignored. | Detection |
 | C7  | SHOULD NOT | A fact is not presented as verified unless the client verified the evidence itself. | Clients |

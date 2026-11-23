@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 6.
+Draft 7.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -54,8 +54,8 @@ several endpoints. A **provider** is whoever operates an endpoint, and
 has a **provider id** at the gateway. A **route** is one provider
 serving one model. A **client** sends requests: a harness, an SDK, a
 plugin, or a script. **Content** is the request and response bodies:
-prompts, tool definitions, outputs. Token counts, timings, and digests
-are not content.
+prompts, tool definitions, outputs. Token counts, timings, digests, and
+a policy carried in the `model` field are not content.
 
 ## Syntax
 
@@ -215,13 +215,15 @@ model list, the requirements that route meets, in the same grammar:
 
 `routes` is a member of each model object in the response to
 `GET {base}/models`. A provider id appears at most once among a model's
-routes.
+routes. To a reader, a model list in which the model is absent, or its
+`routes` is not a list, publishes no routes for that model.
 
 A gateway MUST publish facts that:
 
 - use only `zdr`, `notrain`, `bits`, `region`, and `attest`, each with
   a value valid for that key (for `attest`, any of `weights` and
-  `prompt`), or are the empty string for a route that meets nothing;
+  `prompt`), or are the empty string for a route that publishes none of
+  the five;
 - hold for every party that key constrains, as [Keys](#keys) defines
   it, including every party behind the route where the key constrains
   them. A gateway behind a route is a provider like any other;
@@ -232,9 +234,19 @@ not depend on which keys or values it accepts in requests.
 
 A route whose facts include `attest` MUST also carry `evidence`: the URI
 of the provider's own evidence for that route (see [Result](#result)).
-An evidence URI is an `https` URI as RFC 3986 defines one, with a host,
-in which a comma is percent-encoded: it contains no comma, no
-whitespace, and no other character RFC 3986 does not allow in a URI.
+An evidence URI has this form and is at most 512 bytes:
+
+```
+evidence := "https://" host (":" port)? ("/" rest)?
+host     := label ("." label)*
+label    := [a-z0-9] | [a-z0-9] [a-z0-9-]{0,61} [a-z0-9]
+port     := [0-9]{1,5}
+rest     := [A-Za-z0-9._~/?=&-]*
+```
+
+This is a narrow subset of `https` URIs, chosen so that a reader can
+check one exactly and compare two as strings. Two evidence URIs are the
+same only when they are the same string.
 
 A route meets a policy when all of these hold:
 
@@ -310,13 +322,14 @@ relayed, and nothing else. What that route meets is in its published
 [facts](#facts). The value holds no comma, so two field lines joined
 into one value never read as one valid value.
 
-`Route-Evidence: <URI>` is the `evidence` URI published for that route:
-where the provider serves its own attestation evidence covering this
-response. The document's format and how to verify it are defined by the
-provider's attestation scheme, not here. The gateway MUST NOT put a
-verdict or summary of its own at that URI or in the header; it points
-at the provider's evidence and nothing else. Because an evidence URI
-has no comma and no whitespace, two joined lines never read as one.
+`Route-Evidence: <URI>` is the `evidence` URI published for that route,
+the same string: where the provider serves its own attestation evidence
+covering this response. The document's format and how to verify it are
+defined by the provider's attestation scheme, not here. The gateway
+MUST NOT put a verdict or summary of its own at that URI or in the
+header; it points at the provider's evidence and nothing else. Because
+an evidence URI has no comma and no whitespace, two joined lines never
+read as one.
 
 A gateway MUST NOT pass a `Route-Applied`, `Route-Refused`, or
 `Route-Evidence` header it received from a provider through to the
@@ -359,7 +372,7 @@ GET {base}/route-policy
 ```
 
 ```json
-{ "route_policy": 1,
+{ "route_policy": "1",
   "keys": ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"],
   "attest": ["weights", "prompt"],
   "sort": ["price", "latency", "throughput"],
@@ -370,7 +383,8 @@ GET {base}/route-policy
 appends `/models` to. Detection does not require credentials. The reply
 is `200` with a JSON object:
 
-- `route_policy` is the integer `1`.
+- `route_policy` is the string `"1"`. It is a string so that no JSON
+  decoder can round another number to it.
 - `keys` lists every key the gateway accepts. Each entry fits the `key`
   grammar. Absent means exactly the nine above.
 - `attest` and `sort` list the values the gateway accepts for those two
@@ -471,12 +485,16 @@ A client SHOULD also check the provider named against the model list
 it held when it sent the request, and treat the policy as not honored
 when any of these holds:
 
-- the provider is not among the routes published for the model, or
-  appears there more than once;
+- the provider is not among the routes that list publishes for the
+  model, or appears there more than once;
 - the facts published for that route are invalid, or with the provider
   id do not meet the requirements it sent;
-- the policy it sent has `attest`, and `Route-Evidence` is not the
-  `evidence` URI published for that route.
+- the policy it sent has `attest`, and `Route-Evidence` is not the same
+  string as the `evidence` published for that route.
+
+A client that held no model list cannot make this check; one that held
+a list which publishes no routes for the model has made it, and the
+provider is not among them.
 
 Honored means the gateway named a route and, for `attest`, said where
 its evidence is. It does not mean anyone verified that evidence, and
@@ -515,10 +533,11 @@ result as **unconfirmed**: it MUST NOT report the policy as applied.
 - **Result headers come from the gateway.** A provider that returns
   `Route-Applied` cannot speak for the gateway, because the gateway
   drops it.
-- `Route-Applied` carries a provider id, and `Route-Refused` a reason
-  and at most one key, which may be one the client sent: up to 16
-  characters of `a-z` and `0-9`. Neither carries anything from the
-  content.
+- `Route-Applied` carries a provider id. `Route-Refused` carries a
+  reason and at most one key: up to 16 characters of `a-z` and `0-9`
+  that the gateway found where a key belongs in a policy, which the
+  client may have written in the header or in the `model` field. Neither
+  header carries anything from the content.
 
 ## Limits
 
@@ -535,18 +554,27 @@ string. The limits are the same at every gateway.
 
 ## Adoption
 
-Each step is useful alone.
+Each step adds to the one before.
 
 1. **No harness change.** The user picks or types a suffixed model id.
+   A harness that knows nothing of this protocol sends the request as
+   typed, without [detection](#detection). That is safe for a suffix
+   holding only preferences. For a suffix holding a requirement it is
+   safe only once someone has checked detection for that base URL and
+   key: the user by hand, or a plugin. Otherwise a gateway that does
+   not implement this protocol may already have the content by the time
+   it answers.
 2. **Static header.** The harness sends `Route-Policy` from its
-   provider configuration.
-3. **Policy picker.** The harness reads detection and facts, offers the
-   choices that exist for the selected model, shows the key's own
-   policy as locked, and displays `Route-Applied`.
+   provider configuration, under the same condition.
+3. **Policy picker.** The harness, or a plugin, runs detection before
+   it sends a requirement, reads facts, offers the choices that exist
+   for the selected model, shows the key's own policy as locked, and
+   displays `Route-Applied`. From this step on the client rules are
+   met.
 4. **Verification.** The harness fetches `Route-Evidence` and verifies
    it.
 
-Steps 2 to 4 do not need the harness's maintainers. A plugin can do
+Steps 3 and 4 do not need the harness's maintainers. A plugin can do
 them wherever the harness lets one rewrite the outgoing request and
 read response headers. A plugin can also serve gateways that have not
 adopted this protocol, by [translation](#clients).

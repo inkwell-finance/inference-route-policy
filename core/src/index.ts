@@ -2,7 +2,9 @@
  * Inference Route Policy: the grammar, the order of checks, the combining rules, and the matching rules of SPEC.md
  * as pure functions. No runtime dependency and no I/O, so gateways and clients share one reading of the spec.
  *
- * Every list and map a function returns is its own: changing it never changes an input or another result.
+ * A `Policy` or `Facts` value exists only as this library's parser made it: frozen, and remembered. Every function
+ * that takes one refuses a look-alike built by hand, so no caller can hand the matcher a value the parser would
+ * have refused.
  */
 
 import { COUNTRIES } from "./countries.ts";
@@ -15,17 +17,21 @@ const BASELINE_SORT: readonly string[] = ["price", "latency", "throughput"];
 
 /** Keys whose presence restricts which routes qualify. `sort` and `order` only order them. */
 const REQUIREMENT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore"];
+/** The keys a route's facts may carry. */
+const FACT_KEYS: readonly string[] = ["zdr", "notrain", "bits", "region", "attest"];
 /** Keys a route's facts may never carry, because they are not facts. */
-const NOT_FACTS: Readonly<Record<string, true>> = { only: true, ignore: true, sort: true, order: true };
+const NOT_FACTS: readonly string[] = ["only", "ignore", "sort", "order"];
 
 const KEY_SOURCE = "[a-z][a-z0-9]{0,15}";
 const KEY = new RegExp(`^${KEY_SOURCE}$`);
 const ITEM = /^[a-z0-9][a-z0-9_.-]{0,31}$/;
 const BITS = /^[1-9][0-9]?$/;
 const REFUSED = new RegExp(`^reason=(unsupported|unsatisfiable|unavailable)(?:\\+key=(${KEY_SOURCE}))?$`);
+const LABEL = "(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,61}[a-z0-9])";
+const EVIDENCE = new RegExp(`^https://${LABEL}(?:\\.${LABEL})*(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/?=&-]*)?$`);
 
 /** A flag (`true`) or a list, as written. */
-export type Value = true | readonly string[];
+type Value = true | readonly string[];
 
 /** What a gateway accepts, as its detection reply states it. */
 export interface Support {
@@ -40,26 +46,24 @@ export function baselineSupport(): Support {
 }
 
 export interface Policy {
-  zdr: boolean;
-  notrain: boolean;
-  bits: number | null;
-  region: readonly string[] | null;
-  attest: readonly string[];
-  only: readonly string[] | null;
-  ignore: readonly string[];
-  sort: string | null;
-  order: readonly string[] | null;
+  readonly zdr: boolean;
+  readonly notrain: boolean;
+  readonly bits: number | null;
+  readonly region: readonly string[] | null;
+  readonly attest: readonly string[];
+  readonly only: readonly string[] | null;
+  readonly ignore: readonly string[];
+  readonly sort: string | null;
+  readonly order: readonly string[] | null;
 }
 
 export interface Facts {
-  zdr: boolean;
-  notrain: boolean;
-  bits: number | null;
-  region: readonly string[] | null;
+  readonly zdr: boolean;
+  readonly notrain: boolean;
+  readonly bits: number | null;
+  readonly region: readonly string[] | null;
   /** May hold items this revision does not define, read from a gateway on a later one. They match nothing here. */
-  attest: readonly string[];
-  /** Well-formed keys this revision does not define, read from a gateway on a later one. Carried, never matched. */
-  other: ReadonlyMap<string, Value>;
+  readonly attest: readonly string[];
 }
 
 export interface Failure {
@@ -72,6 +76,21 @@ export interface Failure {
 export type Result<T> = { ok: true; value: T } | Failure;
 
 const fail = (key: string | null, detail: string): Failure => ({ ok: false, key, detail });
+
+/** Every `Policy` and `Facts` this library has made. Membership is what makes a value one. */
+const made = new WeakSet<object>();
+
+/** Freezes a value this library just built, lists included, and remembers it. */
+function make<T extends Policy | Facts>(value: T): T {
+  for (const field of Object.values(value)) if (Array.isArray(field)) Object.freeze(field);
+  made.add(Object.freeze(value));
+  return value;
+}
+
+/** Throws unless `value` is a `Policy` or `Facts` this library made. A look-alike could hold what the parser refuses. */
+function requireMade(value: unknown, what: string): void {
+  if (typeof value !== "object" || value === null || !made.has(value)) throw new TypeError(`${what} was not made by this library's parser`);
+}
 
 /**
  * Walks a policy or facts string in the spec's order of checks (S16): the whole-string limits, then each pair as
@@ -163,7 +182,7 @@ export function parsePolicy(text: string, support: Support = baselineSupport()):
   };
   return {
     ok: true,
-    value: {
+    value: make({
       zdr: pairs.has("zdr"),
       notrain: pairs.has("notrain"),
       bits: pairs.has("bits") ? bitsOf(pairs.get("bits")!) : null,
@@ -173,20 +192,20 @@ export function parsePolicy(text: string, support: Support = baselineSupport()):
       ignore: list("ignore") ?? [],
       sort: list("sort")?.[0] ?? null,
       order: list("order"),
-    },
+    }),
   };
 }
 
 const listPair = (key: string, items: readonly string[]): string => `${key}=${items.join(",")}`;
 
 /**
- * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when no string says exactly what
- * the policy says: it says nothing, an intersection left `region` or `only` empty, a list is over a limit, or a
- * field holds something its key does not allow, such as an item with a comma in it, which would read back as two.
- * A combined policy is a decision and need not be writable (SPEC.md, Combining), so a client that must send one
- * checks here first.
+ * The policy as a string that is valid on a carrier, keys in a fixed order. Fails when there is no such string:
+ * the policy says nothing, an intersection left `region` or `only` empty, or a union is over a limit. A combined
+ * policy is a decision and need not be writable (SPEC.md, Combining), so a client that must send one checks here
+ * first.
  */
 export function formatPolicy(policy: Policy): Result<string> {
+  requireMade(policy, "policy");
   const out: string[] = [];
   if (policy.zdr) out.push("zdr");
   if (policy.notrain) out.push("notrain");
@@ -199,25 +218,12 @@ export function formatPolicy(policy: Policy): Result<string> {
   if (policy.order !== null) out.push(listPair("order", policy.order));
   const text = out.join("+");
   const parsed = parsePolicy(text);
-  if (!parsed.ok) return parsed;
-  // Joining can change meaning without breaking the grammar, so the string must read back as the same policy.
-  const same = (a: readonly string[] | null, b: readonly string[] | null): boolean => (a === null || b === null ? a === b : a.length === b.length && a.every((item, i) => item === b[i]));
-  const read = parsed.value;
-  const unchanged =
-    read.zdr === policy.zdr &&
-    read.notrain === policy.notrain &&
-    read.bits === policy.bits &&
-    read.sort === policy.sort &&
-    same(read.region, policy.region) &&
-    same(read.attest, policy.attest) &&
-    same(read.only, policy.only) &&
-    same(read.ignore, policy.ignore) &&
-    same(read.order, policy.order);
-  return unchanged ? { ok: true, value: text } : fail(null, "holds a value that does not read back as written");
+  return parsed.ok ? { ok: true, value: text } : parsed;
 }
 
 /** The keys a policy uses, for checking them against a detection reply. */
 export function keysOf(policy: Policy): string[] {
+  requireMade(policy, "policy");
   const keys: string[] = [];
   if (policy.zdr) keys.push("zdr");
   if (policy.notrain) keys.push("notrain");
@@ -272,9 +278,10 @@ function intersection(lists: readonly (readonly string[] | null)[]): string[] | 
  */
 export function combinePolicies(layers: { key?: Policy; header?: Policy; suffix?: Policy }): Policy {
   const bySpecificity = [layers.suffix, layers.header, layers.key].filter((p) => p !== undefined);
+  for (const layer of bySpecificity) requireMade(layer, "policy");
   const bits = bySpecificity.map((p) => p.bits).filter((b) => b !== null);
   const order = bySpecificity.find((p) => p.order !== null)?.order ?? null;
-  return {
+  return make({
     zdr: bySpecificity.some((p) => p.zdr),
     notrain: bySpecificity.some((p) => p.notrain),
     bits: bits.length > 0 ? Math.max(...bits) : null,
@@ -284,20 +291,18 @@ export function combinePolicies(layers: { key?: Policy; header?: Policy; suffix?
     ignore: union(bySpecificity.map((p) => p.ignore)),
     sort: bySpecificity.find((p) => p.sort !== null)?.sort ?? null,
     order: order === null ? null : [...order],
-  };
+  });
 }
 
 /**
- * Reads a route's facts as a client must (S13). The empty string is a route that meets nothing. Fails on invalid
- * facts: outside the grammar or limits, an invalid value for `zdr`, `notrain`, `bits`, or `region`, or a key that
- * can never be a fact. The caller then treats the route as meeting no policy that has a requirement. A well-formed
- * key this revision does not define is kept in `other`, and an unknown `attest` item is kept in `attest`; neither
- * is ever matched, since this reader cannot have required it.
+ * Reads a facts string. As a client reads one (S13), a key this revision does not define and an `attest` item it
+ * does not define are let through and match nothing; as a gateway publishes one (S12), they are failures. Either
+ * way the string fails when it is outside the grammar or limits, gives `zdr`, `notrain`, `bits`, or `region` an
+ * invalid value, gives `attest` no list, or carries a key that is never a fact.
  */
-export function parseFacts(text: string): Result<Facts> {
-  const facts: Facts = { zdr: false, notrain: false, bits: null, region: null, attest: [], other: new Map() };
-  if (text === "") return { ok: true, value: facts };
-  const other = new Map<string, Value>();
+function readFacts(text: string, publishing: boolean): Result<Facts> {
+  const facts: { -readonly [K in keyof Facts]: Facts[K] } = { zdr: false, notrain: false, bits: null, region: null, attest: [] };
+  if (text === "") return { ok: true, value: make(facts) };
   const failure = walk(text, (key, value) => {
     switch (key) {
       case "zdr":
@@ -313,45 +318,39 @@ export function parseFacts(text: string): Result<Facts> {
         return facts.region === null ? fail(key, "takes a list of assigned ISO 3166-1 alpha-2 codes") : null;
       case "attest":
         if (value === true) return fail(key, "takes a list");
+        if (publishing && !value.every((item) => BASELINE_ATTEST.includes(item))) return fail(key, "holds an attest value this revision does not define");
         facts.attest = value;
         return null;
       default:
-        if (Object.hasOwn(NOT_FACTS, key)) return fail(key, "is not a fact");
-        other.set(key, value);
-        return null;
+        return NOT_FACTS.includes(key) || publishing ? fail(key, "is not a fact") : null;
     }
   });
-  if (failure !== null) return failure;
-  facts.other = other;
-  return { ok: true, value: facts };
+  return failure === null ? { ok: true, value: make(facts) } : failure;
 }
 
 /**
- * Checks a facts string a gateway is about to publish (S12): everything `parseFacts` checks, and nothing beyond the
- * five fact keys, with only the `attest` values this revision defines. What a gateway may publish does not depend
- * on which keys it accepts in requests.
+ * Reads a route's facts as a client must (S13). The empty string is a route that publishes no fact. On failure the
+ * facts are invalid, and the caller treats the route as meeting no policy that has a requirement.
  */
-export function parsePublishedFacts(text: string): Result<Facts> {
-  const parsed = parseFacts(text);
-  if (!parsed.ok) return parsed;
-  const unknownAttest = parsed.value.attest.find((item) => !BASELINE_ATTEST.includes(item));
-  if (unknownAttest !== undefined) return fail("attest", `"${unknownAttest}" is not an attest value`);
-  const [unknownKey] = parsed.value.other.keys();
-  return unknownKey === undefined ? parsed : fail(unknownKey, "is not a fact a gateway may publish");
-}
+export const parseFacts = (text: string): Result<Facts> => readFacts(text, false);
 
 /**
- * Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met, and neither is a `region`
- * fact that lists no country: it publishes nowhere the content is processed, which proves nothing.
+ * Checks a facts string a gateway is about to publish (S12): only the five fact keys, with only the `attest`
+ * values this revision defines. What a gateway may publish does not depend on which keys it accepts in requests.
  */
+export const parsePublishedFacts = (text: string): Result<Facts> => readFacts(text, true);
+
+/** Whether a route meets a policy (SPEC.md, Facts). A fact that is absent is not met. */
 export function meets(route: { provider: string; facts: Facts }, policy: Policy): boolean {
   const { provider, facts } = route;
+  requireMade(facts, "facts");
+  requireMade(policy, "policy");
   if (policy.zdr && !facts.zdr) return false;
   if (policy.notrain && !facts.notrain) return false;
   if (policy.bits !== null && (facts.bits === null || facts.bits < policy.bits)) return false;
   if (policy.region !== null) {
     const allowed = policy.region;
-    if (facts.region === null || facts.region.length === 0 || !facts.region.every((country) => allowed.includes(country))) return false;
+    if (facts.region === null || !facts.region.every((country) => allowed.includes(country))) return false;
   }
   if (!policy.attest.every((item) => facts.attest.includes(item))) return false;
   if (policy.only !== null && !policy.only.includes(provider)) return false;
@@ -363,6 +362,7 @@ export function meets(route: { provider: string; facts: Facts }, policy: Policy)
  * policy's `sort`, or as given when it has none. Ties keep the given order.
  */
 export function orderRoutes<T extends { provider: string }>(routes: readonly T[], policy: Policy, rank: (route: T, sort: string) => number): T[] {
+  requireMade(policy, "policy");
   const first = (policy.order ?? []).flatMap((id) => routes.filter((route) => route.provider === id));
   const rest = routes.filter((route) => !first.includes(route));
   const sort = policy.sort;
@@ -377,17 +377,11 @@ export function orderRoutes<T extends { provider: string }>(routes: readonly T[]
 export const isProviderId = (id: unknown): id is string => typeof id === "string" && ITEM.test(id);
 
 /**
- * Whether a value is an evidence URI (S18): an `https` URI per RFC 3986 with a host and no comma. The authority and
- * the rest are held to the characters RFC 3986 allows in each (brackets only in the authority, one `#` at most,
- * `%` only before two hex digits), and the URL parser then judges what a character class cannot, such as an
- * unclosed IP literal or a bad port.
+ * Whether a value is an evidence URI (S18), by the spec's own grammar: `https://`, a lowercase host name, an
+ * optional port, and an optional path and query from a fixed set of characters, in at most 512 bytes. The form is
+ * narrow so that this check is exact and two evidence URIs can be compared as strings.
  */
-export function isEvidenceUri(uri: unknown): uri is string {
-  if (typeof uri !== "string") return false;
-  const parts = /^https:\/\/([A-Za-z0-9\-._~:@!$&'()*+;=%[\]]+)([/?#][A-Za-z0-9\-._~:/?#@!$&'()*+;=%]*)?$/.exec(uri);
-  if (parts === null || /%(?![0-9A-Fa-f]{2})/.test(uri) || uri.split("#").length > 2) return false;
-  return URL.canParse(uri) && new URL(uri).hostname !== "";
-}
+export const isEvidenceUri = (uri: unknown): uri is string => typeof uri === "string" && uri.length <= LIMITS.policyBytes && EVIDENCE.test(uri);
 
 /**
  * The `Route-Applied` value for the route whose response is relayed (S14). Throws on a provider id that is not an
@@ -457,14 +451,14 @@ function ownList(reply: object, name: string, shape: RegExp, fallback: readonly 
 }
 
 /**
- * Reads a detection reply body (SPEC.md, Detection). A reply is valid only when every known member is: anything
- * else is no detection. From a valid one, members, keys, and `attest`/`sort` values this revision does not define
- * are dropped from `support`, since this client cannot use them. Members are read as the object's own, never
- * inherited.
+ * Reads a detection reply body (SPEC.md, Detection), as a JSON decoder returned it. A reply is valid only when
+ * every known member is: anything else is no detection. From a valid one, members, keys, and `attest`/`sort`
+ * values this revision does not define are dropped from `support`, since this client cannot use them. Members are
+ * read as the object's own, never inherited. The version is a string, so no decoder can round another number to it.
  */
 export function parseDetection(body: unknown): Result<Detection> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return fail(null, "not a JSON object");
-  if (!Object.hasOwn(body, "route_policy") || Reflect.get(body, "route_policy") !== 1) return fail("route_policy", "is not 1");
+  if (!Object.hasOwn(body, "route_policy") || Reflect.get(body, "route_policy") !== "1") return fail("route_policy", `is not the string "1"`);
   const keys = ownList(body, "keys", KEY, BASELINE_KEYS);
   const attest = ownList(body, "attest", ITEM, BASELINE_ATTEST);
   const sort = ownList(body, "sort", ITEM, BASELINE_SORT);
@@ -515,7 +509,7 @@ export function formatDetection(support: Support, keyPolicy: string | null = nul
     if (!bound.ok) throw new RangeError(`key policy "${keyPolicy}" fails the order of checks: ${bound.detail}`);
   }
   return {
-    route_policy: 1,
+    route_policy: "1",
     keys: [...support.keys],
     attest: [...support.attest],
     sort: [...support.sort],
@@ -542,7 +536,7 @@ export interface ResultHeaders {
 
 export type Outcome =
   | { outcome: "refused"; reason: RefusalReason | null; key: string | null }
-  /** `checked` is false when the client had no model list to compare the route's published facts with (C4). */
+  /** `checked` is false when the client held no model list to compare the route's published facts with (C4). */
   | { outcome: "honored"; provider: string; evidence: string | null; checked: boolean }
   | { outcome: "not-honored"; why: string };
 
@@ -554,14 +548,15 @@ export interface PublishedRoute {
 }
 
 /**
- * Reads the `routes` member of one model from a gateway's model list (SPEC.md, Facts), by provider id. A provider
- * maps to null when it is published but cannot be relied on: it appears more than once, or its facts are invalid.
- * Entries with no usable provider id are skipped, since no `Route-Applied` can name them. Returns null when the
- * model has no `routes` list at all.
+ * Reads the `routes` member of one model in a model list the client holds (SPEC.md, Facts), by provider id. A
+ * provider maps to null when it is published but cannot be relied on: it appears more than once, or its facts are
+ * invalid. Entries with no usable provider id are skipped, since no `Route-Applied` can name them. A member that
+ * is not a list publishes no routes, which is not the same as holding no model list: for that, pass null to
+ * `readOutcome` instead of calling this.
  */
-export function parseRoutes(routes: unknown): Map<string, PublishedRoute | null> | null {
-  if (!Array.isArray(routes)) return null;
+export function parseRoutes(routes: unknown): Map<string, PublishedRoute | null> {
   const byProvider = new Map<string, PublishedRoute | null>();
+  if (!Array.isArray(routes)) return byProvider;
   const entries: unknown[] = Array.from(routes);
   for (const entry of entries) {
     if (typeof entry !== "object" || entry === null) continue;
@@ -581,11 +576,13 @@ export function parseRoutes(routes: unknown): Map<string, PublishedRoute | null>
  * What a response says about the policy a client sent with a requirement (C3, C4, C5). Any `Route-Refused` is a
  * refusal, parsed or not, whatever else is there. Otherwise the policy is honored only by exactly one valid
  * `Route-Applied` and, when `sent` has `attest`, exactly one valid `Route-Evidence`. `routes` is the model's
- * published routes as the client held them when it sent the request, or null when it held none: with them, the
- * named provider must be published exactly once, with valid facts that meet `sent`, and with the `evidence` URI
- * the response gave; without them, only the provider-id requirements can be checked.
+ * published routes from the model list the client held when it sent the request, or null when it held no model
+ * list: with them, the named provider must be published exactly once, with valid facts that meet `sent`, and with
+ * an `evidence` URI equal, as a string, to the one the response gave; without them, only the provider-id
+ * requirements can be checked.
  */
 export function readOutcome(headers: ResultHeaders, sent: Policy, routes: ReadonlyMap<string, PublishedRoute | null> | null): Outcome {
+  requireMade(sent, "policy");
   if (headers.refused.length > 0) {
     const parsed = headers.refused.length === 1 ? parseRefused(headers.refused[0]!) : null;
     return parsed?.ok ? { outcome: "refused", ...parsed.value } : { outcome: "refused", reason: null, key: null };
