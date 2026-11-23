@@ -1,6 +1,6 @@
 # Inference Route Policy
 
-Draft 1.
+Draft 2.
 
 One short string that lets a client tell an inference gateway which
 endpoints may serve a request and how to choose among them: no data
@@ -45,15 +45,17 @@ it.
 
 ## Conventions
 
-The key words MUST, MUST NOT, SHOULD, and MAY are used as described in
-RFC 2119 and RFC 8174, and only when they appear in capitals.
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are used as
+described in RFC 2119 and RFC 8174, and only when they appear in
+capitals.
 
 A **gateway** accepts inference requests and forwards each to one of
-several endpoints. A **provider** is whoever operates an endpoint. A
-**route** is one provider serving one model. A **client** sends
-requests: a harness, an SDK, a plugin, or a script. **Content** is the
-request and response bodies: prompts, tool definitions, outputs. Token
-counts, timings, and digests are not content.
+several endpoints. A **provider** is whoever operates an endpoint, and
+has a **provider id** at the gateway. A **route** is one provider
+serving one model. A **client** sends requests: a harness, an SDK, a
+plugin, or a script. **Content** is the request and response bodies:
+prompts, tool definitions, outputs. Token counts, timings, and digests
+are not content.
 
 ## Syntax
 
@@ -66,23 +68,39 @@ list   := item ("," item)*
 item   := [a-z0-9][a-z0-9_.-]{0,31}
 ```
 
-- Every character is safe unquoted in JSON, YAML, TOML, HTTP header
-  values, URL path segments, and the common shells. Nothing needs
-  escaping, in any carrier. There is no whitespace anywhere in a
-  policy.
+- The alphabet is `a-z`, `0-9`, and `+ = , . _ -`. None of these needs
+  escaping inside a JSON, YAML, or TOML string, in an HTTP field value,
+  in a URL path segment, or as one word in a POSIX shell. A policy is
+  still a string to its container: it is quoted wherever that container
+  quotes strings. In a URL query, `+` is percent-encoded.
+- There is no whitespace anywhere in a policy.
 - A key with no `=` is a flag. A flag states a requirement by being
   present. There is no way to write its absence; leave it out.
-- A key with a dot is a vendor extension, such as `acme.tier=2`. The
-  part before the dot names the vendor. Keys without a dot are defined
-  only by this document.
+- A key with a dot is a [vendor key](#vendor-keys). Keys without a dot
+  are defined only by this document.
 - A key appears at most once in a policy, and an item at most once in
   a list.
-- **A policy is honored whole or refused whole.** A gateway that meets
-  a key it does not accept, a value it does not accept, a repeated key
-  or item, a string over a [limit](#limits), or anything outside this
-  grammar MUST refuse the request (see [Refusal](#refusal)). A
-  requirement added in a later revision therefore never turns into "no
-  requirement" on an older gateway.
+
+**A policy is honored whole or refused whole.** A gateway that is sent
+a policy it cannot honor in full MUST refuse the request (see
+[Refusal](#refusal)). A requirement added in a later revision therefore
+never turns into "no requirement" on an older gateway.
+
+### Order of checks
+
+A gateway checks a policy in this order. The first failure decides the
+refusal and whether it names a key:
+
+1. **The whole string.** It is longer than 512 bytes, or has more than
+   16 pairs (more than 15 `+`). No key is named.
+2. **Each pair, in the order written.** For each: its grammar, then
+   whether its key repeats an earlier one, then whether the gateway
+   accepts the key, then whether it accepts the value. The first pair
+   that fails is the offending pair. Its key is named when the key
+   itself matches the `key` grammar, and not otherwise.
+
+A list with more than 16 items, or with a repeated item, is a grammar
+failure of its pair.
 
 ## Carriers
 
@@ -92,27 +110,34 @@ The same string travels three ways.
 
 ```
 model := id "+" policy
+id    := one or more characters, none of them "+"
 ```
 
-The gateway splits the `model` field at its first `+`, resolves the id
-as it would have without the suffix, and applies the rest as a policy.
-A `model` field with a `+` and nothing valid after it is refused like
-any other malformed policy. This carrier works in any harness that lets
-the user type a model id, which is why it exists. A gateway SHOULD list
-the suffixed ids it expects to be popular in its model list, so they
-appear in pickers with their metadata.
+A `model` field that contains `+` is always read this way: the gateway
+splits it at its first `+`, resolves the id as it would have without
+the suffix, and applies the rest as a policy. If the id is empty the
+suffix is malformed and no key is named. This carrier works in any
+harness that lets the user type a model id, which is why it exists. A
+gateway SHOULD list the suffixed ids it expects to be popular in its
+model list, so they appear in pickers with their metadata.
 
 **Header.** `Route-Policy: <policy>` on the inference request. It is
 independent of the API surface and of the request body schema. A
-request with more than one `Route-Policy` header is refused as
-malformed.
+request with more than one `Route-Policy` field line is malformed and
+no key is named. The check is on field lines as received, before
+repeated lines are joined into one value; a gateway deployed behind a
+component that joins them MUST have that component refuse such
+requests or pass the lines through unjoined.
 
 **Key default.** A gateway MAY bind a policy to an API key, which is
-what an account setting in a web console is. [Detection](#detection)
-reports it to the holder of the key.
+what an account setting in a web console is. It MUST NOT bind a policy
+it would refuse. [Detection](#detection) reports the bound policy to
+the holder of the key.
 
 When more than one reaches a request, all of them apply; see
-[Combining](#combining).
+[Combining](#combining). The gateway checks the header first and the
+suffix second, each on its own; the first that fails decides the
+refusal.
 
 A gateway MUST remove the suffix and the header before forwarding the
 request to a provider. The provider receives the model id the gateway
@@ -120,42 +145,75 @@ would have sent without a policy, and no `Route-Policy` header.
 
 ## Keys
 
-Requirements decide which routes qualify. A route qualifies when every
-requirement holds for **every party that receives the content**,
-including the gateway itself and any further gateway behind it.
+A gateway accepts a pair when it lists the pair's key in
+[detection](#detection) and the value is valid for that key as the
+tables below say. Anything else is a key or a value it does not accept.
 
-| Key       | Value | A route qualifies when |
-| --------- | ----- | ---------------------- |
-| `zdr`     | flag | No party keeps any content after the response ends. Retention for abuse review counts as retention. |
-| `notrain` | flag | No party uses the content to train or tune a model. |
-| `bits`    | one integer, `1` to `64`, no leading zero | The weights are served at this many bits per parameter or more. A route that does not publish its precision does not qualify. |
-| `region`  | list of ISO 3166-1 alpha-2 codes, lowercase | Content is processed only in listed countries. A route that does not publish where it processes content does not qualify. |
-| `attest`  | list of `weights`, `prompt` | The route can produce, for this request, evidence rooted in hardware that the client can verify without trusting the gateway. `weights`: a digest of the weights that served it. `prompt`: digests of the request as the model server received it and of the response as it produced it, bound to the same environment. |
-| `only`    | list of provider ids | Its provider is listed. |
-| `ignore`  | list of provider ids | Its provider is not listed. |
+Requirements decide which routes qualify. There are three kinds, and
+they differ in whom they constrain.
+
+**On everyone who receives the content**: the gateway itself, the
+route's provider, and any party behind either.
+
+| Key       | Valid value | A route qualifies when |
+| --------- | ----------- | ---------------------- |
+| `zdr`     | flag | None of them keeps any content after the response ends. Retention for abuse review counts as retention. |
+| `notrain` | flag | None of them uses the content to train or tune a model. |
+| `region`  | list of officially assigned ISO 3166-1 alpha-2 codes, lowercase | All of them process the content only in listed countries. A route that does not publish where content is processed does not qualify. |
+
+**On the model server**, the machine that runs the weights.
+
+| Key      | Valid value | A route qualifies when |
+| -------- | ----------- | ---------------------- |
+| `bits`   | one integer, `1` to `64`, no leading zero | The weights are served at this many bits per parameter or more. A route that does not publish its precision does not qualify. |
+| `attest` | list drawn from `weights`, `prompt`, each also listed in detection | The model server can produce, for this request, evidence rooted in hardware that the client can verify without trusting the gateway. `weights`: a digest of the weights that served it. `prompt`: digests of the request as the model server received it and of the response as it produced it, bound to the same environment. |
+
+**On the route's provider id**, and on nothing else. These select
+routes by name and say nothing about other parties.
+
+| Key      | Valid value | A route qualifies when |
+| -------- | ----------- | ---------------------- |
+| `only`   | list of provider ids | Its provider id is listed. |
+| `ignore` | list of provider ids | Its provider id is not listed. |
 
 Preferences order the routes that qualify. They never make a route
 qualify or disqualify it.
 
-| Key     | Value | Meaning |
-| ------- | ----- | ------- |
-| `sort`  | one of `price`, `latency`, `throughput` | `price`: lowest expected charge for this request. `latency`: shortest time to the first output token. `throughput`: most output tokens per second. How a gateway measures these is its own business. Absent means the gateway's default order. |
+| Key     | Valid value | Meaning |
+| ------- | ----------- | ------- |
+| `sort`  | one of `price`, `latency`, `throughput`, also listed in detection | `price`: lowest expected charge for this request. `latency`: shortest time to the first output token. `throughput`: most output tokens per second. How a gateway measures these is its own business. Absent means the gateway's default order. |
 | `order` | list of provider ids | Try these first, in this order, then the rest by `sort`. |
 
-A value of the wrong shape for its key (a list where a flag is defined,
-a flag where a value is defined, two values where one is defined, an
-integer out of range) is a value the gateway does not accept.
+A value of the wrong shape for its key is not valid: a list where a
+flag is defined, a flag where a list is defined, two items where one is
+defined, an integer out of range, a two-letter code that ISO 3166-1 has
+not officially assigned (`eu` and `uk` are not).
 
-Provider ids are the gateway's own and are published in its model list.
-They are not portable between gateways. An id the gateway does not know
-is not an error: in `only` it matches no route, and in `ignore` and
-`order` it has no effect.
-
-A vendor key is accepted only by a gateway that defines it. Every other
-gateway refuses it.
+Every provider id a gateway publishes or reports is an `item`. Provider
+ids are the gateway's own and are not portable between gateways. An id
+the gateway does not know is valid and is not an error: in `only` it
+matches no route, and in `ignore` and `order` it has no effect.
 
 Choosing between models is out of scope. A policy picks among routes of
 the model the request names.
+
+### Vendor keys
+
+A vendor key, such as `acme.tier=2`, is defined by the gateway that
+lists it in detection, and by no one else. Every other gateway refuses
+it. The part before the dot names the vendor.
+
+- A vendor key is always a requirement, never a preference.
+- The gateway defines which values it accepts. Any other value is one
+  it does not accept.
+- A route meets a vendor requirement only if its published facts carry
+  the same key, and then as the gateway's rule for that key says.
+- The gateway defines how two carriers' values for the key combine.
+  Where it defines no rule, the two values MUST be identical, the same
+  items in the same order, or the request is refused as `unsupported`
+  naming the key.
+- A client cannot check a vendor value against detection. It MAY send
+  any value that fits the grammar for a vendor key the gateway lists.
 
 ## Facts
 
@@ -166,67 +224,104 @@ model list, the requirements that route meets, in the same grammar:
 { "id": "example-model",
   "routes": [
     { "provider": "aurora", "facts": "zdr+notrain+bits=8+region=us" },
-    { "provider": "basalt", "facts": "bits=16+region=us,de+attest=weights,prompt" },
+    { "provider": "basalt", "facts": "bits=16+region=us,de+attest=weights,prompt",
+      "evidence": "https://basalt.example/attestation" },
     { "provider": "cobalt", "facts": "" }
   ] }
 ```
 
 `routes` is a member of each model object in the response to
-`GET {base}/models`. `facts` uses the policy grammar, restricted to
-`zdr`, `notrain`, `bits`, `region`, `attest`, and vendor keys, and it
-MAY be the empty string for a route that meets nothing.
+`GET {base}/models`.
+
+A gateway MUST publish facts that:
+
+- use only `zdr`, `notrain`, `bits`, `region`, `attest`, and vendor
+  keys it defines, each with a value valid for that key, or are the
+  empty string for a route that meets nothing;
+- hold for every party the key constrains, including every party behind
+  the route. A gateway behind a route is a provider like any other;
+- are the facts its routing uses.
+
+A route whose facts include `attest` MUST also carry `evidence`: the
+URI of the provider's own evidence for that route (see
+[Result](#result)).
 
 A route meets a policy when all of these hold:
 
-- each flag in the policy is in its facts;
+- each of `zdr` and `notrain` that the policy has is in the route's
+  facts;
 - if the policy has `bits`, the route has `bits` and it is at least the
   policy's;
 - if the policy has `region`, the route has `region` and every country
-  in it is in the policy's;
+  in the route's is in the policy's;
 - every item in the policy's `attest` is in the route's;
-- its provider is in the policy's `only`, if there is one, and not in
-  its `ignore`.
+- its provider id is in the policy's `only`, if there is one, and not
+  in its `ignore`;
+- every vendor requirement is met as [Vendor keys](#vendor-keys) says.
 
-A fact that is absent is not met. A client MUST ignore fact keys it
-does not know: a fact it does not know cannot be one it required.
+A fact that is absent is not met.
+
+A reader of facts, such as a client, MUST treat a route as meeting
+nothing when its facts are malformed or contain `only`, `ignore`,
+`sort`, or `order`. It MUST ignore any other well-formed key it does
+not know: a fact it does not know cannot be one it required.
 
 Facts let a client show which choices exist before sending anything.
 Prices and measured speed are not facts and are not defined here.
 
 ## Result
 
-A gateway that supports this protocol MUST add `Route-Applied` to every
-response that a route produced for a request a policy reached, by any
-carrier:
+A gateway relays a route's response, or it refuses. A route **fails**
+when the gateway decides, before relaying any byte of that route's
+response body, not to relay its response: on a connection error, a
+timeout, or a status the gateway treats as retryable. Which conditions
+count is the gateway's choice. When a route fails, the gateway MAY try
+another qualifying route. It MUST NOT move a request to another route
+after relaying any byte of a response body.
+
+Every request ends in exactly one of these outcomes:
+
+| Outcome | Status | `Route-Applied` | `Route-Refused` | `Route-Evidence` |
+| ------- | ------ | --------------- | --------------- | ---------------- |
+| No policy reached the request, by any carrier. | As without this protocol | MAY | MUST NOT | MUST NOT |
+| A policy reached it and was refused before routing. | 400 | MUST NOT | MUST: `unsupported` or `unsatisfiable` | MUST NOT |
+| A policy reached it, routes qualify, and every one tried failed. | 503 | MUST NOT | MUST: `unavailable` | MUST NOT |
+| A policy reached it and a qualifying route's response is relayed. | The route's | MUST, naming that route | MUST NOT | MUST if the combined policy has `attest`, else MUST NOT |
+
+A relayed response is never rewritten as a refusal, and a refusal never
+carries a provider's body.
+
+```
+applied := "provider=" item ("+" facts)?
+```
 
 ```
 Route-Applied: provider=aurora+zdr+notrain+bits=8+region=us
 ```
 
-It is `provider=<id>` followed by that route's facts, joined by `+`
-when the facts are not empty. It MUST be final before the first byte of
-the body. A gateway MAY try another qualifying route when one fails
-before that point, and MUST NOT move a request to another route after
-it.
+`Route-Applied` names the provider id of the route whose response is
+relayed, followed by that route's published facts when they are not
+empty. It is final before the first byte of the body.
 
-When `attest` was required, the gateway MUST also send
-`Route-Evidence: <URI>`, where the evidence for this response can be
-fetched. The document's format and how to verify it are defined by the
-provider's attestation scheme, not here. The gateway passes evidence
-through and MUST NOT summarize it as a verdict.
+`Route-Evidence: <URI>` is the `evidence` URI published for that route:
+where the provider serves its own attestation evidence covering this
+response. The document's format and how to verify it are defined by the
+provider's attestation scheme, not here. The gateway MUST NOT put a
+verdict or summary of its own at that URI or in the header; it points
+at the provider's evidence and nothing else.
 
 A gateway MUST NOT pass a `Route-Applied`, `Route-Refused`, or
 `Route-Evidence` header it received from a provider through to the
-client as its own, except as [Chains](#security) allows.
-
-A client that sent requirements and receives a response with no
-`Route-Applied` MUST treat the policy as not honored. A client SHOULD
-check that the reported provider and facts meet the requirements it
-sent, and treat a mismatch the same way.
+client. These headers are the gateway's own, always.
 
 ## Refusal
 
 A gateway MUST NOT serve a request outside its policy. It refuses with:
+
+```
+refused := "reason=" reason ("+key=" key)?
+reason  := "unsupported" | "unsatisfiable" | "unavailable"
+```
 
 ```
 Route-Refused: reason=unsupported+key=bits
@@ -234,16 +329,19 @@ Route-Refused: reason=unsupported+key=bits
 
 | `reason`        | Status | Meaning |
 | --------------- | ------ | ------- |
-| `unsupported`   | 400 | The policy is malformed, over a [limit](#limits), or has a key or value the gateway does not accept. `key` names the first such key when the offending pair has a well-formed one, and is absent otherwise. |
-| `unsatisfiable` | 400 | No route of this model meets the policy. Retrying does not help. |
-| `unavailable`   | 503 | Routes meet the policy, but none can serve right now. The gateway MUST NOT fall back to one that does not. |
+| `unsupported`   | 400 | A carrier is malformed (a repeated `Route-Policy` line, an empty id before a suffix), a policy that reached the request failed the [order of checks](#order-of-checks), or two carriers' vendor values could not be combined. `key` is present exactly when a key is named. |
+| `unsatisfiable` | 400 | No route of this model meets the combined policy. Retrying does not help. `key` is never present. |
+| `unavailable`   | 503 | Routes meet the combined policy, and every one the gateway tried failed. The gateway MUST NOT fall back to one that does not meet it. `key` is never present. |
+
+A request that could be refused for more than one reason is refused for
+the first in the order above.
 
 An `unsupported` or `unsatisfiable` request is refused before any
 content is sent to any provider. An `unavailable` request has sent
-content only to routes that meet the policy.
+content only to routes that meet the combined policy.
 
 The response body is whatever error shape the API surface normally
-uses. A refused response has no `Route-Applied`.
+uses.
 
 ## Detection
 
@@ -260,32 +358,37 @@ GET {base}/route-policy
 ```
 
 `{base}` is the API base URL the client already has, the one it
-appends `/models` to. The reply is `200` with a JSON object in which
-`route_policy` is the integer `1`.
+appends `/models` to. Detection does not require credentials. The reply
+is `200` with a JSON object:
 
-- `keys` lists the keys the gateway accepts, vendor keys included. A
-  reply without `keys` means exactly the nine above.
-- `attest` and `sort` list the values the gateway accepts for those
-  keys. A reply without them means exactly the lists above.
+- `route_policy` is the integer `1`.
+- `keys` lists every key the gateway accepts, vendor keys included.
+  Each entry fits the `key` grammar. Absent means exactly the nine
+  above.
+- `attest` and `sort` list the values the gateway accepts for those two
+  keys. Each entry fits the `item` grammar. Absent means exactly the
+  lists above.
 - Those three default lists are fixed and do not grow in later
   revisions, so a client that wants something newer checks for it and
   falls back.
-- `key_policy` appears only when the request carries credentials whose
-  key has a policy bound to it, and is that policy.
-- Clients MUST ignore members they do not understand.
+- `key_policy` is present only when the request carries credentials
+  whose key has a policy bound to it, and is that policy. It is valid
+  under the reply's own lists.
 
-Detection does not require credentials. A gateway MUST refuse, as
-`unsupported`, any key or value it did not list.
+For `bits`, `region`, `only`, `ignore`, and `order`, listing the key
+means accepting every value that is valid for it; there is no list of
+values to check. For a vendor key, listing it says nothing about which
+values are accepted.
 
-A gateway that does not implement this protocol ignores the header and
-may resolve a suffixed model id in ways this document cannot predict.
-So:
+A gateway MUST refuse, as `unsupported`, any key it did not list and
+any `attest` or `sort` value it did not list.
 
-- A client MUST NOT send a policy that contains a requirement to a base
-  URL unless it has received a valid detection reply from that base URL
-  listing every key and value the policy uses.
-- A client MAY send a policy that contains only preferences without
-  detection.
+A reply is **valid** when it is a JSON object whose own members satisfy
+every rule above. A client MUST treat anything else, including a reply
+it cannot fetch, as no detection. Within a valid reply a client MUST
+ignore members it does not know, keys without a dot that this revision
+does not define, and `attest` and `sort` values this revision does not
+define.
 
 ## Combining
 
@@ -299,30 +402,75 @@ requirements accumulate and can only narrow:
 | `region`, `only` | The intersection of those present. An empty intersection is `unsatisfiable`. |
 | `attest`, `ignore` | The union. |
 | `sort`, `order` | The most specific wins: suffix, then header, then key default. |
-| vendor keys | As the vendor defines. Without a defined rule, the same vendor key arriving by two carriers with different values is `unsupported`. |
+| vendor keys | As [Vendor keys](#vendor-keys) says. |
 
-No request can remove a requirement its key carries. Each carrier's
-policy is parsed and checked on its own first; if any is refused, the
-request is refused.
+No request can remove or weaken a requirement its key carries.
+
+A gateway combines the policies it parsed. The combined policy is a
+decision, not a string: it need not fit the [limits](#limits) or the
+grammar, and a gateway never has to write it down.
+
+## Clients
+
+**Before sending.** A client MUST NOT send a policy that contains a
+requirement by a carrier of this protocol (the model suffix or the
+header) to a base URL unless it holds a valid [detection](#detection)
+reply from that base URL that lists every key the policy uses and
+every `attest` and `sort` value it uses. Without one, it does not send
+the request: no content leaves the client. A policy that contains only
+preferences MAY be sent without detection.
+
+**Holding a policy.** A client that holds a policy of its own, and
+finds another typed into the model id as a suffix, applies both. Where
+it can use both carriers, it sends its own by the header and leaves the
+suffix as typed. Where it can use only one, it combines the two as
+[Combining](#combining) says, with the typed suffix as the more
+specific, and sends the result. If the result cannot be written as a
+valid policy, because an intersection is empty or a limit is exceeded,
+the client MUST NOT send the request and MUST NOT send a weaker policy
+in its place.
+
+**Reading the result.** For a request it sent with a requirement, a
+client MUST treat the policy as **not honored** when the response has
+no `Route-Applied` and no `Route-Refused`: it MUST NOT report the
+policy as applied, to its user or to code that asks. It SHOULD check
+that the provider and facts in `Route-Applied` meet the requirements it
+sent, and treat a mismatch the same way. A response with
+`Route-Refused` is a refusal even when the client cannot parse the
+value; a client SHOULD tell its user the reason and the key.
+
+**Claims.** A client SHOULD NOT present a fact as verified unless it
+verified the evidence for it itself.
+
+**Translation.** A client MAY serve a gateway that has not adopted this
+protocol by translating a policy into that gateway's own request
+fields. Translation uses no carrier of this protocol, so the rule
+under "Before sending" does not apply to it; these two do instead. The
+client MUST NOT send a translated request unless every requirement in
+the policy maps to something the target documents as a hard filter;
+otherwise it does not send the request at all. And it MUST treat the
+result as **unconfirmed**: it MUST NOT report the policy as applied.
 
 ## Security
 
 - **Facts are claims.** `zdr`, `notrain`, `bits`, and `region` are what
   the gateway says about a route, on whatever basis it has. Only
   `attest` items can be checked without trusting the gateway, and only
-  by a client that verifies the evidence itself. A client SHOULD NOT
-  present an unverified fact as verified.
+  by a client that verifies the evidence itself.
 - **Never fail open.** Refusal is the only permitted response to a
   policy that cannot be met. This is why unknown keys refuse rather
   than being ignored.
 - **Do not leak the policy.** The header and suffix are removed before
   the request leaves the gateway, so a provider cannot treat requests
   with requirements differently from the rest.
-- **Chains.** A gateway that forwards to another gateway either passes
-  the requirements on in this protocol and checks the `Route-Applied`
-  it gets back, or treats that route as meeting none of them.
+- **Chains.** A gateway behind a route is a provider like any other: it
+  receives no policy from this request, and the facts published for
+  that route already cover it and everything behind it. A gateway that
+  wants a downstream gateway to apply a policy binds one to its key
+  there.
 - **Result headers come from the gateway.** A provider that returns
-  `Route-Applied` must not be able to speak for the gateway.
+  `Route-Applied` cannot speak for the gateway, because the gateway
+  drops it.
 - `Route-Applied` and `Route-Refused` carry provider ids and keys from
   this document, nothing from the content and nothing secret.
 
@@ -336,8 +484,10 @@ request is refused.
 | Key | 16 bytes, or 33 with a vendor prefix |
 | Item | 32 bytes |
 
-A policy over a limit is refused as `unsupported`. Gateways MAY choose
-lower limits.
+These apply to a policy on a carrier, to a key default, and to a facts
+string. In `Route-Applied` they apply to the facts that follow the
+provider, not to the whole value. The limits are the same at every
+gateway.
 
 ## Adoption
 
@@ -354,15 +504,8 @@ Each step is useful alone.
 
 Steps 2 to 4 do not need the harness's maintainers. A plugin can do
 them wherever the harness lets one rewrite the outgoing request and
-read response headers.
-
-A plugin can also serve gateways that have not adopted this protocol,
-by translating the policy into that gateway's own request fields. A
-translated policy has no `Route-Applied`, so the plugin MUST show it as
-unconfirmed, and MUST refuse to send a requirement the target dialect
-cannot express as a hard filter. Translation is the one case in which a
-client sends requirements without a detection reply: the plugin stands
-in for it with its own knowledge of the target dialect.
+read response headers. A plugin can also serve gateways that have not
+adopted this protocol, by [translation](#clients).
 
 ## Relationship to existing dialects
 
@@ -386,8 +529,9 @@ in for it with its own knowledge of the target dialect.
    client require a floor. The whole-or-refused rule makes adding it
    later safe.
 2. **Evidence freshness.** Attestation that proves anything needs a
-   nonce the client chose before the request. `Route-Evidence` as
-   drafted is only a pointer after the fact.
+   nonce the client chose before the request. Publishing `evidence`
+   with the route lets a client fetch it first, but this document does
+   not yet say how a nonce reaches the provider.
 3. **Price ceilings.** A cap needs an agreed unit across input, cached
    input, and output.
 4. **`+` in harness parsers.** No model id in OpenRouter's public list
