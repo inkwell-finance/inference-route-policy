@@ -1,10 +1,21 @@
 import { isEvidenceUri, meets, parseApplied, parseRefused, providerAllowed, REFUSAL_STATUS, type Policy, type PublishedRoute, type RefusalReason } from "../../core/src/index.ts";
 import { sent, type Observation, type Probe } from "./http.ts";
 
+// G34 — compare only observations from the same endpoint and credential:
+// Input                                               | Verdict and claim
+// No refusal, or JSON refusal with no own-error body   | SKIP: no comparable observation.
+// Empty refusal, media mismatch, invalid declared JSON | FAIL: a positive contradiction.
+// A JSON member has no observed type at its known path | FAIL: a positive contradiction.
+// Non-JSON refusal without a media contradiction      | SKIP: structure not compared.
+// JSON shape equals one complete own-error sample     | PASS: that shape was observed.
+// JSON shape differs only by fields or their grouping  | SKIP: name the unverified difference.
+// Array shapes ignore order and repetitions, not element structure. Only a
+// single body can establish a match; pooled controls can diagnose differences.
+
 export interface Exchange {
   probe: Probe;
   reply: Observation;
-  ordinaryControl?: boolean;
+  ordinaryControl?: string;
   missingRefusal?: boolean;
 }
 
@@ -29,7 +40,8 @@ export interface ResultAudit {
   attestedRelays: Exchange[];
   results: Exchange[];
   refusals: Exchange[];
-  shapeControlsNeeded: Map<Probe["credential"], string>;
+  shapeControlsNeeded: Set<Probe["credential"]>;
+  shapeUnverified?: string;
 }
 
 const precedence: Readonly<Record<RefusalReason, number>> = { unsupported: 0, unsatisfiable: 1, unavailable: 2 };
@@ -46,10 +58,31 @@ interface Shape {
   contradiction?: string;
   unseen?: string;
   missing?: string[];
+  unparsed?: string;
 }
 
 function jsonType(value: unknown): string {
   return value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+}
+
+function shapeDifference(value: unknown, sample: unknown, path: string): string | undefined {
+  if (jsonType(value) !== jsonType(sample)) return path;
+  if (Array.isArray(value) && Array.isArray(sample)) {
+    if (value.some((item: unknown) => !sample.some((candidate: unknown) => shapeDifference(item, candidate, path) === undefined))
+      || sample.some((item: unknown) => !value.some((candidate: unknown) => shapeDifference(item, candidate, path) === undefined))) {
+      return `${path}[]`;
+    }
+  } else if (value !== null && typeof value === "object" && sample !== null && typeof sample === "object") {
+    const fields: [string, unknown][] = Object.entries(value);
+    for (const [key, field] of fields) {
+      const member = `${path}.${key}`;
+      if (!Object.hasOwn(sample, key)) return member;
+      const difference = shapeDifference(field, Reflect.get(sample, key), member);
+      if (difference !== undefined) return difference;
+    }
+    const extra = Object.keys(sample).find((key) => !Object.hasOwn(value, key));
+    if (extra !== undefined) return `${path}.${extra}`;
+  }
 }
 
 function compareJsonShape(value: unknown, controls: readonly unknown[], path: string): Shape {
@@ -91,25 +124,26 @@ function mediaType(reply: Observation): string | undefined {
 }
 
 function compareErrorShape(reply: Observation, controls: readonly Observation[]): Shape {
-  if (controls.length === 0) return { unseen: "an ordinary error body under the same credential" };
   const media = mediaType(reply);
   const sameMedia = controls.filter((sample) => mediaType(sample) === media);
-  if (sameMedia.length === 0) return { contradiction: `media type ${media ?? "(none)"} was not used by any ordinary error control` };
+  if (controls.length > 0 && sameMedia.length === 0) {
+    return { contradiction: `media type ${media ?? "(none)"} was not used by any ordinary error control` };
+  }
+  if (media !== "application/json" && !media?.endsWith("+json")) {
+    return { unparsed: `refusal body is ${media ?? "of unspecified media type"}; structure not compared` };
+  }
+  if (reply.body === undefined) return { contradiction: "expected a JSON error body" };
   const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
-  if (reply.body !== undefined) {
-    if (json.length === 0) return { contradiction: "JSON was not used by any ordinary error control with the same media type" };
-    if (json.some((sample) => {
-      const one = compareJsonShape(reply.body, [sample], "$");
-      return one.contradiction === undefined && one.missing === undefined && one.unseen === undefined;
-    })) return {};
-    const shape = compareJsonShape(reply.body, json, "$");
-    return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
-      ? shape : { unseen: "one ordinary error control showing the refusal's combination of members and types" };
+  if (json.length === 0) return { unseen: "an ordinary JSON error body under the same credential" };
+  let firstDifference: string | undefined;
+  for (const sample of json) {
+    const difference = shapeDifference(reply.body, sample, "$");
+    if (difference === undefined) return {};
+    firstDifference ??= difference;
   }
-  if (media === "application/json" || media?.endsWith("+json") || json.length === sameMedia.length) {
-    return { contradiction: "expected a JSON error body" };
-  }
-  return {};
+  const shape = compareJsonShape(reply.body, json, "$");
+  return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
+    ? shape : { unseen: `one ordinary error control with the same whole refusal shape (difference at ${firstDifference})` };
 }
 
 function sameCredential(a: Probe, b: Probe): boolean {
@@ -118,7 +152,7 @@ function sameCredential(a: Probe, b: Probe): boolean {
 
 export function auditResults(exchanges: readonly Exchange[], contextFor: (probe: Probe) => ResultContext): ResultAudit {
   const audit: ResultAudit = {
-    failures: new Map(), catalogRelays: [], attestedRelays: [], results: [], refusals: [], shapeControlsNeeded: new Map(),
+    failures: new Map(), catalogRelays: [], attestedRelays: [], results: [], refusals: [], shapeControlsNeeded: new Set(),
   };
   const ordinary = exchanges.filter(({ ordinaryControl, reply }) => ordinaryControl && reply.hasBody && noResult(reply));
   for (const exchange of exchanges) {
@@ -171,18 +205,30 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
         fail("G3", "unavailable presupposes a qualifying route, but none meets even the known requirements");
         fail("G29", "unavailable must not mask a refusal before routing");
       }
-      if (!reply.hasBody) fail("G34", "a refusal has a nonempty error body");
-      const references = ordinary.filter((entry) => sameCredential(entry.probe, probe));
-      const shape = compareErrorShape(reply, references.map(({ reply }) => reply));
-      if (shape.contradiction !== undefined && reply.hasBody) {
-        audit.shapeControlsNeeded.set(probe.credential, shape.contradiction);
-        const controls = [...new Set(references.map(({ reply: sample }) => `HTTP ${sample.status} ${mediaType(sample) ?? "(no media type)"}`))];
-        fail("G34", `the same error body structure as an ordinary error on this endpoint and credential (${controls.join(", ")}): ${shape.contradiction}`);
+      const references = ordinary.filter((entry) => entry.probe.path === probe.path && sameCredential(entry.probe, probe));
+      const sampled = () => {
+        const kinds = new Set(references.map(({ ordinaryControl, reply: sample }) =>
+          `${ordinaryControl}, HTTP ${sample.status} ${mediaType(sample) ?? "(no media type)"}`));
+        return `${references.length} sampled ordinary errors${kinds.size === 0 ? "" : ` (${[...kinds].join("; ")})`}`;
+      };
+      if (!reply.hasBody) {
+        fail("G34", `a refusal has a nonempty error body; the refusal was empty (compared with ${sampled()})`);
+        continue;
       }
-      if (shape.unseen !== undefined && reply.hasBody) audit.shapeControlsNeeded.set(probe.credential,
-        shape.unseen.startsWith("$") ? `an ordinary error control showing refusal member ${shape.unseen}` : shape.unseen);
-      if (shape.missing !== undefined && reply.hasBody) audit.shapeControlsNeeded.set(probe.credential,
-        `requiredness of missing refusal members ${[...new Set(shape.missing)].join(", ")} cannot be established from sampled ordinary errors`);
+      const shape = compareErrorShape(reply, references.map(({ reply }) => reply));
+      if (shape.contradiction !== undefined) {
+        audit.shapeControlsNeeded.add(probe.credential);
+        fail("G34", `the refusal uses this endpoint's ordinary error format; ${shape.contradiction} (based on ${sampled()})`);
+      }
+      if (shape.unseen !== undefined || shape.missing !== undefined) {
+        audit.shapeControlsNeeded.add(probe.credential);
+        const missing = shape.missing === undefined ? undefined
+          : `requiredness of missing refusal members ${[...new Set(shape.missing)].join(", ")} cannot be established from sampled ordinary errors`;
+        const unseen = shape.unseen?.startsWith("$") ? `an ordinary error control showing refusal member ${shape.unseen}` : shape.unseen;
+        const issue = missing !== undefined && unseen !== undefined ? `${missing}; also need ${unseen}` : missing ?? unseen;
+        if (issue !== undefined) audit.shapeUnverified ??= issue;
+      }
+      if (shape.unparsed !== undefined) audit.shapeUnverified ??= shape.unparsed;
       continue;
     }
 

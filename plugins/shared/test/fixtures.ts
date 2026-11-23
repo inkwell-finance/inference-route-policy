@@ -57,7 +57,8 @@ export interface Reply {
 
 /** What the fake gateway answers; a test changes these between requests. */
 export interface FakeGatewayReplies {
-  detection: Reply;
+  /** One reply for every caller, or one chosen by the request's headers and path (its query included). */
+  detection: Reply | ((headers: IncomingHttpHeaders, path: string) => Reply);
   /** One reply for every caller, or one chosen by the request's headers and path (its query included). */
   models: Reply | ((headers: IncomingHttpHeaders, path: string) => Reply);
   /** One reply for every request, or one chosen by the request, so overlapping requests can be told apart. */
@@ -87,9 +88,10 @@ export async function fakeGateway(): Promise<FakeGateway> {
     requests.push({ method: request.method ?? "", path, headers: request.headers, rawHeaders: request.rawHeaders, body });
     const models = replies.models;
     const inference = replies.inference;
+    const detection = replies.detection;
     const recorded = requests[requests.length - 1];
     const reply = path.includes("/route-policy")
-      ? replies.detection
+      ? typeof detection === "function" ? detection(request.headers, path) : detection
       : path.includes("/models")
         ? typeof models === "function" ? models(request.headers, path) : models
         : typeof inference === "function" && recorded !== undefined ? inference(recorded) : typeof inference === "function" ? { status: 500 } : inference;

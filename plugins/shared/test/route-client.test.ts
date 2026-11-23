@@ -5,6 +5,7 @@ import { addWatcher, withdrawReleases } from "../src/fetch-gate.ts";
 import type { Fetch, Target } from "../src/gateway-client.ts";
 import { OPENROUTER_BASE } from "../src/openrouter.ts";
 import type { Report } from "../src/outcome.ts";
+import { holdPolicy } from "../src/held.ts";
 import { placeOf, type RequestContext } from "../src/request.ts";
 import { RouteClient, type Located, type Prepared } from "../src/route-client.ts";
 import { fakeGateway, type FakeGateway } from "./fixtures.ts";
@@ -393,7 +394,7 @@ test("C5, C8: a redirect never outranks a refusal, and a translated request answ
   const { client: c, reports } = client("only=aurora");
   const policy = c.held.kind === "policy" ? c.held.policy : assert.fail("held");
   gateway.replies.inference = { status: 308, headers: { location: `${elsewhere.base}/chat/completions` } };
-  await sendText(release(c, { decision: { action: "translate", model: "vendor/model", provider: { only: ["aurora"] }, sent: policy }, target: target(), generation: 0 }));
+  await sendText(release(c, { decision: { action: "translate", model: "vendor/model", provider: { only: ["aurora"] }, sent: policy }, target: target(), unexact: null, generation: 0 }));
   const translated = reports.at(-1);
   assert.ok(translated?.kind === "unconfirmed");
   assert.match(translated.note ?? "", /redirect \(status 308\)/);
@@ -434,6 +435,99 @@ test("C4, C14: each base URL has its own model list, and the decision follows th
   assert.equal((await decide(c, target())).decision.action, "send", "aurora is in this base URL's list");
   blockedFor((await decide(c, target("k", elsewhere.base))).decision, /no route the model list publishes/);
   assert.equal(elsewhere.requests.filter((r) => r.path.endsWith("/models")).length, 1, "the other base URL's list was read");
+});
+
+// Replies that differ by place: the query names a team whose key policy no route meets, and a second key has a
+// key policy of its own that no route meets either. Every other place gets a plain reply.
+function differingPlaces(): void {
+  gateway.replies.detection = (headers, path) =>
+    path.includes("team=R%27D")
+      ? { status: 200, body: { route_policy: "1", key_policy: "only=nosuch" } }
+      : headers.authorization === "Bearer k2"
+        ? { status: 200, body: { route_policy: "1", key_policy: "notrain" } }
+        : { status: 200, body: { route_policy: "1" } };
+  gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr" }, { provider: "cobalt", facts: "" }] }] } };
+}
+
+/** A decision as data, for comparing two: its routes by provider. */
+const view = (decision: Decision): string => JSON.stringify(decision, (_key, value: unknown) => (value instanceof Map ? [...value.keys()] : value));
+
+test("C14: a base URL that cannot be used as written holds nothing, so a request with no policy goes as the harness sends it, before and after its rewritten spelling was read", async () => {
+  reset();
+  differingPlaces();
+  const written = placeOf(`${gateway.base}?team=R'D`);
+  assert.ok(written !== null && written.unexact !== null);
+  const inexact: Located = { target: { ...written.place, context: bearer("k") }, unexact: written.unexact };
+  const encoded: Located = { target: { ...written.place, context: bearer("k") }, unexact: null };
+  const { client: c } = client("zdr");
+  c.held = { kind: "none" };
+  const cold = (await c.decide(inexact, "demo-model", null)).decision;
+  assert.ok(cold.action === "send" && cold.routes === null && cold.sent === null, view(cold));
+  // The encoded spelling is a place of its own. A request there with a policy reads its detection and catalog;
+  // then its key policy, which no route meets, blocks even a request there with none.
+  c.held = holdPolicy("zdr", "session");
+  blockedFor((await c.decide(encoded, "demo-model", null)).decision, /meets the policy combined with the key's own/);
+  c.held = { kind: "none" };
+  blockedFor((await c.decide(encoded, "demo-model", null)).decision, /meets the key's own policy/);
+  const warm = (await c.decide(inexact, "demo-model", null)).decision;
+  assert.equal(view(warm), view(cold), "the same request, the same decision, whatever was read for another place");
+  assert.equal(gateway.requests.filter((r) => r.path.includes("team=R'D")).length, 0, "nothing was read for the place as written");
+});
+
+test("C14: whatever was read before for other places, credentials, and models, each request gets the decision it gets in a fresh client that read only its own place", async () => {
+  const places: Located[] = [];
+  const written = placeOf(`${gateway.base}?team=R'D`);
+  assert.ok(written !== null && written.unexact !== null);
+  places.push({ target: target("k1"), unexact: null });
+  places.push({ target: { ...written.place, context: bearer("k1") }, unexact: null });
+  places.push({ target: { ...written.place, context: bearer("k1") }, unexact: written.unexact });
+  places.push({ target: { ...written.place, context: bearer("k2") }, unexact: null });
+  places.push({ target: target("k2"), unexact: null });
+  const policies = [null, "zdr", "sort=price", "only=aurora", "notrain"];
+  const models = ["demo-model", "demo-model+zdr", "demo-model+sort=latency"];
+  for (const seed of [1, 7, 42]) {
+    reset();
+    differingPlaces();
+    // A small deterministic generator: the interleaving is random but the same on every run.
+    let state = seed;
+    const pick = <T,>(items: readonly T[]): T => {
+      state = (state * 1103515245 + 12345) % 2147483648;
+      const item = items[state % items.length];
+      assert.ok(item !== undefined);
+      return item;
+    };
+    const steps: { place: number; policy: string | null; model: string }[] = [];
+    const { client: warm } = client("zdr");
+    for (let i = 0; i < 30; i++) {
+      const step = { place: places.indexOf(pick(places)), policy: pick(policies), model: pick(models) };
+      steps.push(step);
+      const decideIn = async (c: RouteClient, s: typeof step): Promise<Decision> => {
+        c.held = s.policy === null ? { kind: "none" } : holdPolicy(s.policy, "session");
+        const place = places[s.place];
+        assert.ok(place !== undefined);
+        return (await c.decide(place, s.model, null)).decision;
+      };
+      const got = view(await decideIn(warm, step));
+      // The reference: a fresh client that has seen only the earlier requests to this same place.
+      const { client: fresh } = client("zdr");
+      const own = places[step.place]?.unexact === null ? steps.slice(0, -1).filter((s) => s.place === step.place) : [];
+      for (const earlier of own) await decideIn(fresh, earlier);
+      assert.equal(got, view(await decideIn(fresh, step)), `seed ${seed}, step ${i}: ${JSON.stringify(step)}`);
+    }
+  }
+});
+
+test("C14, C15: a request the previous session released is still stopped when stale, but its stop is not shown in the next session", async () => {
+  reset();
+  const { client: c, reports } = client("zdr");
+  const sendA = release(c, await decide(c, target()));
+  const sendB = release(c, await decide(c, target(), "demo-model"));
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  await sendText(sendA);
+  c.newSession();
+  await assert.rejects(sendB(), /discarded before it left/);
+  assert.deepEqual(reports.map((r) => r.kind), ["not-honored"], "the stop of B is not reported in the new session");
+  assert.equal(c.lastReport, null);
 });
 
 test("C14: failed reads are not kept, so the next request tries again: a detection reply and a model list each", async () => {
@@ -482,7 +576,7 @@ test("C8: the response to a translated request is reported unconfirmed, with or 
   reset();
   const { client: c, reports } = client("only=aurora");
   const policy = c.held.kind === "policy" ? c.held.policy : assert.fail("held");
-  const translated = (): Prepared => ({ decision: { action: "translate", model: "vendor/model", provider: { only: ["aurora"] }, sent: policy }, target: target(), generation: 0 });
+  const translated = (): Prepared => ({ decision: { action: "translate", model: "vendor/model", provider: { only: ["aurora"] }, sent: policy }, target: target(), unexact: null, generation: 0 });
   gateway.replies.inference = { status: 200, body: {} };
   await sendText(release(c, translated()));
   gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };

@@ -31,10 +31,11 @@ export interface RouteClientOptions {
   onReport: (report: Report, subject: string | null) => void;
 }
 
-/** A decision, the target it was made for, and the detection generation it relied on. */
-export interface Prepared {
+/** A decision, the place it was made for, and the detection generation it relied on. */
+export interface Prepared extends Located {
   decision: Decision;
   target: Target;
+  unexact: string | null;
   generation: number;
 }
 
@@ -80,15 +81,34 @@ export class RouteClient {
 
   #fetch: Fetch = (input, init) => (this.#options.fetch ?? globalThis.fetch)(input, init);
 
-  #key = (target: Target): string => `${normalizeBase(target.base)}\n${target.query}\n${contextKey(target.context)}`;
+  /**
+   * A place's key in every cache and table of this client: its base URL, query, and context. Only a place usable
+   * exactly as written has one. One that is not has no detection and no catalog, and cannot even be looked up, so
+   * nothing read for the place it would be sent to instead is evidence about it (C14).
+   */
+  #key(located: Located): string | null {
+    if (located.unexact !== null) return null;
+    const { target } = located;
+    return `${normalizeBase(target.base)}\n${target.query}\n${contextKey(target.context)}`;
+  }
+
+  /** The session whose requests are being shown; a request released in an earlier one is not shown in this one. */
+  #session = 0;
+
+  /** A new session starts: it has heard of no result, and results of requests released before are not shown. */
+  newSession(): void {
+    this.#session += 1;
+    this.lastReport = null;
+  }
 
   /**
    * The detection result for a place, fetching it when none is held or in flight. A base URL that cannot be used
    * as written has none, and nothing is fetched for it (SPEC.md, Detection).
    */
-  #detection({ target, unexact }: Located): Promise<DetectionResult> {
-    if (unexact !== null) return Promise.resolve({ ok: false, why: unexact });
-    const key = this.#key(target);
+  #detection(located: Located): Promise<DetectionResult> {
+    const key = this.#key(located);
+    if (key === null) return Promise.resolve({ ok: false, why: located.unexact ?? "its base URL cannot be used as written" });
+    const { target } = located;
     let pending = this.#detections.get(key);
     if (pending === undefined) {
       const read = fetchDetection(this.#fetch, target, this.#options.timeoutMs ?? 5000);
@@ -105,8 +125,10 @@ export class RouteClient {
   }
 
   /** The model list for a place. Read only after a valid detection reply, which a place not as written never has. */
-  #modelList({ target }: Located): Promise<{ list: unknown } | null> {
-    const key = this.#key(target);
+  #modelList(located: Located): Promise<{ list: unknown } | null> {
+    const key = this.#key(located);
+    if (key === null) return Promise.resolve(null);
+    const { target } = located;
     let pending = this.#lists.get(key);
     if (pending === undefined) {
       const read = fetchModelList(this.#fetch, target, this.#options.timeoutMs ?? 5000);
@@ -122,10 +144,11 @@ export class RouteClient {
   }
 
   /** How many times the detection reply for a base URL and credential has been discarded. */
-  #generation = (cacheKey: string): number => this.#generations.get(cacheKey) ?? 0;
+  #generation = (cacheKey: string | null): number => (cacheKey === null ? 0 : (this.#generations.get(cacheKey) ?? 0));
 
   /** C14: the detection reply for this base URL and credential can no longer be trusted, nor anything decided on it. */
-  #discardDetection(cacheKey: string): void {
+  #discardDetection(cacheKey: string | null): void {
+    if (cacheKey === null) return;
     this.#detections.delete(cacheKey);
     this.#heldDetections.delete(cacheKey);
     this.#generations.set(cacheKey, this.#generation(cacheKey) + 1);
@@ -140,10 +163,10 @@ export class RouteClient {
    */
   async decide(located: Located, model: string, configured: string | null): Promise<Prepared> {
     const { target, unexact } = located;
-    const key = this.#key(target);
+    const key = this.#key(located);
     // Taken before any read: a discard while this decision waits makes it stale.
     const generation = this.#generation(key);
-    const prepared = (decision: Decision): Prepared => ({ decision, target: { ...target, base: normalizeBase(target.base) }, generation });
+    const prepared = (decision: Decision): Prepared => ({ decision, target: { ...target, base: normalizeBase(target.base) }, unexact, generation });
     const layers = readLayers(this.held, model, configured);
     if (!layers.ok) return prepared({ action: "block", reason: layers.reason });
     // A base URL the parser would not send as written is somewhere else than written: nothing is read from it,
@@ -151,17 +174,18 @@ export class RouteClient {
     if (unexact !== null && anyPolicy(layers.value)) return prepared({ action: "block", reason: unexact });
     const base = normalizeBase(target.base);
     this.#bases.add(base);
-    let detection: Detection | null = this.#heldDetections.get(key) ?? null;
+    // What is held for this place, and only this place: a place not as written has no key, so holds nothing.
+    let detection: Detection | null = key === null ? null : (this.#heldDetections.get(key) ?? null);
     let noDetection = "not fetched";
-    let modelList: { list: unknown } | null = this.#heldLists.get(key) ?? null;
+    let modelList: { list: unknown } | null = key === null ? null : (this.#heldLists.get(key) ?? null);
     if (anyPolicy(layers.value)) {
-      const result = await this.#detection({ target, unexact });
+      const result = await this.#detection(located);
       detection = result.ok ? result.detection : null;
       if (!result.ok) noDetection = result.why;
       const bound = detection?.keyPolicy == null ? null : parsePolicy(detection.keyPolicy, detection.support);
       const requirement = anyRequirement(layers.value) || (bound?.ok === true && hasRequirements(bound.value));
       if (detection !== null && requirement && !isOpenRouter(base)) {
-        modelList = await this.#modelList({ target, unexact });
+        modelList = await this.#modelList(located);
       }
     }
     // The decision names the place with its query: a base URL that differs in its query is another base URL.
@@ -170,7 +194,7 @@ export class RouteClient {
 
   /** Whether nothing a decision relied on has been discarded since it was made (C14). */
   isCurrent(prepared: Prepared): boolean {
-    return prepared.generation === this.#generation(this.#key(prepared.target));
+    return prepared.generation === this.#generation(this.#key(prepared));
   }
 
   /**
@@ -180,7 +204,8 @@ export class RouteClient {
    */
   release(prepared: Prepared & { decision: Exclude<Decision, { action: "block" }> }, header: string | null, body: string): void {
     const { decision, target } = prepared;
-    const cacheKey = this.#key(target);
+    const cacheKey = this.#key(prepared);
+    const session = this.#session;
     const sent: Sent = decision.action === "translate" ? { kind: "translated" } : { kind: "protocol", policy: decision.sent, routes: decision.routes };
     const requirement = decision.sent !== null && hasRequirements(decision.sent);
     const subject = `request for ${decision.model} to ${target.base}${target.query}`;
@@ -194,8 +219,10 @@ export class RouteClient {
         header,
         body,
         current: () => this.isCurrent(prepared),
-        stopped: (reason) => this.blocked(reason),
-        complete: (completion) => this.#complete(cacheKey, sent, requirement, completion, subject),
+        stopped: (reason) => {
+          if (session === this.#session) this.blocked(reason);
+        },
+        complete: (completion) => this.#complete(cacheKey, sent, requirement, completion, subject, session),
       }),
     );
     // Withdrawing an old unused release can only stop it, never let anything through.
@@ -227,7 +254,7 @@ export class RouteClient {
    * whatever else holds; a translated request's result is unconfirmed whatever else holds; only then is a
    * redirect, which the plugin never follows, a policy not honored.
    */
-  #complete(cacheKey: string, sent: Sent, requirement: boolean, completion: Completion, subject: string): void {
+  #complete(cacheKey: string | null, sent: Sent, requirement: boolean, completion: Completion, subject: string, session: number): void {
     const read = interpret(completion.result, sent);
     const redirected = completion.status >= 300 && completion.status < 400;
     const redirect = `the gateway answered with a redirect (status ${completion.status}), which the plugin does not follow with content`;
@@ -236,7 +263,8 @@ export class RouteClient {
     else if (redirected && read.kind !== "refused" && sent.kind === "protocol" && sent.policy !== null) report = { kind: "not-honored", why: redirect };
     // C14: a requirement that came back not honored means the detection reply can no longer be trusted there.
     if (report.kind === "not-honored" && requirement) this.#discardDetection(cacheKey);
-    this.#report(report, subject);
+    // What a late response says of the gateway counts above; it is shown only in the session that sent it.
+    if (session === this.#session) this.#report(report, subject);
   }
 
   #report(report: Report, subject: string | null): void {

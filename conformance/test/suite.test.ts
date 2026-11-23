@@ -255,7 +255,7 @@ test("G11: a valid pair repeated across carriers must not be rejected as a dupli
   assert.equal(report.checks.find(({ id }) => id === "G11")?.status, "FAIL");
 });
 
-test("G12: a region intersection must be empty in both carrier orientations", async (t) => {
+test("G12: conformance catches a widened region intersection in the reverse carrier orientation", async (t) => {
   const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "region=de" && suffix === "region=us"
     ? rewrite({ header: "region=us,de", suffix: null }) : next()));
   assert.equal(report.checks.find(({ id }) => id === "G12")?.status, "FAIL");
@@ -356,7 +356,8 @@ function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "problem-type" 
     };
     if (defect === "missing-envelope" && refused) return change(reply, { body: JSON.stringify({ error }) });
     if (defect === "empty-body" && refused) return change(reply, { body: "" });
-    const issues = refused ? [{ severity: 1 }] : [{ severity: 1 }, { severity: 2 }];
+    const issues = refused ? [{ severity: 3, field: "model" }, { severity: 2 }]
+      : [{ severity: 1 }, { severity: 2, field: "id" }, { severity: 3 }];
     const envelope = {
       ...body, error,
       problem: defect === "problem-type" && refused ? "policy" : {
@@ -369,7 +370,7 @@ function gatewayWithEnrichedErrors(defect?: "missing-envelope" | "problem-type" 
   };
 }
 
-test("G34: matching nested envelopes may have different codes, messages, and list lengths", async (t) => {
+test("G34: equal nested shapes allow different scalar values, array order, and repetitions", async (t) => {
   const report = await run(t, gatewayWithEnrichedErrors());
   assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
 });
@@ -494,7 +495,7 @@ test("G25: a stable nonstandard ordinary status is not interchangeable with anot
   assert.match(verdict.detail, /same ordinary error status 422 as the no-policy control/);
 });
 
-test("G6: pinning a second provider catches a gateway that always uses the first one for only", async (t) => {
+test("G6: conformance catches a relay from the first provider when only pins the second", async (t) => {
   const report = await run(t, fixture(({ header, next, rewrite }) => header === "only=basalt" ? rewrite({ header: "only=aurora" }) : next()));
   assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
 });
@@ -1051,8 +1052,12 @@ test("G22: a non-object detection reply cannot establish absence of a key policy
   assert.match(check.detail, /an inspectable detection object/);
 });
 
-for (const mode of ["optional-observed", "optional-unseen", "known-bad-type"] as const) {
-  test(`G34: problem JSON distinguishes ${mode} from a missing mandatory member`, async (t) => {
+for (const [mode, assertion] of [
+  ["optional-observed", "passes when a sampled problem JSON has the same optional errors array"],
+  ["optional-unseen", "skips when no sampled problem JSON shows the refusal's errors member"],
+  ["known-bad-type", "fails when the refusal changes errors[].field from string to number"],
+] as const) {
+  test(`G34: ${assertion}`, async (t) => {
     const additionalControls = new Set<string | null>();
     const report = await run(t, async (request, transport) => {
       const raw = request.method === "POST" ? await request.clone().text() : undefined;
@@ -1121,7 +1126,7 @@ test("G11: a policy satisfied by the sole route in both carriers cannot demonstr
   assert.match(check.detail, /distinguishing omission of the header and suffix/);
 });
 
-for (const order of [[0, 1], [1, 0]] as const) test(`G11: provider-only narrowing ${order[0] === 0 ? "is observable with the weaker provider first" : "is inconclusive when every probe relays the same provider"}`, async (t) => {
+for (const order of [[0, 1], [1, 0]] as const) test(`G11: provider-only narrowing ${order[0] === 0 ? "is observable with the weaker provider first" : "is inconclusive when the comparison relays name the same provider"}`, async (t) => {
   const modelRoutes = [{ ...routes[0]!, facts: "bits=8" }, { ...routes[1]!, facts: "bits=64", evidence: undefined }];
   const open = createGateway({
     models: { [model]: order.map((i) => {
@@ -1288,4 +1293,89 @@ test("G3 G29: an unavailable reply cannot claim qualification after a known empt
   }], () => ({ carriesPolicy: true, known, impossible: true }));
   assert.match(audit.failures.get("G3") ?? "", /unavailable presupposes a qualifying route/);
   assert.match(audit.failures.get("G29") ?? "", /unavailable must not mask a refusal before routing/);
+});
+
+for (const { title, media, ordinary, refused, note } of [
+  { title: "XML does not get a structural verdict", media: "application/xml", ordinary: "<error><message>bad request</message></error>", refused: "<completion><text>synthetic success</text></completion>", note: /refusal body is application\/xml; structure not compared/ },
+  { title: "JSON-looking text/plain does not get a structural verdict", media: "text/plain", ordinary: '{"error":{"message":"bad request"}}', refused: '{"error":{"message":"bad policy"}}', note: /refusal body is text\/plain; structure not compared/ },
+  { title: "a refusal array element cannot be assembled from two observed shapes", media: "application/problem+json", ordinary: '{"problems":[{"column":3},{"path":"/m"}]}', refused: '{"problems":[{"column":3,"path":"/m"}]}', note: /same whole refusal shape \(difference at \$\.problems\[\]\)/ },
+  { title: "a proper subset of the observed array element shapes is inconclusive", media: "application/problem+json", ordinary: '{"problems":[{"column":3},{"path":"/m"}]}', refused: '{"problems":[{"column":3}]}', note: /same whole refusal shape \(difference at \$\.problems\[\]\)/ },
+] as const) test(`G34: ${title}`, async (t) => {
+  const seen = new Set<string>();
+  const report = await run(t, async (request, transport) => {
+    const reply = await good(request, transport);
+    if (request.method !== "POST" || reply.status < 400) return reply;
+    const body = reply.headers.has(refusal) ? refused : ordinary;
+    seen.add(body);
+    return change(reply, { body, replace: { "content-type": media } });
+  });
+  assert.deepEqual(seen, new Set([ordinary, refused]));
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, note);
+});
+
+test("G34: complete JSON shapes cannot be assembled across ordinary error bodies", async (t) => {
+  const report = await run(t, async (request, transport) => {
+    const raw = request.method === "POST" ? await request.clone().text() : undefined;
+    const reply = await good(request, transport);
+    if (raw === undefined || reply.status < 400) return reply;
+    const body = reply.headers.has(refusal) ? { column: 3, path: "/m" } : raw === "{" ? { column: 3 } : { path: "/m" };
+    return change(reply, { body: JSON.stringify(body) });
+  });
+  assert.equal(report.failed, 0);
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /same whole refusal shape \(difference at \$\.(path|column)\)/);
+});
+
+test("G34: malformed declared JSON fails and names the sampled error count and kinds", async (t) => {
+  const report = await run(t, fixture(async ({ next }) => {
+    const reply = await next();
+    return reply.headers.has(refusal) ? change(reply, { body: '{"error":' }) : reply;
+  }));
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "FAIL");
+  assert.match(check.detail, /expected a JSON error body/);
+  assert.match(check.detail, /\bbased on [1-9]\d* sampled ordinary errors\b/);
+  assert.match(check.detail, /malformed JSON, HTTP 400 application\/json/);
+  assert.match(check.detail, /wrong model type, HTTP 400 application\/json/);
+});
+
+test("G34: a JSON refusal without a comparable ordinary error cannot establish a shape", async (t) => {
+  const report = await run(t, fixture(async ({ request, next }) => {
+    const reply = await next();
+    return request.method === "POST" && reply.status >= 400 && !reply.headers.has(refusal) ? change(reply, { body: "" }) : reply;
+  }));
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /ordinary JSON error body under the same credential/);
+});
+
+test("G34: no observed Route-Refused field means there is no refusal shape to verify", async (t) => {
+  const report = await run(t, fixture(async ({ next }) => {
+    const reply = await next();
+    return reply.headers.has(refusal) ? change(reply, { replace: { [refusal]: null } }) : reply;
+  }));
+  const check = report.checks.find(({ id }) => id === "G34");
+  assert.equal(check?.status, "SKIP");
+  assert.match(check.detail, /an observed refusal/);
+});
+
+for (const scope of ["endpoint", "credential"] as const) test(`G34: a matching JSON shape from another ${scope} cannot certify the refusal`, () => {
+  const context = { carriesPolicy: true };
+  const probe = { path: "responses", credential: { key, header: "authorization" } } as const;
+  const reply = {
+    status: 400, body: { error: { message: "bad request" } }, hasBody: true, contentType: "application/json",
+    applied: [], refused: [], evidence: [], received: "HTTP 400",
+  };
+  const elsewhere = scope === "endpoint" ? { ...probe, path: "chat/completions" }
+    : { ...probe, credential: { ...probe.credential, key: policyKey } };
+  const audit = auditResults([
+    { probe: elsewhere, reply, ordinaryControl: "wrong input field" },
+    { probe, reply: { ...reply, refused: [formatRefused("unsupported")] } },
+  ], () => context);
+  assert.equal(audit.failures.has("G34"), false);
+  assert.equal(audit.shapeUnverified, "an ordinary JSON error body under the same credential");
 });

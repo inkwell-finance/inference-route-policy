@@ -394,8 +394,8 @@ export async function runConformance(options: Options): Promise<Report> {
       if (!isBareError(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
       return sample;
     }
-    async function compareOwn(before: Exchange, probe: Probe): Promise<void> {
-      before.ordinaryControl = true;
+    async function compareOwn(before: Exchange, probe: Probe, kind: string): Promise<void> {
+      before.ordinaryControl = kind;
       const requirement = `the same ordinary error status ${before.reply.status} as the no-policy control, with no result headers`;
       const { reply } = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
       if (!noResult(reply)) throw mismatch(probe, reply.received, requirement);
@@ -789,14 +789,14 @@ export async function runConformance(options: Options): Promise<Report> {
     await run("G25", "corroborated ordinary errors retained their status and no route headers when challenged with a policy", async () => {
       const malformed = bodyProbe("{");
       const malformedControl = await ordinaryError(malformed);
-      await compareOwn(malformedControl, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] });
+      await compareOwn(malformedControl, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] }, "malformed JSON");
       for (const raw of ['{"model":4}', "{}"]) {
         const probe = bodyProbe(raw);
         const control = await ordinaryError(probe);
-        await compareOwn(control, { ...probe, policies: [INVALID_POLICY] });
+        await compareOwn(control, { ...probe, policies: [INVALID_POLICY] }, raw === "{}" ? "missing model field" : "wrong model type");
       }
       const emptyModel = await ordinaryError(inference(""));
-      await compareOwn(emptyModel, inference("", INVALID_POLICY, INVALID_POLICY));
+      await compareOwn(emptyModel, inference("", INVALID_POLICY, INVALID_POLICY), "empty model ID");
       const missing: string[] = [];
       const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
       const unknown = await observeControl(inference(unknownModel));
@@ -814,7 +814,7 @@ export async function runConformance(options: Options): Promise<Report> {
           || refusal(resolution, "unavailable") || unsatisfiable(resolution)) {
           missing.push(`unknown-model subcase: accepted-policy control reached routing for the unpublished model (HTTP ${resolution.status})`);
         } else {
-          await compareOwn(unknown, inference(unknownModel, INVALID_POLICY, INVALID_POLICY));
+          await compareOwn(unknown, inference(unknownModel, INVALID_POLICY, INVALID_POLICY), "unknown model");
         }
       }
 
@@ -832,7 +832,7 @@ export async function runConformance(options: Options): Promise<Report> {
           const challenge = await observeControl({ ...malformed, credential });
           if (challenge !== undefined && isBareError(challenge.reply) && challenge.reply.status === candidate.reply.status
             && challenge.reply.status !== malformedControl.reply.status) {
-            await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] });
+            await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] }, "bad credential");
           } else {
             missing.push(`bad-credentials subcase: headerless HTTP ${candidate.reply.status} did not distinguish credential rejection from a provider relay`);
           }
@@ -880,7 +880,7 @@ export async function runConformance(options: Options): Promise<Report> {
           if (seen.has(raw)) continue;
           const sample = await observe(scopedProbe(raw)).catch(() => undefined);
           if (sample === undefined || !isBareError(sample.reply)) continue;
-          sample.ordinaryControl = true;
+          sample.ordinaryControl = raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field";
         }
         const current = scopeFor(scopedProbe("{}"));
         const model = current?.models[0];
@@ -890,13 +890,18 @@ export async function runConformance(options: Options): Promise<Report> {
           const field = endpoint === "responses" ? "input" : "messages";
           const limit = endpoint === "responses" ? "max_output_tokens" : "max_tokens";
           const body = bodyFor(endpoint, model.id);
-          for (const edit of [{ [field]: null }, { [field]: 4 }, { [limit]: -1 }, { route_conformance_unknown_field: true }]) {
+          for (const [kind, edit] of [
+            ["null input field", { [field]: null }],
+            ["wrong input type", { [field]: 4 }],
+            ["negative token limit", { [limit]: -1 }],
+            ["unknown input field", { route_conformance_unknown_field: true }],
+          ] as const) {
             const probe = scopedProbe(JSON.stringify({ ...body, ...edit }));
             const control = await observe(probe).catch(() => undefined);
             if (control === undefined || !isBareError(control.reply)) continue;
             const challenged = await observe({ ...probe, policies: [INVALID_POLICY] }).catch(() => undefined);
             if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-              control.ordinaryControl = true;
+              control.ordinaryControl = kind;
             }
           }
           const witness = model.policies[0]?.text;
@@ -908,7 +913,7 @@ export async function runConformance(options: Options): Promise<Report> {
             if (control !== undefined && isBareError(control.reply)) {
               const challenged = await observe(on(endpoint, credential)(synthetic, witness)).catch(() => undefined);
               if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-                control.ordinaryControl = true;
+                control.ordinaryControl = "unknown model";
               }
             }
           }
@@ -934,7 +939,7 @@ export async function runConformance(options: Options): Promise<Report> {
     audited("G19", "observed refusals and policy relays used exclusive single result headers", audit.results,
       audit.results.length > 0 ? undefined : "an observed policy refusal or relay");
     audited("G34", "each observed refusal matches an ordinary error shape observed on this endpoint and credential", audit.refusals,
-      audit.refusals.length > 0 ? audit.shapeControlsNeeded.values().next().value : "an observed refusal");
+      audit.refusals.length > 0 ? audit.shapeUnverified : "an observed refusal");
   }
 
   return { checks, passed: checks.filter((c) => c.status === "PASS").length, failed: checks.filter((c) => c.status === "FAIL").length, skipped: checks.filter((c) => c.status === "SKIP").length };

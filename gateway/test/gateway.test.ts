@@ -199,11 +199,13 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
       assert.deepEqual(body, endpoint === "messages" ? { type: "error", ...error } : error);
     }
     assert.equal(calls.length, 0);
-    for (const policy of ["ignore=missing", "order=missing,aurora"]) {
+    for (const [policy, provider] of [
+      ["ignore=missing", "aurora"], ["ignore=missing,aurora", "basalt"], ["order=missing,basalt", "basalt"],
+    ]) {
       const valid = await gateway(call(model, "open", policy));
-      assert.equal(valid.headers.get("route-applied"), "provider=aurora");
+      assert.equal(valid.headers.get("route-applied"), `provider=${provider}`);
     }
-    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "aurora"]);
+    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "basalt", "basalt"]);
   });
 }
 

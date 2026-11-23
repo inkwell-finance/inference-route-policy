@@ -195,6 +195,23 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     assert.equal(gateway().requests.length, before);
   });
 
+  test(`C3, C15: ${name}: a response to a request the previous session sent is not shown in the next one, though what it says of the gateway still counts`, async () => {
+    const harness = await make("zdr");
+    gateway().replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 200 };
+    const pending = harness.request();
+    for (let i = 0; i < 400 && gateway().inference().length === 0; i++) await new Promise((wake) => setTimeout(wake, 5));
+    await harness.emit("session_start", { type: "session_start", reason: "new" });
+    const shownAtStart = harness.shown.length;
+    assert.ok((await pending).sent);
+    assert.deepEqual(harness.shown.slice(shownAtStart), [], "nothing about it is shown in the new session");
+    const reads = gateway().requests.filter((r) => r.path.endsWith("/route-policy")).length;
+    await harness.command("route", "");
+    const text = notices(harness).at(-1) ?? "";
+    assert.match(text, /^Last result: none yet in this session$/m);
+    // Not honored, it discarded the detection reply: /route reads it again.
+    assert.equal(gateway().requests.filter((r) => r.path.endsWith("/route-policy")).length, reads + 1);
+  });
+
   test(`C3, C15: ${name}: a session started again after a result has heard of none: /route says so, and the status line is cleared`, async () => {
     const harness = await make("zdr");
     await harness.request();

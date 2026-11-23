@@ -1,32 +1,32 @@
-Inference Route Policy: real pi against the demo stack (2026-11-23T22:16:58.814Z)
+Inference Route Policy: real pi against the demo stack (2026-11-23T22:46:45.697Z)
 $ node gateway/src/demo.ts --port 0
-demo stack: gateway http://127.0.0.1:63880/v1; plain provider http://127.0.0.1:63880/plain/v1; gateway with its model list withheld http://127.0.0.1:63881/v1
-isolated config: C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\agent\models.json (providers gateway, withheld, plain; key demo-key-zdr carries the key policy zdr)
+demo stack: gateway http://127.0.0.1:63486/v1; plain provider http://127.0.0.1:63486/plain/v1; gateway with its model list withheld http://127.0.0.1:63487/v1
+isolated config: C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\agent\models.json (providers gateway, withheld, plain; key demo-key-zdr carries the key policy zdr)
 
 == (a) honored: zdr through the gateway, checked against the model list
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63880/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63486/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
   turn ended; last assistant message: [{"type":"text","text":"served by aurora"}]
-  <- setStatus: route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://127.0.0.1:63880/v1)
+  <- setStatus: route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://127.0.0.1:63486/v1)
   GET /__demo/requests: [{"provider":"aurora","path":"/v1/chat/completions","model":"demo-model"}]
   PASS
 
 == (b) refused before sending: only=nosuch with the model list held (C16)
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route only=nosuch"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: only=nosuch
   <- notify: Route policy: only=nosuch (set in this session)
-     Gateway http://127.0.0.1:63880/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63486/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
@@ -37,47 +37,47 @@ $ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:
   PASS
 
 == (b) refused by the gateway: only=nosuch with the model list withheld
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route only=nosuch"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: only=nosuch
   <- notify: Route policy: only=nosuch (set in this session)
-     Gateway http://127.0.0.1:63881/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63487/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
   turn ended; last assistant message: error: 400: {"type":"invalid_request_error","message":"Route policy unsatisfiable"}
-  <- setStatus: route policy refused by the gateway: unsatisfiable (request for demo-model to http://127.0.0.1:63881/v1)
-  <- notify: route policy refused by the gateway: unsatisfiable (request for demo-model to http://127.0.0.1:63881/v1)
+  <- setStatus: route policy refused by the gateway: unsatisfiable (request for demo-model to http://127.0.0.1:63487/v1)
+  <- notify: route policy refused by the gateway: unsatisfiable (request for demo-model to http://127.0.0.1:63487/v1)
   GET /__demo/requests: []
   PASS
 
 == (c) blocked: zdr against a base URL with no detection (the plain provider)
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model plain/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model plain/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63880/plain/v1, read with the credential in authorization: no detection (detection reply is not valid: status is 404, not 200)
+     Gateway http://127.0.0.1:63486/plain/v1, read with the credential in authorization: no detection (detection reply is not valid: status is 404, not 200)
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
-  turn ended; last assistant message: error: Blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63880/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
-  <- setStatus: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63880/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
-  <- notify: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63880/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  turn ended; last assistant message: error: Blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63486/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  <- setStatus: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63486/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
+  <- notify: request blocked by the route policy plugin, nothing was sent: http://127.0.0.1:63486/plain/v1 has no valid detection reply (detection reply is not valid: status is 404, not 200), so no requirement may be sent there
   GET /__demo/requests: []
   PASS
 
 == (d) blocked: zdr through the gateway when the plugin fails inside its guard (its context's model accessor throws)
   (IRP_E2E_FAULT=model, read only by e2e/faulty-plugin.ts)
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\e2e\faulty-plugin.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\e2e\faulty-plugin.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63880/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63486/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
@@ -89,37 +89,37 @@ $ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:
 
 == (e) blocked at fetch: the harness reports one key and sends another; detection was read for the reported one
   (IRP_E2E_FAULT=key, read only by e2e/faulty-plugin.ts)
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\e2e\faulty-plugin.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model gateway/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\e2e\faulty-plugin.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63880/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63486/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
   turn ended; last assistant message: error: Connection error.
-  <- setStatus: request blocked by the route policy plugin, nothing was sent: this request to http://127.0.0.1:63880/v1 is not one the plugin released: its URL, headers (it carries authorization besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once
-  <- notify: request blocked by the route policy plugin, nothing was sent: this request to http://127.0.0.1:63880/v1 is not one the plugin released: its URL, headers (it carries authorization besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once
+  <- setStatus: request blocked by the route policy plugin, nothing was sent: this request to http://127.0.0.1:63486/v1 is not one the plugin released: its URL, headers (it carries authorization besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once
+  <- notify: request blocked by the route policy plugin, nothing was sent: this request to http://127.0.0.1:63486/v1 is not one the plugin released: its URL, headers (it carries authorization besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once
   GET /__demo/requests: []
   PASS
 
 == (f) a released request is sent once: the first send gets a retryable 503, and no second copy leaves
-$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-BNUL93)
+$ C:\Users\Lars\AppData\Local\vite-plus\data\js_runtime\node\26.13.1\node.exe C:\Users\Lars\.pi\agent\install\releases\1.2.0\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js --mode rpc --model withheld/demo-model --no-extensions -e H:\inference-route-policy\plugins\pi\src\index.ts --no-skills --no-prompt-templates --no-context-files --no-tools --no-approve --no-session   (cwd C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da\work; HOME, USERPROFILE, APPDATA, LOCALAPPDATA, PI_CODING_AGENT_DIR in C:\Users\Lars\AppData\Local\Temp\irp-e2e-pi-Qo47Da)
   -> {"id":"set","type":"prompt","message":"/route zdr"}
   -> {"id":"show","type":"prompt","message":"/route"}
   <- setStatus: 
   <- notify: Route policy set: zdr
   <- notify: Route policy: zdr (set in this session)
-     Gateway http://127.0.0.1:63881/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
+     Gateway http://127.0.0.1:63487/v1, read with the credential in authorization: detection valid; accepts zdr, notrain, bits, region, attest, only, ignore, sort, order
      Key policy (locked, applied by the gateway to every request with this key): zdr
      Last result: none yet in this session
   -> {"id":"ask","type":"prompt","message":"Say hello."}
   turn ended; last assistant message: error: 503: {"message":"try again"}
   POSTs that left the harness for the proxy: 1
-  <- setStatus: route policy NOT honored: no Route-Applied (request for demo-model to http://127.0.0.1:63881/v1)
-  <- notify: route policy NOT honored: no Route-Applied (request for demo-model to http://127.0.0.1:63881/v1)
+  <- setStatus: route policy NOT honored: no Route-Applied (request for demo-model to http://127.0.0.1:63487/v1)
+  <- notify: route policy NOT honored: no Route-Applied (request for demo-model to http://127.0.0.1:63487/v1)
   GET /__demo/requests: []
   PASS
 

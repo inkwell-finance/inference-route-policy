@@ -202,7 +202,7 @@ interface Guarded {
   prepared: Prepared;
 }
 
-const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", query: "", context: [] }, generation: 0 } });
+const blockWith = (reason: string): Guarded => ({ request: null, prepared: { decision: { action: "block", reason }, target: { base: "", query: "", context: [] }, unexact: null, generation: 0 } });
 
 export interface PluginOptions {
   /** True where `before_provider_headers` lets the plugin set request headers (pi); false where it cannot (omp). */
@@ -316,7 +316,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     client.held = held;
     // A started or resumed session has heard of no result yet: the last one, and the status line that shows it,
     // belong to the session before.
-    client.lastReport = null;
+    client.newSession();
     try {
       ui?.setStatus(STATUS_KEY, undefined);
     } catch {
