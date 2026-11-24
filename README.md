@@ -213,18 +213,28 @@ result, `/route <policy>` sets it, and `/route clear` removes it.
 - A request is decided in the harness's `before_provider_request` hook
   and checked again where it leaves, in the process's `fetch`: a POST
   to a base URL the plugin has decided for goes out only if its URL,
-  credential headers, `Route-Policy` header, and body are exactly those
-  of a request the plugin released, once, and without following
-  redirects. A harness feature that sends content to some other base
-  URL without the hook is not covered, and neither is a transport that
-  does not use `fetch`.
+  headers, `Route-Policy` header, and body are exactly those of a
+  request the plugin released, once, and without following redirects.
+  A released request is also stopped if it is sent anywhere but the
+  base URL it was released for, and so is any POST that carries a
+  `Route-Policy` header to a base URL the plugin has not decided for.
+- A harness feature that sends other content to some other base URL
+  without the hook is not covered, and neither is a transport that does
+  not use `fetch`.
 - A release is used once. A harness's automatic retry of the same
   request is stopped, so a retryable error ends the turn and the user
   sends again.
 - A POST whose body the plugin cannot read at `fetch`, such as a
-  compressed one, is stopped whenever a policy is held or carried.
-- omp gives a plugin no way to set request headers, so there the held
-  policy travels as a model suffix.
+  compressed one, is stopped whenever a policy is held or carried and
+  it goes to a base URL the plugin has decided for. Sent elsewhere, it
+  cannot be compared with what was released.
+- A base URL that the process's URL handling would send other than as
+  written, for example by percent-encoding a character, gets no policy:
+  a request with one is blocked.
+- A request to an API that names its model in the URL can carry a
+  policy only as a header. omp gives a plugin no way to set request
+  headers, so there the held policy travels as a model suffix, and
+  such a request is blocked whenever a policy is held.
 
 ## License
 

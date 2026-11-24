@@ -7,8 +7,10 @@
  * header, and serialized body. A POST that matches exactly one
  * session's release goes, once: the release is used up, so a harness's resend of the same request is not
  * released again. It goes with redirects off, so a gateway cannot move the body elsewhere, and the response to
- * that very call goes back to the session that released it. A POST no release matches goes untouched unless a
- * session watching its base URL says a policy is at stake, and then it fails before a byte is written.
+ * that very call goes back to the session that released it. A POST no release matches fails before a byte is
+ * written when a session watching its base URL says a policy is at stake, or, where no session says so, when its
+ * body is an outstanding release's (a release is sent only where it was released for) or it carries a
+ * `Route-Policy` header no session checked for that place. Any other POST goes untouched.
  *
  * Why here: the harness hooks decide on what the harness tells them, which is not always what goes on the wire,
  * and both harnesses skip their response hook for a non-2xx response, which is how a refusal arrives.
@@ -123,7 +125,24 @@ function plan(registry: Registry, outgoing: Outgoing): Plan {
       stop ??= reason;
       tell(() => watcher.stopped(reason));
     }
-    return stop === null ? { kind: "pass" } : { kind: "stop", reason: stop };
+    if (stop !== null) return { kind: "stop", reason: stop };
+    // No session claims this POST. It still fails closed when it is a release being spent somewhere other than
+    // its own place, or when it carries a policy that no session checked for where it goes.
+    const where = `${outgoing.path}${outgoing.query}`;
+    const spent = registry.releases.flatMap((e) => (e.release !== null && e.release.body === outgoing.body && e.release.current() ? [e.release] : []));
+    const [elsewhere] = spent;
+    if (elsewhere !== undefined) {
+      const reason = `this request to ${where} is one released for ${elsewhere.base}${elsewhere.query}, and a release is sent only where it was released for`;
+      const told = new Set<object>();
+      for (const release of spent) {
+        if (told.has(release.owner)) continue;
+        told.add(release.owner);
+        tell(() => release.stopped(reason));
+      }
+      return { kind: "stop", reason };
+    }
+    if (outgoing.header !== null) return { kind: "stop", reason: `this request to ${where} carries a Route-Policy header, and no session checked ${where} for it` };
+    return { kind: "pass" };
   } catch (error) {
     return { kind: "stop", reason: `the plugin failed while checking the request: ${error instanceof Error ? error.message : "unknown error"}` };
   }

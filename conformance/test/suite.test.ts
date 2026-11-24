@@ -18,6 +18,8 @@ const model = "other/example-model.v2";
 const refusal = "route-refused";
 const applied = "route-applied";
 const evidence = "route-evidence";
+const wideningPolicy = "bits=9";
+const streamingPolicy = "zdr";
 const idList = ["G1", "G2", "G3", "G6", "G7", "G8", "G9", "G10", "G11", "G12", "G13", "G15", "G17", "G19", "G20", "G21", "G22", "G23", "G24", "G25", "G26", "G29", "G34"] as const;
 type Id = (typeof idList)[number];
 
@@ -106,10 +108,11 @@ const faults: Record<Id, Mutation> = {
     ? rewrite({ neutralKey: true, header: "only=basalt" }) : next(),
   G11: ({ header, suffix, next, rewrite }) => header === "only=x,x" && suffix === "bits=0" ? rewrite({ header: suffix, suffix: header }) : next(),
   G12: ({ header, suffix, next, rewrite }) => header === "region=us" && suffix === "region=de" ? rewrite({ header: "region=us,de", suffix: null }) : next(),
-  G13: ({ auth, header, suffix, next, rewrite }) => auth?.endsWith(policyKey) && header !== null && suffix !== null ? rewrite({ neutralKey: true }) : next(),
-  G15: async ({ body, next }) => {
+  G13: ({ auth, header, suffix, next, rewrite }) => auth?.endsWith(policyKey) && header === wideningPolicy && suffix === wideningPolicy
+    ? rewrite({ neutralKey: true }) : next(),
+  G15: async ({ body, header, next }) => {
     const reply = await next();
-    return body.stream === true ? change(reply, { replace: { [applied]: null } }) : reply;
+    return body.stream === true && header === streamingPolicy ? change(reply, { replace: { [applied]: null } }) : reply;
   },
   G17: async ({ header, next }) => {
     const reply = await next();
@@ -130,7 +133,7 @@ const faults: Record<Id, Mutation> = {
   G22: async ({ path, auth, next }) => path === "/v1/route-policy" && auth === null ? Response.json({ route_policy: "1", key_policy: "zdr" }) : next(),
   G23: async ({ path, next }) => path === "/v1/models" ? Response.json({ data: [{ id: model, routes: [...published, published[0]] }] }) : next(),
   G24: ({ header, next, rewrite }) => header === "order=routeprobe0" ? rewrite({ header: "only=routeprobe0" }) : next(),
-  G25: ({ body, header, next }) => typeof body.model === "number" && header === "bits=0" ? protocolError("unsupported", "bits") : next(),
+  G25: ({ body, header, next }) => body.model === 4 && header === "bits=0" ? protocolError("unsupported", "bits") : next(),
   G26: async ({ request, auth, header, suffix, next }) => {
     const reply = await next();
     return request.method === "POST" && reply.ok && auth?.endsWith(key) && header === null && suffix === null ? change(reply, { replace: { [evidence]: "https://aurora.example/" } }) : reply;
@@ -188,7 +191,7 @@ const faultDetails: Record<Id, RegExp> = {
   G6: /"applied":\["provider=cobalt"\].*; required: the named published route must meet/,
   G7: /required: an accepted preference cannot disqualify the matching published routes$/,
   G8: /required: no published route meets even the known suffix requirements$/,
-  G9: /"refused":\["reason=unsupported\+key=only"\].*; required: two raw Route-Policy lines return 400 unsupported without a key$/,
+  G9: /"routePolicyLines":\[\["Route-Policy","[^"]*"\],\["rOuTe-PoLiCy","[^"]*"\]\].*"refused":\["reason=unsupported\+key=only"\].*; required: two raw Route-Policy lines return 400 unsupported without a key$/,
   G10: /"applied":\["provider=basalt"\].*; required: the relayed route must meet the detected key default/,
   G11: /required: swapping malformed carriers reports only, the header's first failure$/,
   G12: /required: 400 unsatisfiable for an empty intersection in either carrier order$/,
@@ -218,8 +221,8 @@ const faultTitles: Record<Id, string> = {
   G10: "a request carrying just the bound zdr key fails when it relays basalt",
   G11: "header only=x,x and suffix bits=0 fail when the refusal names bits",
   G12: "header region=us with suffix region=de fails if their union relays",
-  G13: "dropping the bound zdr from requests carrying bits=9 in both carriers fails",
-  G15: "the streaming zdr relay fails without Route-Applied",
+  G13: `dropping the bound zdr from requests carrying ${wideningPolicy} in both carriers fails`,
+  G15: `the streaming ${streamingPolicy} relay fails without Route-Applied`,
   G17: "Basalt's evidence URI with an added slash fails exact comparison",
   G19: "bits=64 unsatisfiable fails if it also names provider=aurora",
   G20: "anonymous detection fails with a numeric route_policy of 1",
@@ -714,12 +717,12 @@ test("G23: the Bearer and x-api-key catalog probes keep the ordinary and bound m
   assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
 });
 
-test("G23: a 403 on the policy-key catalog leaves that model scope unavailable", async (t) => {
+for (const status of [402, 403]) test(`G23: HTTP ${status} on the policy-key catalog leaves that model scope unavailable`, async (t) => {
   let catalogDenied = 0;
   const report = await run(t, async (request, transport) => {
     if (new URL(request.url).pathname === "/v1/models" && request.headers.get("authorization") === `Bearer ${policyKey}`) {
       catalogDenied++;
-      return Response.json({ error: { type: "access_denied", message: "catalog access requires an entitlement" } }, { status: 402 });
+      return Response.json({ error: { type: "access_denied", message: "catalog access requires an entitlement" } }, { status });
     }
     return good(request, transport);
   });
@@ -787,11 +790,14 @@ test("G34: a refusal missing problem and request_id leaves the match inconclusiv
 
 test("G25: a headerless HTTP 200 for the unpublished probe model is not an ordinary-error control", async (t) => {
   let undisclosedRequests = 0;
-  const report = await run(t, fixture(({ id, next, request, transport, suffix, body }) => {
+  const report = await run(t, fixture(async ({ id, next, request, transport, suffix, body }) => {
     if (!id.startsWith("route-conformance-unknown-")) return next();
     undisclosedRequests++;
     const resolved = suffix === null ? model : `${model}+${suffix}`;
-    return good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model: resolved }) }), transport);
+    const reply = await good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model: resolved }) }), transport);
+    assert.equal(reply.status, 200);
+    for (const field of [applied, refusal, evidence]) assert.equal(reply.headers.get(field), null);
+    return reply;
   }));
   assert.equal(undisclosedRequests, 1);
   assert.equal(report.failed, 0);
@@ -806,7 +812,10 @@ test("G25: a headerless 422 for the unpublished model is excluded when zdr retur
     if (!id.startsWith("route-conformance-unknown-")) return next();
     controls.push(header);
     const reply = await good(new Request(request.url, { method: request.method, headers: request.headers, body: JSON.stringify({ ...body, model }) }), transport);
-    return reply.headers.has(refusal) ? reply : change(reply, { status: 422, body: "provider could not process the input" });
+    assert.equal(reply.headers.get(applied), header === "zdr" ? "provider=aurora" : null);
+    assert.equal(reply.headers.get(refusal), null);
+    assert.equal(reply.headers.get(evidence), null);
+    return change(reply, { status: 422, body: "provider could not process the input" });
   }));
   assert.deepEqual(controls, [null, "zdr"]);
   assert.equal(report.failed, 0);
@@ -913,7 +922,7 @@ test("G9: ignoring the mixed-case bits=64 header fails despite a valid rejection
     return reply;
   }));
   assert.equal(duplicates, 1);
-  assertFailure(report, "G9", /bits=64.*; required: no published route meets even the known mixed-case header requirements$/);
+  assertFailure(report, "G9", /"routePolicyLines":\[\["rOuTe-PoLiCy","bits=64"\]\].*; required: no published route meets even the known mixed-case header requirements$/);
 });
 
 test("G17: the bound attest=weights request without a header or suffix fails if Basalt omits Route-Evidence", async (t) => {
@@ -924,6 +933,7 @@ test("G17: the bound attest=weights request without a header or suffix fails if 
   const report = await run(t, fixture(async ({ request, auth, header, suffix, id, next }) => {
     const reply = await next();
     if (request.method !== "POST" || auth !== `Bearer ${policyKey}` || header !== null || suffix !== null || id !== model) return reply;
+    assert.equal(reply.headers.get(evidence), "https://basalt.example/attestation");
     return change(reply, { replace: { [evidence]: null } });
   }, target));
   assertFailure(report, "G17", /"applied":\["provider=basalt"\],"refused":\[\],"evidence":\[\].*; required: one Route-Evidence is required by the known attest requirement$/);
@@ -937,7 +947,7 @@ test("G21: unsupported for advertised bits=32 fails even alongside provider=auro
   assertFailure(report, "G21", /bits=32.*"refused":\["reason=unsupported\+key=bits"\].*; required: advertised support accepts every key and value sent/);
 });
 
-test("G25: headerless HTTP 429 on the credential controls leaves own-error precedence inconclusive", async (t) => {
+test("G25: headerless HTTP 429 on every POST leaves own-error precedence inconclusive", async (t) => {
   const usableInputs: { header: string | null; id: string; suffix: string | null; body: Record<string, unknown>; auth: string | null }[] = [];
   const report = await run(t, fixture(({ request, header, id, suffix, body, auth, next }) => {
     if (request.method !== "POST") return next();
@@ -960,6 +970,23 @@ test("G25: headerless HTTP 429 on the credential controls leaves own-error prece
   const probe = usableInputs[i]!;
   const control = usableInputs[i + 1]!;
   assert.deepEqual(control, { ...probe, header: null, suffix: null, body: { ...probe.body, model: probe.id } });
+});
+
+test("G25: headerless HTTP 429 confined to synthetic-credential POSTs passes own-error precedence", async (t) => {
+  const synthetic = new Map<string, string[]>();
+  const report = await run(t, fixture(async ({ auth, request, path, id, header, next }) => {
+    if (request.method !== "POST" || !auth?.replace(/^Bearer /, "").startsWith("route-conformance-invalid-")) return next();
+    const raw = await request.text();
+    const probes = synthetic.get(path) ?? [];
+    probes.push(raw === "{" && header === null ? "malformed JSON" : `${id}:${header ?? ""}`);
+    synthetic.set(path, probes);
+    return Response.json({ error: { type: "rate_limit", message: "try later" } }, { status: 429 });
+  }), INFERENCE_ENDPOINTS);
+  assert.equal(report.failed, 0);
+  for (const endpoint of INFERENCE_ENDPOINTS) {
+    assert.deepEqual(synthetic.get(`/v1/${endpoint}`), [`${model}:`, `${model}:zdr`, "malformed JSON", `${model}:bits=0`]);
+    assert.equal(report.checks.find((c) => c.endpoint === endpoint && c.id === "G25")?.status, "PASS");
+  }
 });
 
 test("G19: HTTP 429 carrying unsupported+key=bits fails the refusal status check", async (t) => {
@@ -987,6 +1014,7 @@ test("G34: a text/plain 503 for bits=1 fails the ordinary JSON error-shape check
   const report = await run(t, async (request, transport) => {
     const reply = await unavailableGateway(request, transport);
     if (!changed && request.headers.get("route-policy") === "bits=1" && reply.headers.get(refusal) === formatRefused("unavailable")) {
+      assert.equal(reply.status, 503);
       changed = true;
       return change(reply, { body: "service unavailable", replace: { "content-type": "text/plain" } });
     }
@@ -1042,7 +1070,7 @@ test("G15: a transient headerless 429 on the streaming probe is inconclusive", a
 
 test("G15: a non-SSE 200 whose body aborts still exposes provider=aurora", async (t) => {
   let interrupted = 0;
-  const report = await run(t, fixture(({ body, next }) => {
+  const handler = fixture(({ body, next }) => {
     if (body.stream !== true) return next();
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -1050,11 +1078,21 @@ test("G15: a non-SSE 200 whose body aborts still exposes provider=aurora", async
         controller.error(new Error("connection fell away after headers"));
       },
     }, { highWaterMark: 0 }); // The adapter commits headers before pulling the body.
-    return new Response(stream, { headers: { [applied]: formatApplied("aurora"), "content-type": "application/octet-stream" } });
-  }));
+    return new Response(stream, { status: 200, headers: { [applied]: formatApplied("aurora"), "content-type": "application/octet-stream" } });
+  });
+  const base = await baseAt(t, serve(handler, 0));
+  const report = await runConformance({ base, key, policyKey, endpoints: ["chat/completions"] });
   assert.equal(interrupted, 1);
   assert.equal(report.failed, 0);
   assert.equal(report.checks.find(({ id }) => id === "G15")?.status, "PASS");
+  const reply = await wireRequest(parseBase(base), {
+    path: "chat/completions", credential: { header: "authorization", key }, raw: JSON.stringify({ model, stream: true }),
+  }, 3_000);
+  assert.equal(interrupted, 2);
+  assert.equal(reply.status, 200);
+  assert.equal(reply.contentType, "application/octet-stream");
+  assert.deepEqual(reply.applied, ["provider=aurora"]);
+  assert.equal(reply.hasBody, false);
 });
 
 test("G15: a +zdr relay with comma-joined provider attribution fails the result audit", async (t) => {
@@ -1082,7 +1120,7 @@ test("G19: a headerless bits=64 rejection fails when its no-policy control reach
   assert.match(verdict.detail, /the no-policy control reached routing/);
 });
 
-test("G19: the demo has a PASS result-header check on chat/completions, responses, and messages", async (t) => {
+test(`G19: the demo has a PASS result-header check on ${INFERENCE_ENDPOINTS.join(", ")}`, async (t) => {
   const { server, base } = await startDemo(0);
   t.after(() => { server.closeAllConnections(); server.close(); });
   const report = await runConformance({ base: `${base}/v1`, key: "demo-key", policyKey: "demo-key-zdr", endpoints: INFERENCE_ENDPOINTS });
@@ -1252,12 +1290,12 @@ const clauses: Clause[] = [
   { id: "G24", clause: "order=routeprobe0,aurora fails when the gateway reports unsupported", required: "a syntactically valid unknown provider id is not an unsupported value", mutate: ({ header, next }) =>
     header === "order=routeprobe0,aurora" ? protocolError("unsupported", "order") : next() },
   { id: "G25", clause: "model=4 with header bits=0 fails if it returns unsupported instead of the model error", required: "the same ordinary error status 400 as the no-policy control, with no result headers", mutate: ({ header, body, next }) =>
-    header === "bits=0" && typeof body.model === "number" ? protocolError("unsupported", "bits") : next() },
+    header === "bits=0" && body.model === 4 ? protocolError("unsupported", "bits") : next() },
   ...([applied, refusal, evidence] as const).map((name): Clause => ({
     id: "G25", clause: `malformed JSON with repeated Route-Policy lines fails if ${name} is present`,
-    required: "the same ordinary error status 400 as the no-policy control, with no result headers", mutate: async ({ request, transport, header, body, next }) => {
+    required: "the same ordinary error status 400 as the no-policy control, with no result headers", mutate: async ({ request, transport, header, next }) => {
+      if (!transport?.repeatedRoutePolicy || header === null || await request.clone().text() !== "{") return next();
       const reply = await next();
-      if (request.method !== "POST" || !transport?.repeatedRoutePolicy || header === null || Object.keys(body).length > 0) return reply;
       return change(reply, { replace: { [name]: name === applied ? formatApplied("aurora")
         : name === refusal ? formatRefused("unsupported", "bits") : "https://aurora.example/evidence" } });
     },
@@ -1389,6 +1427,9 @@ test("G22: HTTP 201 fails detection status but leaves its key_policy=zdr valid",
   const report = await run(t, fixture(async ({ path, auth, next }) => {
     const reply = await next();
     if (path !== "/v1/route-policy" || auth !== `Bearer ${policyKey}`) return reply;
+    const body: unknown = await reply.clone().json();
+    assert.ok(body !== null && typeof body === "object" && "key_policy" in body);
+    assert.equal(body.key_policy, "zdr");
     return change(reply, { status: 201 });
   }));
   assertFailure(report, "G20", /required: a complete valid detection reply: status is 201, not 200$/);
@@ -1474,12 +1515,15 @@ for (const query of ["", "?", "?tenant=east", "?a=first&a=second", "?tag=O'Brien
   });
 }
 
-test("G20: a base path containing an unescaped space is rejected before detection", async (t) => {
+for (const [component, suffix] of [
+  ["query", "?tenant=two words"], ["path", "/two words"], ["path", "/naïve"],
+  ["query", "?tenant=\tq"], ["query", "?tenant=\r\nq"], ["query", "?tenant=\x00q"], ["path", "\\tenant"],
+]) test(`G20: a base ${component} containing raw ${JSON.stringify(suffix)} is rejected before detection`, async (t) => {
   let count = 0;
   const base = await baseAt(t, serve((request, transport) => { count++; return good(request, transport); }, 0));
-  for (const invalid of [`${base}?tenant=two words`, `${base}/naïve`, `${base}?tenant=\tq`, `${base}?tenant=\r\nq`, `${base}?tenant=\x00q`, `${base}\\tenant`]) {
-    await assert.rejects(runConformance({ base: invalid }), /cannot reproduce the base URL's request target exactly/);
-  }
+  await assert.rejects(runConformance({ base: `${base}${suffix}` }), {
+    name: "TypeError", message: "cannot reproduce the base URL's request target exactly; supply an escaped HTTP(S) URL",
+  });
   assert.equal(count, 0);
 });
 
@@ -1697,14 +1741,14 @@ test("G7: sort=price is compatible with a catalog holding one route and no accep
   assert.equal(report.checks.find(({ id }) => id === "G7")?.status, "PASS");
 });
 
-for (const additional of ["bits", "sort"] as const) test(`G11: ${additional === "bits" ? "bits=64 with bits=1" : "bits=1 with sort=price"} is probed in both carrier orientations`, async (t) => {
+for (const [impossible, partner, keys] of [
+  ["bits=64", "bits=1", ["bits"]], ["bits=1", "sort=price", ["bits", "sort"]],
+] as const) test(`G11: ${impossible} with ${partner} is probed in both carrier orientations`, async (t) => {
   const target = createGateway({
-    models: { [model]: [{ ...routes[0]!, facts: additional === "bits" ? "bits=8" : "" }] },
-    accept: { keys: additional === "bits" ? ["bits"] : ["bits", "sort"], sort: ["price"] },
+    models: { [model]: [{ ...routes[0]!, facts: impossible === "bits=64" ? "bits=8" : "" }] },
+    accept: { keys, sort: ["price"] },
     fetch: () => Response.json({ output: "served" }),
   });
-  const partner = additional === "bits" ? "bits=1" : "sort=price";
-  const impossible = additional === "bits" ? "bits=64" : "bits=1";
   const pairs = new Set<string>();
   const report = await run(t, fixture(({ header, suffix, next }) => {
     if (header !== null && suffix !== null && [header, suffix].includes(impossible) && [header, suffix].includes(partner)) {
@@ -1827,17 +1871,24 @@ test("G34: separate path and column control objects do not certify a refusal con
   assert.match(check.detail, /same whole refusal shape \(difference at \$\.(path|column)\)/);
 });
 
-test("G34: a truncated JSON refusal fails with the sampled count and error kinds in the diagnostic", async (t) => {
+test("G34: a truncated JSON refusal fails with the exact count and full kind list of sampled ordinary errors", async (t) => {
   const report = await run(t, fixture(async ({ next }) => {
     const reply = await next();
     return reply.headers.has(refusal) ? change(reply, { body: '{"error":' }) : reply;
   }));
   const check = report.checks.find(({ id }) => id === "G34");
   assert.equal(check?.status, "FAIL");
-  assert.match(check.detail, /expected a JSON error body/);
-  assert.match(check.detail, /\bbased on [1-9]\d* sampled ordinary errors\b/);
-  assert.match(check.detail, /malformed JSON, HTTP 400 application\/json/);
-  assert.match(check.detail, /wrong model type, HTTP 400 application\/json/);
+  const kinds = [
+    "malformed JSON, HTTP 400 application/json",
+    "wrong model type, HTTP 400 application/json",
+    "missing model field, HTTP 400 application/json",
+    "empty model ID, HTTP 404 application/json",
+    "unknown model, HTTP 404 application/json",
+    "invalid model field, HTTP 400 application/json",
+    "malformed or empty JSON, HTTP 400 application/json",
+  ];
+  assert.equal(check.detail.split("; required: ")[1],
+    `the refusal uses this endpoint's ordinary error format; expected a JSON error body (based on 11 sampled ordinary errors (${kinds.join("; ")}))`);
 });
 
 test("G34: a JSON refusal with empty ordinary control bodies leaves the shape unverified", async (t) => {

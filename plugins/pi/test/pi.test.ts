@@ -1,264 +1,420 @@
-import assert from "node:assert/strict";
-import { after, before, beforeEach, mock, test } from "node:test";
-import { MODEL_IN_URL_APIS } from "../../shared/src/plugin.ts";
-import { adapterContract } from "../../shared/test/adapter-contract.ts";
-import { FakeHarness } from "../../shared/test/fake-harness.ts";
-import { fakeGateway, routeOpenRouterTo, type FakeGateway } from "../../shared/test/fixtures.ts";
-import routePolicy from "../src/index.ts";
+// pi only: the header hook carries the plugin's policy as Route-Policy, and each payload takes the decision its
+// headers were prepared with, in order, or is blocked when which one it got cannot be told.
 
-delete process.env["ROUTE_POLICY"];
+import { scenarios, type Adapter, type Scenario } from "../../shared/test/fake-harness.ts";
+import type { Expected } from "../../shared/test/wire.ts";
+import pi from "../src/index.ts";
 
-let gateway: FakeGateway;
-routeOpenRouterTo(() => gateway.base);
-before(async () => {
-  gateway = await fakeGateway();
-});
-after(async () => {
-  await gateway.close();
-});
-beforeEach(async () => {
-  await FakeHarness.endAll();
-  gateway.requests.length = 0;
-  gateway.replies.detection = { status: 200, body: { route_policy: "1" } };
-  gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr+notrain+bits=8" }] }] } };
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
-});
+const ADAPTERS: readonly Adapter[] = [{ name: "pi", register: pi, headerHook: true }];
 
-/** pi with the plugin loaded and `policy` set through `/route`. */
-async function pi(policy?: string): Promise<FakeHarness> {
-  const harness = new FakeHarness(gateway.base, { headerHook: true });
-  routePolicy(harness.api);
-  await harness.emit("session_start", { type: "session_start", reason: "startup" });
-  if (policy !== undefined) await harness.command("route", policy);
-  return harness;
-}
+const NOT_HONORED = { status: 200, body: { choices: [] } };
+const entry = (policy: string | null): { type: string; customType: string; data: { policy: string | null } } => ({ type: "custom", customType: "inference-route-policy", data: { policy } });
 
-const BLOCKED = "Blocked by the route policy plugin, nothing was sent: ";
-const UNPREPARED = `${BLOCKED}the plugin did not see this request's headers, so it cannot tell which policy they carry`;
-const prepare = (harness: FakeHarness, headers: Record<string, string | null> = {}): Promise<unknown> => harness.emit("before_provider_headers", { type: "before_provider_headers", headers });
-const payloadHook = (harness: FakeHarness, payload: Record<string, unknown>): Promise<unknown> => harness.emit("before_provider_request", { type: "before_provider_request", payload }, "payload");
-/** What serializing a hook's returned payload does: its JSON, or the error a blocked payload throws. */
-function serialized(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-}
+const LIST: readonly Scenario[] = [
+  {
+    key: "n01",
+    ids: ["C10"],
+    env: { ROUTE_POLICY: "zdr" },
+    steps: [
+      { do: "set", model: { headers: { "ROUTE-POLICY": "bits=8" } } },
+      { do: "request" },
+      { do: "set", model: { headers: { "Route-Policy": "bits=8", "route-policy": "notrain" } } },
+      { do: "request" },
+    ],
+  },
+  {
+    key: "n02",
+    ids: ["C1"],
+    env: { ROUTE_POLICY: "zdr" },
+    steps: [
+      { do: "payload" },
+      { do: "route", args: "clear" },
+      { do: "payload" },
+      { do: "set", model: { id: "demo-model+zdr" } },
+      { do: "payload" },
+      { do: "set", model: { id: "demo-model", headers: { "route-policy": "zdr" } } },
+      { do: "payload" },
+    ],
+  },
+  {
+    key: "n03",
+    ids: ["C1", "C14"],
+    env: { ROUTE_POLICY: "zdr" },
+    steps: [
+      { do: "headers" },
+      { do: "route", args: "clear" },
+      { do: "headers" },
+      { do: "payload" },
+      { do: "headers", headers: { authorization: "Bearer demo-key" } },
+      { do: "headers", headers: { authorization: "Bearer demo-key-zdr" } },
+      { do: "payload" },
+      { do: "headers" },
+      { do: "payload", as: "b" },
+      { do: "post", body: "b" },
+    ],
+  },
+  {
+    key: "n04",
+    ids: ["C1"],
+    env: { ROUTE_POLICY: "zdr" },
+    session: { auth: [{ throws: "keychain locked" }, { result: { ok: true, apiKey: "demo-key" } }] },
+    steps: [{ do: "request" }, { do: "request" }],
+  },
+  {
+    key: "n05",
+    ids: ["C1"],
+    env: { ROUTE_POLICY: "zdr" },
+    timers: true,
+    steps: [
+      { do: "headers" },
+      { do: "set", auth: ["never", { result: { ok: true, apiKey: "demo-key" } }] },
+      { do: "start", id: "r1" },
+      { do: "tick", ms: 19_999 },
+      { do: "tick", ms: 1 },
+      { do: "finish", id: "r1" },
+      { do: "payload" },
+    ],
+  },
+  {
+    key: "n06",
+    ids: ["C1"],
+    env: { ROUTE_POLICY: "zdr" },
+    steps: [
+      { do: "request", payload: { model: "other-model", messages: [] } },
+      { do: "headers" },
+      { do: "set", model: { id: "other-model" } },
+      { do: "payload", payload: { model: "other-model", messages: [] } },
+    ],
+  },
+  {
+    key: "n07",
+    ids: ["C14"],
+    env: { ROUTE_POLICY: "zdr" },
+    rules: [{ on: "inference", nth: 1, reply: NOT_HONORED }],
+    steps: [
+      { do: "headers", as: "stale" },
+      { do: "request" },
+      { do: "headers", as: "fresh" },
+      { do: "payload" },
+      { do: "payload", as: "b" },
+      { do: "post", headers: "fresh", body: "b" },
+    ],
+  },
+  {
+    key: "n08",
+    ids: ["C10"],
+    steps: [
+      { do: "branch", entries: [entry("zdr"), entry("notrain")] },
+      { do: "emit", event: "session_tree" },
+      { do: "request" },
+      { do: "branch", entries: [entry("zdr")] },
+      { do: "emit", event: "session_switch" },
+      { do: "request" },
+    ],
+  },
+  {
+    key: "n09",
+    ids: ["C1", "C14"],
+    env: { ROUTE_POLICY: "zdr" },
+    session: { auth: { result: { ok: true, apiKey: "demo-key", headers: { "x-a": "auth", "x-b": "auth" } } }, model: { headers: { "x-b": "model", "x-c": "model" } } },
+    steps: [{ do: "headers", headers: { "x-c": "wire" } }, { do: "payload" }, { do: "post" }],
+  },
+  {
+    key: "n10",
+    ids: ["C1"],
+    env: { ROUTE_POLICY: "zdr" },
+    steps: [{ do: "headers", headers: "none" }, { do: "payload" }],
+  },
+];
 
-// ---- C10: carriers.
-test("C10: pi: held zdr+sort=price with typed +sort=latency+bits=8 is sent with Route-Policy zdr+sort=price and body model demo-model+sort=latency+bits=8 as typed", async () => {
-  const harness = await pi("zdr+sort=price");
-  harness.model.id = "demo-model+sort=latency+bits=8";
-  assert.ok((await harness.request({ model: harness.model.id, messages: [] })).sent);
-  assert.deepEqual(gateway.inference().map((r) => [r.headers["route-policy"], JSON.parse(r.body)]), [["zdr+sort=price", { model: "demo-model+sort=latency+bits=8", messages: [] }]]);
-});
+const EXPECTED: Expected = {
+  n01: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== set model={\"headers\":{\"ROUTE-POLICY\":\"bits=8\"}}",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"ROUTE-POLICY\":null,\"Route-Policy\":\"zdr+bits=8\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr+bits=8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== set model={\"headers\":{\"Route-Policy\":\"bits=8\",\"route-policy\":\"notrain\"}}",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr+notrain\",\"route-policy\":null}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr+notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  n02: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+      "== route args=clear",
+      "[1] appendEntry inference-route-policy {\"policy\":null}",
+      "[1] notify info \"Route policy cleared\"",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+      "== set model={\"id\":\"demo-model+zdr\"}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model+zdr\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+      "== set model={\"id\":\"demo-model\",\"headers\":{\"route-policy\":\"zdr\"}}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+    ],
+  },
+  n03: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== headers",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "== route args=clear",
+      "[1] appendEntry inference-route-policy {\"policy\":null}",
+      "[1] notify info \"Route policy cleared\"",
+      "== headers",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it",
+      "== headers headers={\"authorization\":\"Bearer demo-key\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"authorization\":\"Bearer demo-key\"}",
+      "== headers headers={\"authorization\":\"Bearer demo-key-zdr\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"authorization\":\"Bearer demo-key-zdr\"}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: requests for this model were prepared with different policies or keys at once; resend it",
+      "== headers",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {}",
+      "== payload as=b",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "== post body=b",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"no route policy sent with this request; the gateway names aurora as its route (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  n04: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> throws keychain locked",
+      "[1] before_provider_headers -> {}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  n05: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== headers",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "== set auth=[\"never\",{\"result\":{\"ok\":true,\"apiKey\":\"demo-key\"}}]",
+      "== start id=r1",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> never settles",
+      "== tick ms=19999",
+      "== tick ms=1",
+      "[1] before_provider_headers -> {}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable",
+      "== finish id=r1",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+    ],
+  },
+  n06: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== request payload={\"model\":\"other-model\",\"messages\":[]}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the request's model is not the one its headers were prepared for\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the request's model is not the one its headers were prepared for\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the request's model is not the one its headers were prepared for",
+      "== headers",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "== set model={\"id\":\"other-model\"}",
+      "== payload payload={\"model\":\"other-model\",\"messages\":[]}",
+      "[1] getApiKeyAndHeaders \"other-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin did not see this request's headers, so it cannot tell which policy they carry",
+    ],
+  },
+  n07: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== headers as=stale",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy NOT honored: no Route-Applied (request for demo-model to http://{gw}/v1)\"",
+      "[1] notify warning \"route policy NOT honored: no Route-Applied (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | body \"{\\\"choices\\\":[]}\"",
+      "== headers as=fresh",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the detection reply this request was checked against was discarded since; it is not sent\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the detection reply this request was checked against was discarded since; it is not sent\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the detection reply this request was checked against was discarded since; it is not sent",
+      "== payload as=b",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "== post headers=fresh body=b",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  n08: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"zdr\"}},{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"notrain\"}}]",
+      "== emit event=session_tree",
+      "[1] setStatus route-policy undefined",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"notrain\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"zdr\"}}]",
+      "== emit event=session_switch",
+      "== request",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_headers -> {\"Route-Policy\":\"notrain\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  n09: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== headers headers={\"x-c\":\"wire\"}",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\",\"headers\":{\"x-a\":\"auth\",\"x-b\":\"auth\"}}",
+      "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | x-a: auth | x-b: model | x-c: wire | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | x-a: auth | x-b: model | x-c: wire | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "[1] before_provider_headers -> {\"x-c\":\"wire\",\"Route-Policy\":\"zdr\"}",
+      "== payload",
+      "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\",\"headers\":{\"x-a\":\"auth\",\"x-b\":\"auth\"}}",
+      "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
+      "== post",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1 is not one the plugin released: its URL, headers (it carries authorization, x-c besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1 is not one the plugin released: its URL, headers (it carries authorization, x-c besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once\"",
+      "[1] POST http://{gw}/v1/chat/completions stopped: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1 is not one the plugin released: its URL, headers (it carries authorization, x-c besides the usual ones), body, or Route-Policy header differs from what was checked, or it was already sent once",
+    ],
+  },
+  n10: {
+    pi: [
+      "== open s=1",
+      "[1] registerCommand route \"Show the route policy (no argument), set one (/route <policy>), or remove it (/route clear)\"",
+      "[1] handlers session_start x1, session_tree x1, session_shutdown x1, before_provider_headers x1, before_provider_request x1",
+      "[1] setStatus route-policy undefined",
+      "== headers headers=none",
+      "[1] before_provider_headers (no headers) -> done",
+      "== payload",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable\"",
+      "[1] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable",
+    ],
+  },
+};
 
-test("C10: pi: held zdr with a configured route-policy bits=8 is sent with Route-Policy zdr+bits=8", async () => {
-  const harness = await pi("zdr");
-  harness.model.headers = { "route-policy": "bits=8" };
-  await harness.request();
-  assert.deepEqual(gateway.inference().map((r) => r.headers["route-policy"]), ["zdr+bits=8"]);
-});
-
-for (const [label, configured, expected] of [
-  ["ROUTE-POLICY bits=8", { "ROUTE-POLICY": "bits=8" }, { "ROUTE-POLICY": null, "Route-Policy": "zdr+bits=8" }],
-  ["Route-Policy bits=8 and route-policy notrain", { "Route-Policy": "bits=8", "route-policy": "notrain" }, { "Route-Policy": "zdr+notrain", "route-policy": null }],
-] as const) {
-  test(`C10: pi: held zdr's header hook, given the configured ${label}, leaves only Route-Policy set, to the combination`, async () => {
-    const harness = await pi("zdr");
-    harness.model.headers = { ...configured };
-    const headers: Record<string, string | null> = { ...configured };
-    await prepare(harness, headers);
-    assert.deepEqual(headers, expected);
-  });
-}
-
-// ---- C1: no detection.
-for (const [label, held, model, configured] of [
-  ["held zdr", "zdr", "demo-model", undefined],
-  ["typed +zdr", undefined, "demo-model+zdr", undefined],
-  ["a configured route-policy zdr", undefined, "demo-model", { "route-policy": "zdr" }],
-] as const) {
-  test(`C1: pi: with detection answering route_policy 1 as a number, a request with ${label} is blocked: no valid detection reply`, async () => {
-    gateway.replies.detection = { status: 200, body: { route_policy: 1 } };
-    const harness = await pi(held);
-    harness.model.id = model;
-    if (configured !== undefined) harness.model.headers = { ...configured };
-    const result = await harness.request({ model, messages: [] });
-    assert.deepEqual([result.error, gateway.inference()], [`${BLOCKED}${gateway.base} has no valid detection reply (detection reply is not valid: route_policy is not the string "1"), so no requirement may be sent there`, []]);
-  });
-}
-
-// ---- C1: payloads and their headers.
-for (const [label, held, model, configured] of [
-  ["held zdr", "zdr", "demo-model", undefined],
-  ["typed +zdr", undefined, "demo-model+zdr", undefined],
-  ["no policy", undefined, "demo-model", undefined],
-  ["a configured route-policy zdr", undefined, "demo-model", { "route-policy": "zdr" }],
-] as const) {
-  test(`C1: pi: a payload for ${model} with ${label}, whose headers the plugin never prepared, is blocked`, async () => {
-    const harness = await pi(held);
-    harness.model.id = model;
-    if (configured !== undefined) harness.model.headers = { ...configured };
-    assert.equal(serialized(await payloadHook(harness, { model, messages: [] })), UNPREPARED);
-  });
-}
-
-test("C1: pi: a payload after headers prepared with held zdr and then with none is blocked: its header is unknowable", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness);
-  await harness.command("route", "clear");
-  await prepare(harness);
-  assert.equal(serialized(await payloadHook(harness, { model: "demo-model", messages: [] })), `${BLOCKED}requests for this model were prepared with different policies or keys at once; resend it`);
-});
-
-test("C14: pi: a payload after headers prepared with Bearer demo-key and with Bearer demo-key-zdr is blocked: its key is unknowable", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness, { authorization: "Bearer demo-key" });
-  await prepare(harness, { authorization: "Bearer demo-key-zdr" });
-  assert.equal(serialized(await payloadHook(harness, { model: "demo-model", messages: [] })), `${BLOCKED}requests for this model were prepared with different policies or keys at once; resend it`);
-});
-
-test("C1: pi: a request with held zdr whose key lookup throws keychain locked is blocked: its headers could not be prepared", async () => {
-  const harness = await pi("zdr");
-  harness.resolveAuth = async () => {
-    throw new Error("keychain locked");
-  };
-  const result = await harness.request();
-  assert.deepEqual([result.error, harness.handlerErrors, gateway.inference()], [`${BLOCKED}the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable`, [], []]);
-});
-
-test("C1: pi: a request with held zdr whose header hook's key lookup never settles is blocked after 20 seconds, not given an earlier preparation", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness);
-  let calls = 0;
-  harness.resolveAuth = () => (calls++ === 0 ? new Promise(() => {}) : Promise.resolve({ ok: true, apiKey: "demo-key" }));
-  mock.timers.enable({ apis: ["setTimeout"] });
-  try {
-    const pending = harness.request();
-    await new Promise((resolve) => setImmediate(resolve));
-    mock.timers.tick(20_000);
-    const result = await pending;
-    assert.deepEqual([result.error, gateway.inference()], [`${BLOCKED}the plugin could not prepare the headers of a request in flight, so which policy this one carries is unknowable`, []]);
-  } finally {
-    mock.timers.reset();
-  }
-});
-
-test("C5, C11: pi: held notrain answered 503 with Route-Refused reason=unavailable is shown with its reason", async () => {
-  gateway.replies.inference = { status: 503, headers: { "route-refused": "reason=unavailable" }, body: {} };
-  const harness = await pi("notrain");
-  const from = harness.shown.length;
-  await harness.request();
-  const text = `route policy refused by the gateway: unavailable (request for demo-model to ${gateway.base})`;
-  assert.deepEqual(harness.shown.slice(from), [{ method: "setStatus", text }, { method: "notify", text }]);
-});
-
-test("C1: pi: a payload for other-model, with headers prepared for demo-model, is blocked", async () => {
-  const harness = await pi("zdr");
-  const result = await harness.request({ model: "other-model", messages: [] });
-  assert.deepEqual([result.error, gateway.inference()], [`${BLOCKED}the request's model is not the one its headers were prepared for`, []]);
-});
-
-test("C1: pi: a payload for other-model, with headers prepared only while demo-model was selected, is blocked as unprepared", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness);
-  harness.model.id = "other-model";
-  assert.equal(serialized(await payloadHook(harness, { model: "other-model", messages: [] })), UNPREPARED);
-});
-
-// ---- C14: preparations and discards.
-test("C14: pi: a payload whose headers were prepared before another request came back not honored is blocked as discarded", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness);
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
-  await harness.request();
-  assert.equal(serialized(await payloadHook(harness, { model: "demo-model", messages: [] })), `${BLOCKED}the detection reply this request was checked against was discarded since; it is not sent`);
-});
-
-test('C14: pi: after a request came back not honored, the next request makes the gateway requests ["GET /v1/route-policy", "POST /v1/chat/completions"]', async () => {
-  const harness = await pi("zdr");
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
-  await harness.request();
-  gateway.requests.length = 0;
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
-  await harness.request();
-  assert.deepEqual(gateway.requests.map((r) => `${r.method} ${r.path}`), ["GET /v1/route-policy", "POST /v1/chat/completions"]);
-});
-
-test("C14: pi: with a stale preparation queued ahead of a fresh one, the next payload alone, sent with the fresh headers, is the one POST that reaches the gateway", async () => {
-  const harness = await pi("zdr");
-  await prepare(harness);
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
-  await harness.request();
-  const fresh: Record<string, string | null> = {};
-  await prepare(harness, fresh);
-  assert.equal(serialized(await payloadHook(harness, { model: "demo-model", messages: [] })), `${BLOCKED}the detection reply this request was checked against was discarded since; it is not sent`);
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
-  const posts = gateway.inference().length;
-  const body = serialized(await payloadHook(harness, { model: "demo-model", messages: [] }));
-  const headers = { authorization: "Bearer demo-key", "content-type": "application/json", ...Object.fromEntries(Object.entries(fresh).filter((e): e is [string, string] => e[1] !== null)) };
-  await (await fetch(`${gateway.base}/chat/completions`, { method: "POST", headers, body })).text();
-  assert.deepEqual(gateway.inference().slice(posts).map((r) => [r.body, r.headers["route-policy"]]), [[JSON.stringify({ model: "demo-model", messages: [] }), "zdr"]]);
-});
-
-// ---- C1, C14: Google's key header.
-test('C1, C14: pi: a request with held zdr over google-generative-ai makes the gateway requests [GET, GET, POST], each with [x-goog-api-key, authorization] as ["demo-key", undefined]', async () => {
-  const harness = await pi("zdr");
-  harness.model.api = "google-generative-ai";
-  assert.ok((await harness.request({ contents: [] })).sent);
-  assert.deepEqual(gateway.requests.map((r) => [r.method, r.headers["x-goog-api-key"], r.headers.authorization]), [["GET", "demo-key", undefined], ["GET", "demo-key", undefined], ["POST", "demo-key", undefined]]);
-});
-
-for (const [label, wireKey] of [["x-goog-api-key other-key", "other-key"], ["no x-goog-api-key", null]] as const) {
-  test(`C1, C14: pi: a request with held zdr over google-generative-ai leaving with ${label} is stopped at fetch`, async () => {
-    const harness = await pi("zdr");
-    harness.model.api = "google-generative-ai";
-    harness.wireKey = wireKey;
-    const result = await harness.request({ contents: [] });
-    assert.deepEqual([result.sent, result.error?.includes("is not one the plugin released"), gateway.inference()], [false, true, []]);
-  });
-}
-
-// ---- C10: where the model is named.
-test(`C10: pi: for each of the ${MODEL_IN_URL_APIS.length} APIs in MODEL_IN_URL_APIS, held zdr with body {contents} is sent with Route-Policy zdr and that body`, async () => {
-  assert.ok(MODEL_IN_URL_APIS.length > 0);
-  for (const api of MODEL_IN_URL_APIS) {
-    gateway.requests.length = 0;
-    const harness = await pi("zdr");
-    harness.model.api = api;
-    assert.ok((await harness.request({ contents: [] })).sent, api);
-    assert.deepEqual(gateway.inference().map((r) => [r.headers["route-policy"], r.body]), [["zdr", JSON.stringify({ contents: [] })]], api);
-  }
-});
-
-for (const api of ["openai-completions", "openai-responses", "anthropic-messages", "azure-openai-responses", "mistral-conversations"]) {
-  for (const held of ["zdr", "sort=price"]) {
-    test(`C10: pi: held ${held} with body {input} and no model, over ${api}, is blocked: it has no model`, async () => {
-      const harness = await pi(held);
-      harness.model.api = api;
-      const result = await harness.request({ input: "fixture" });
-      assert.deepEqual([result.error, gateway.inference()], [`${BLOCKED}the request has no model in its body, which the ${api} API needs to carry the model and its suffix`, []]);
-    });
-  }
-}
-
-// ---- C10: resume.
-for (const [changes, header] of [
-  [["notrain", "zdr", "clear", "zdr+notrain"], "zdr+notrain"],
-  [["notrain", "zdr", "clear"], undefined],
-] as const) {
-  test(`C10: pi: a session resumed after /route ${changes.join(", /route ")}, followed by unrelated entries, sends Route-Policy ${String(header)}`, async () => {
-    const first = await pi();
-    for (const change of changes) await first.command("route", change);
-    const resumed = new FakeHarness(gateway.base, { headerHook: true });
-    resumed.entries.push(...first.entries, { type: "custom", customType: "another-plugin", data: { policy: "bits=8" } }, { type: "message", customType: "", data: { policy: "bits=8" } });
-    routePolicy(resumed.api);
-    await resumed.emit("session_start", { type: "session_start", reason: "resume" });
-    await resumed.request();
-    assert.deepEqual(gateway.inference().map((r) => r.headers["route-policy"]), [header]);
-  });
-}
-
-adapterContract("pi", pi, () => gateway);
+scenarios(LIST, ADAPTERS, EXPECTED);

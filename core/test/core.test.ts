@@ -256,7 +256,7 @@ test("S16: bits=0 followed by 15 pairs is refused naming bits, bits=0 followed b
   assert.deepEqual(parsePolicy(`bits=0+only=${"a".repeat(32)},${"b,".repeat(250)}c`), { ok: false, key: null, detail: "longer than 512 bytes" });
 });
 
-test("S16: in 11 policies of two to four pairs, the first failing pair in written order is the one refused, by value, repetition, grammar or unknown key", () => {
+test("S16: 11 policies of two to four pairs are refused with the key and detail of the first pair, in written order, that fails", () => {
   const cases: [text: string, key: string | null, detail: string][] = [
     ["bits=0+only=a,a", "bits", "takes one integer from 1 to 64"],
     ["only=a,a+bits=0", "only", "repeated item"],
@@ -867,7 +867,7 @@ test("C6: a reply with keys, attest and sort as empty lists grants no key and re
   assert.equal(supports(noValues.value.support, policy("sort=price")), false);
 });
 
-test("C6, C12: a reply listing later among keys, attest and sort is valid, gives keys zdr, attest, sort, attest weights and sort price, and keeps the key policy zdr+later=x+sort=later+attest=later as sent though it does not parse under that support", () => {
+test("C6: a reply listing later among keys, attest and sort is valid, gives keys zdr, attest, sort, attest weights and sort price, and keeps the key policy zdr+later=x+sort=later+attest=later as sent though it does not parse under that support", () => {
   const newer = parseDetection({ route_policy: "1", keys: ["zdr", "later", "sort", "attest"], attest: ["weights", "later"], sort: ["price", "later"], key_policy: "zdr+later=x+sort=later+attest=later" });
   assert.ok(newer.ok);
   assert.deepEqual(lists(newer.value.support), { keys: ["zdr", "attest", "sort"], attest: ["weights"], sort: ["price"] });
@@ -1301,7 +1301,7 @@ test("C16: over aurora, basalt, broken and twice, someRouteMeets is false for zd
   assert.equal(someRouteMeets(preSendRoutes(), combinePolicies({ header: policy("region=us"), suffix: policy("region=ca") })), false);
 });
 
-test("C16: someRouteMeets is false for sort=price over no routes, and refuses a hand-built copy of zdr over the four providers aurora, basalt, broken and twice and over no routes", () => {
+test("C16: someRouteMeets is false for sort=price over no routes, and refuses a hand-built copy of zdr, given the four published providers aurora, basalt, broken and twice or given no routes", () => {
   assert.equal(someRouteMeets(parseRoutes([]), policy("sort=price")), false);
   const forged: Policy = { ...policy("zdr") };
   assert.throws(() => someRouteMeets(preSendRoutes(), forged), notAPolicy);

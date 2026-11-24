@@ -59,6 +59,7 @@ for (const endpoint of ENDPOINTS) {
     const controller = await controllerReady;
     const response = await pending.catch((error: unknown) => assert.fail(`expected final headers before producing body bytes: ${String(error)}`));
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/event-stream");
     assert.equal(response.headers.get("route-applied"), "provider=aurora");
     const reader = response.body!.getReader();
     controller.enqueue(new TextEncoder().encode("data: first\n\n"));
@@ -108,6 +109,7 @@ test("G33: Basalt's gzip reply reaches the client decoded without its original e
   const init = target(`${model}+zdr`);
   const reply = await fetch(`${url}/v1/chat/completions`, { ...init, headers: { ...init.headers, "Route-Policy": "zdr", "accept-encoding": "br" } });
   assert.equal(reply.status, 200);
+  assert.equal(reply.headers.get("route-applied"), "provider=basalt");
   assert.equal(reply.headers.get("content-encoding"), null);
   assert.equal(reply.headers.get("content-length"), null);
   assert.equal(await reply.text(), payload);

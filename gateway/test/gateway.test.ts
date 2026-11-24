@@ -255,7 +255,7 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     noHeaders(response);
   });
 
-  test(`G25 ${mode}: a numeric model remains a headerless 400 with a repeated invalid policy`, async () => {
+  test(`G25 ${mode}: a numeric model remains a headerless 400 with policy-header repetition flagged`, async () => {
     const { gateway, calls } = setup();
     const requestWithInvalidHeader = (body: string, key = "open") => inference(endpoint, body, key, { "Route-Policy": "bits=0" });
     const cases: [string, string, number][] = [
@@ -299,7 +299,7 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(calls, []);
   });
 
-  test(`G34 ${mode}: bits=0 and a numeric model return the same error envelope`, async () => {
+  test(`G34 ${mode}: bits=0 and a numeric model return the same error-envelope shape`, async () => {
     const { gateway } = setup();
     const ordinary = await gateway(inference(endpoint, `{"model":7,"stream":${stream}}`));
     const policy = await assertRefusal(await gateway(call(model, "open", "bits=0")), 400, "reason=unsupported+key=bits");

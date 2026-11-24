@@ -1,375 +1,972 @@
-// Each test is one POST (or GET) through the fetch gate in one situation, and one thing observed of it: whether it
-// is stopped (fetch rejects and the gateway receives nothing), whether it goes (and what the gateway receives),
-// or what a release's owner or a watcher is told or hears.
+// The fetch gate on its own (C1, C3, C5, C14): releases and watchers added directly, every fetch through the
+// gated global fetch, every arrival recorded at loopback origins, every owner and watcher callback logged.
+
 import assert from "node:assert/strict";
-import { after, before, beforeEach, test } from "node:test";
-import { addRelease, addWatcher, type Release } from "../src/fetch-gate.ts";
-import { NOT_CONTEXT, placeOf, type Completion } from "../src/request.ts";
-import { fakeGateway, type FakeGateway } from "./fixtures.ts";
+import { mock, test } from "node:test";
+import { addRelease, addWatcher, withdrawReleases, type Release } from "../src/fetch-gate.ts";
+import { NOT_CONTEXT } from "../src/request.ts";
+import { describe } from "./fake-harness.ts";
+import { deadline, Log, log, Origins, recording, settle, summarize, type Expected, type Rule } from "./wire.ts";
 
-let gateway: FakeGateway;
-let elsewhere: FakeGateway;
-const removals: (() => void)[] = [];
-before(async () => {
-  gateway = await fakeGateway();
-  elsewhere = await fakeGateway();
-});
-after(async () => {
-  await gateway.close();
-  await elsewhere.close();
-});
-beforeEach(() => {
-  for (const remove of removals.splice(0)) remove();
-  gateway.requests.length = 0;
-  elsewhere.requests.length = 0;
-  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: { ok: true } };
-});
+/** A record, an array of lines, or { $headers: lines } for a Headers object made of them. */
+type HeadersSpec = Readonly<Record<string, string>> | readonly (readonly [string, string])[] | { readonly $headers: readonly (readonly [string, string])[] };
 
-const BODY = JSON.stringify({ model: "demo-model", messages: [{ role: "user", content: "secret" }] });
-const BLOCKED = (reason: string): string => `Blocked by the route policy plugin, nothing was sent: ${reason}`;
+type Step =
+  /** A release by `owner`, for `base` (with {origin} filled in), and the bytes it must leave with. `throws`: its owner's callbacks throw after they are logged. */
+  | { do: "release"; as: string; owner: string; base: string; query?: string; context?: readonly (readonly [string, string])[]; header?: string | null; body: string; throws?: boolean }
+  /** What the named release's decision relied on is discarded. */
+  | { do: "stale"; as: string }
+  | { do: "withdraw"; as: string }
+  | { do: "withdraw-owner"; owner: string }
+  /** A watcher answering `answer` for POSTs under `base`, null for others; "throws" to throw. `throws`: its stopped callback throws after it is logged. */
+  | { do: "watch"; as: string; answer: string | null | "throws"; base?: string; throws?: boolean }
+  | { do: "unwatch"; as: string }
+  | { do: "fetch"; id?: string; method?: string; url: string; headers?: HeadersSpec; body?: string; request?: boolean }
+  | { do: "finish"; id: string }
+  | { do: "await-held"; gate: string }
+  | { do: "release-gate"; gate: string }
+  | { do: "tick"; ms: number }
+  /** Calls the global fetch's own preconnect member, a runtime's member the gate must keep. */
+  | { do: "preconnect"; url: string };
 
-/** Releases BODY for bearer k and policy zdr at the gateway's base URL; returns what its owner hears and is told. */
-function release(overrides: Partial<Release> = {}): { completions: Completion[]; stops: string[] } {
-  const seen = { completions: [] as Completion[], stops: [] as string[] };
-  removals.push(
-    addRelease({
-      owner: overrides.owner ?? seen,
-      base: gateway.base,
-      query: "",
-      context: [["authorization", "Bearer k"]],
-      header: "zdr",
-      body: BODY,
-      current: () => true,
-      stopped: (reason) => seen.stops.push(reason),
-      complete: (completion) => seen.completions.push(completion),
-      ...overrides,
-    }),
-  );
-  return seen;
+interface Scenario {
+  key: string;
+  ids: readonly string[];
+  origins?: readonly string[];
+  rules?: readonly Rule[];
+  /** Mock Date, so `tick` steps age releases. */
+  clock?: boolean;
+  steps: readonly Step[];
 }
 
-/** A watcher that stops every POST to the gateway's origin no release matched, as "not released"; returns what it is told. */
-function watchAll(): string[] {
-  const stops: string[] = [];
-  removals.push(addWatcher({ check: (o) => (o.path.startsWith(new URL(gateway.base).origin) ? "not released" : null), stopped: (r) => stops.push(r) }));
-  return stops;
+type Lines = readonly (readonly [string, string])[];
+const isLines = (spec: HeadersSpec): spec is Lines => Array.isArray(spec);
+
+/** Headers as fetch takes them: a Headers object, an array of lines, or a record, as the step writes them. */
+function headersOf(spec: HeadersSpec): NonNullable<RequestInit["headers"]> {
+  const lines = (pairs: Lines): [string, string][] => pairs.map(([name, value]) => [name, value]);
+  if (isLines(spec)) return lines(spec);
+  const instance: unknown = spec["$headers"];
+  if (Array.isArray(instance)) return new Headers(lines(instance));
+  // Not lines and not a Headers object: the record form.
+  return { ...(spec as Readonly<Record<string, string>>) };
 }
 
-const post = (init: { headers?: RequestInit["headers"]; body?: string; url?: string } = {}): Promise<Response> =>
-  fetch(init.url ?? `${gateway.base}/chat/completions`, { method: "POST", headers: init.headers ?? { authorization: "Bearer k", "route-policy": "zdr" }, body: init.body ?? BODY });
-
-/** Asserts a POST is stopped: fetch rejects with `reason`, and neither gateway receives anything. */
-async function stopped(sending: Promise<Response>, reason: string): Promise<void> {
-  await assert.rejects(sending, (error: unknown) => error instanceof Error && error.message === BLOCKED(reason));
-  assert.deepEqual([gateway.requests, elsewhere.requests], [[], []]);
-}
-
-const OK_COMPLETION = (applied: string[] = ["provider=aurora"]): Completion => ({ status: 200, result: { applied, refused: [], evidence: [] } });
-
-test('C1: a POST no release matches, with a watcher answering "not released", is stopped with that reason', async () => {
-  watchAll();
-  await stopped(post(), "not released");
-});
-
-test('C1: a POST no release matches, with a watcher answering "not released", has the watcher told "not released"', async () => {
-  const stops = watchAll();
-  await assert.rejects(post());
-  assert.deepEqual(stops, ["not released"]);
-});
-
-test('C1: a POST no release matches, while a release for another body waits, with a watcher answering "not released", is stopped with that reason', async () => {
-  watchAll();
-  release({ body: JSON.stringify({ model: "other-model", messages: [] }) });
-  await stopped(post(), "not released");
-});
-
-test("C1: a POST no release matches, with a watcher that throws broken watcher, is stopped as a failure of the plugin", async () => {
-  removals.push(addWatcher({ check: () => { throw new Error("broken watcher"); }, stopped: () => {} }));
-  await stopped(post(), "the plugin failed while checking the request: broken watcher");
-});
-
-test("C1: the released POST reaches the gateway as [POST, /chat/completions, the released body, policy header zdr]", async () => {
-  release();
-  await (await post()).text();
-  assert.deepEqual(gateway.requests.map((r) => [r.method, r.path.replace(/^.*\/v1/, ""), r.body, r.headers["route-policy"]]), [["POST", "/chat/completions", BODY, "zdr"]]);
-});
-
-test("C5: the owner of the released POST hears its 400 response with Route-Refused reason=unsatisfiable", async () => {
-  const owner = release();
-  gateway.replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: { error: { message: "no" } } };
-  await (await post()).text();
-  assert.deepEqual(owner, { completions: [{ status: 400, result: { applied: [], refused: ["reason=unsatisfiable"], evidence: [] } }], stops: [] });
-});
-
-test("C1: the released POST's 400 response reaches the caller with its body untouched", async () => {
-  release();
-  gateway.replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: { error: { message: "no" } } };
-  const response = await post();
-  assert.deepEqual([response.status, await response.json()], [400, { error: { message: "no" } }]);
-});
-
-test('C1: a second POST of the released bytes, with a watcher answering "not released", is stopped with that reason', async () => {
-  watchAll();
-  release();
-  await (await post()).text();
-  gateway.requests.length = 0;
-  await stopped(post(), "not released");
-});
-
-const STALE = "the detection reply this request was checked against was discarded before it left; send it again";
-test("C14: a POST of a release whose decision is no longer current is stopped as discarded", async () => {
-  release({ current: () => false });
-  await stopped(post(), STALE);
-});
-
-test("C14: the owner of a release whose decision is no longer current is told it was discarded", async () => {
-  const owner = release({ current: () => false });
-  await assert.rejects(post());
-  assert.deepEqual(owner.stops, [STALE]);
-});
-
-test("C14: the owner of a release whose decision is no longer current hears no response", async () => {
-  const owner = release({ current: () => false });
-  await assert.rejects(post());
-  assert.deepEqual(owner.completions, []);
-});
-
-for (const [name, variant] of [
-  ["bearer other instead of k", { headers: { authorization: "Bearer other", "route-policy": "zdr" } }],
-  ["an added x-api-key", { headers: { authorization: "Bearer k", "x-api-key": "k2", "route-policy": "zdr" } }],
-  ["an added x-goog-api-key", { headers: { authorization: "Bearer k", "x-goog-api-key": "k2", "route-policy": "zdr" } }],
-  ["an added api-key", { headers: { authorization: "Bearer k", "api-key": "k2", "route-policy": "zdr" } }],
-  ["an added cookie", { headers: { authorization: "Bearer k", cookie: "session=1", "route-policy": "zdr" } }],
-  ["an added proxy-authorization", { headers: { authorization: "Bearer k", "proxy-authorization": "Basic eA==", "route-policy": "zdr" } }],
-  ["an added x-tenant-token", { headers: { authorization: "Bearer k", "x-tenant-token": "t", "route-policy": "zdr" } }],
-  ["the query ?key=1", { url: "QUERY" }],
-  ["the path /other/chat/completions", { url: "OTHER" }],
-  ["policy header zdr+notrain", { headers: { authorization: "Bearer k", "route-policy": "zdr+notrain" } }],
-  ["no policy header", { headers: { authorization: "Bearer k" } }],
-  ["two route-policy lines zdr", { headers: [["authorization", "Bearer k"], ["route-policy", "zdr"], ["route-policy", "zdr"]] }],
-  ["an added provider member in the body", { body: JSON.stringify({ model: "demo-model", messages: [{ role: "user", content: "secret" }], provider: {} }) }],
-  ["a trailing space after the body", { body: `${BODY} ` }],
-] as const) {
-  test(`C1, C14: a POST differing from the release only by ${name}, with a watcher answering "not released", is stopped with that reason`, async () => {
-    watchAll();
-    release();
-    const url = "url" in variant ? (variant.url === "QUERY" ? `${gateway.base}/chat/completions?key=1` : `${new URL(gateway.base).origin}/other/chat/completions`) : undefined;
-    const headers = "headers" in variant ? (variant.headers as RequestInit["headers"]) : undefined;
-    const body = "body" in variant ? variant.body : undefined;
-    await stopped(post({ ...(url === undefined ? {} : { url }), ...(headers === undefined ? {} : { headers }), ...(body === undefined ? {} : { body }) }), "not released");
-  });
-}
-
-test('C1: a POST with policy header zdr to a release made with no policy header, with a watcher answering "not released", is stopped with that reason', async () => {
-  watchAll();
-  release({ header: null });
-  await stopped(post(), "not released");
-});
-
-const NAMES = NOT_CONTEXT.filter((name) => name !== "route-policy");
-test(`C1: for each of the ${NAMES.length} names in NOT_CONTEXT but route-policy, a POST adding that header goes as the release`, async () => {
-  assert.ok(NAMES.length > 0);
-  watchAll();
-  for (const name of NAMES) {
-    const owner = release();
-    // fetch computes content-length itself; any value given here is replaced, so the header is still present.
-    await (await post({ headers: { authorization: "Bearer k", "route-policy": "zdr", [name]: name === "content-length" ? String(BODY.length) : "x" } })).text();
-    assert.deepEqual(owner, { completions: [OK_COMPLETION()], stops: [] }, name);
+async function run(scenario: Scenario): Promise<string[]> {
+  const out = new Log();
+  const origins = await Origins.start(out, ["gw", ...(scenario.origins ?? [])], scenario.rules ?? []);
+  const owners = new Map<string, object>();
+  const current = new Map<string, boolean>();
+  const withdrawals = new Map<string, () => void>();
+  const unwatch = new Map<string, () => void>();
+  const started = new Map<string, Promise<void>>();
+  const owner = (name: string): object => {
+    let found = owners.get(name);
+    if (found === undefined) {
+      found = { name };
+      owners.set(name, found);
+    }
+    return found;
+  };
+  const send = async (step: Extract<Step, { do: "fetch" }>): Promise<void> => {
+    const url = origins.fill(step.url);
+    const method = step.method ?? "POST";
+    const init: RequestInit = { method, ...(step.headers === undefined ? {} : { headers: headersOf(step.headers) }), ...(step.body === undefined ? {} : { body: step.body }) };
+    let response: Response;
+    try {
+      response = step.request === true ? await fetch(new Request(url, init)) : await fetch(url, init);
+    } catch (error) {
+      log(`${method} ${url} threw ${String(error)}`);
+      return;
+    }
+    const text = await response.text();
+    const shown = [...response.headers].filter(([name]) => name !== "connection" && name !== "keep-alive").map(([name, value]) => `${name}: ${value}`);
+    log(`${method} ${url} -> ${response.status} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
+  };
+  if (scenario.clock === true) mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  try {
+    await recording(out, null, () =>
+      deadline(
+        (async () => {
+          for (const step of scenario.steps) {
+            out.push(`== ${describe(step, 400)}`);
+            switch (step.do) {
+              case "release": {
+                current.set(step.as, true);
+                const as = step.as;
+                const release: Release = {
+                  owner: owner(step.owner),
+                  base: origins.fill(step.base),
+                  query: step.query ?? "",
+                  context: step.context ?? [],
+                  header: step.header ?? null,
+                  body: step.body,
+                  current: () => current.get(as) === true,
+                  stopped: (reason) => {
+                    log(`${step.owner} told ${as} stopped: ${reason}`);
+                    if (step.throws === true) throw new Error("owner callback is gone");
+                  },
+                  complete: (completion) => {
+                    log(`${step.owner} told ${as} complete: ${JSON.stringify(completion)}`);
+                    if (step.throws === true) throw new Error("owner callback is gone");
+                  },
+                };
+                withdrawals.set(step.as, addRelease(release));
+                break;
+              }
+              case "stale":
+                current.set(step.as, false);
+                break;
+              case "withdraw":
+                withdrawals.get(step.as)?.();
+                break;
+              case "withdraw-owner":
+                withdrawReleases(owner(step.owner));
+                break;
+              case "watch": {
+                const { as, answer } = step;
+                const base = step.base === undefined ? null : origins.fill(step.base);
+                unwatch.set(
+                  as,
+                  addWatcher({
+                    check: (outgoing) => {
+                      log(`watcher ${as} asked about ${JSON.stringify(outgoing)}`);
+                      if (answer === "throws") throw new Error("broken watcher");
+                      return base === null || outgoing.path.startsWith(`${base}/`) ? answer : null;
+                    },
+                    stopped: (reason) => {
+                      log(`watcher ${as} told stopped: ${reason}`);
+                      if (step.throws === true) throw new Error("watcher callback is gone");
+                    },
+                  }),
+                );
+                break;
+              }
+              case "unwatch":
+                unwatch.get(step.as)?.();
+                break;
+              case "fetch":
+                if (step.id === undefined) await send(step);
+                else started.set(step.id, send(step));
+                break;
+              case "finish":
+                await deadline(started.get(step.id) ?? Promise.reject(new Error(`no fetch ${step.id}`)), 3000, `fetch ${step.id} to finish`);
+                break;
+              case "await-held":
+                await origins.held(step.gate);
+                break;
+              case "release-gate":
+                origins.release(step.gate);
+                break;
+              case "preconnect": {
+                const member: unknown = Reflect.get(globalThis.fetch, "preconnect");
+                if (typeof member === "function") member(origins.fill(step.url));
+                else log("the global fetch has no preconnect");
+                break;
+              }
+              case "tick":
+                mock.timers.tick(step.ms);
+                break;
+            }
+            await settle();
+          }
+        })(),
+        10_000,
+        `scenario ${scenario.key} to finish`,
+      ),
+    );
+  } finally {
+    if (scenario.clock === true) mock.timers.reset();
+    for (const withdraw of withdrawals.values()) withdraw();
+    for (const stop of unwatch.values()) stop();
+    await origins.close();
   }
-});
-
-for (const [name, headers] of [
-  ["a lowercase object", { authorization: "Bearer k", "route-policy": "zdr" }],
-  ["a title-case object", { Authorization: "Bearer k", "Route-Policy": "zdr" }],
-  ["an uppercase object", { AUTHORIZATION: "Bearer k", "ROUTE-POLICY": "zdr" }],
-  ["a mixed-case object", { aUtHoRiZaTiOn: "Bearer k", "rOuTe-PoLiCy": "zdr" }],
-  ["a lowercase array", [["authorization", "Bearer k"], ["route-policy", "zdr"]]],
-  ["a mixed-case array", [["Authorization", "Bearer k"], ["ROUTE-POLICY", "zdr"]]],
-  ["a Headers", "HEADERS"],
-] as const) {
-  test(`C1: a POST with the released headers as ${name} goes as the release`, async () => {
-    const owner = release();
-    const given = headers === "HEADERS" ? new Headers({ Authorization: "Bearer k", "Route-Policy": "zdr" }) : (headers as RequestInit["headers"]);
-    await (await post({ ...(given === undefined ? {} : { headers: given }) })).text();
-    assert.deepEqual(owner, { completions: [OK_COMPLETION()], stops: [] });
-  });
+  return out.lines;
 }
 
-test('C1: a POST of a Request object carrying the released bytes, with a watcher answering "not released", is stopped with that reason', async () => {
-  watchAll();
-  release();
-  await stopped(fetch(new Request(`${gateway.base}/chat/completions`, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY })), "not released");
-});
-
-const AMBIGUOUS = "two sessions released this same request, so whose it is cannot be told";
-test("C1, C5: a POST that two owners released alike is stopped as ambiguous", async () => {
-  release({ owner: { session: 1 } });
-  release({ owner: { session: 2 } });
-  await stopped(post(), AMBIGUOUS);
-});
-
-test("C1, C5: of two owners that released a POST alike, the first and the second are told it is ambiguous", async () => {
-  const first = release({ owner: { session: 1 } });
-  const second = release({ owner: { session: 2 } });
-  await assert.rejects(post());
-  assert.deepEqual([first.stops, second.stops], [[AMBIGUOUS], [AMBIGUOUS]]);
-});
-
-test("C1, C5: of two owners that released a POST alike, the first and the second hear no response", async () => {
-  const first = release({ owner: { session: 1 } });
-  const second = release({ owner: { session: 2 } });
-  await assert.rejects(post());
-  assert.deepEqual([first.completions, second.completions], [[], []]);
-});
-
-/** Waits until `done` holds, for at most two seconds. */
-async function until(done: () => boolean): Promise<void> {
-  for (let i = 0; i < 400 && !done(); i++) await new Promise((wake) => setTimeout(wake, 5));
-  assert.ok(done(), "timed out waiting");
+function scenarios(list: readonly Scenario[], expected: Expected): void {
+  for (const scenario of list) {
+    const want = expected[scenario.key]?.["gate"];
+    const steps = scenario.steps.map((step) => describe(step, 40)).join("; ");
+    const rules = (scenario.rules ?? []).map((rule) => `rule ${describe({ ...rule })}; `).join("");
+    test(`${scenario.key}${scenario.ids.length === 0 ? "" : ` ${scenario.ids.join(", ")}`}: gate: ${rules}steps: ${steps} => ${want === undefined ? "(no expected record)" : summarize(want)}`, async () => {
+      const [key, variant, actual] = [scenario.key, "gate", await run(scenario)];
+      assert.ok(want !== undefined, `no expected record for ${key} in ${variant}`);
+      assert.deepEqual(actual, want);
+    });
+  }
 }
 
-test("C5: with mine (200 aurora, 200 ms) leaving before theirs (400 unsatisfiable, 20 ms), the owners' callbacks are [theirs with 400 and Route-Refused reason=unsatisfiable, mine with 200 and Route-Applied provider=aurora]", async () => {
-  const OTHER = JSON.stringify({ model: "other-model", messages: [] });
-  const heard: unknown[] = [];
-  release({ owner: { session: 1 }, complete: (c) => heard.push(["mine", c]) });
-  release({ owner: { session: 2 }, body: OTHER, complete: (c) => heard.push(["theirs", c]) });
-  gateway.replies.inference = (request) =>
-    request.body === BODY
-      ? { status: 200, headers: { "route-applied": "provider=aurora" }, body: {}, delayMs: 200 }
-      : { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {}, delayMs: 20 };
-  const first = post();
-  await until(() => gateway.inference().length === 1);
-  await Promise.all([first.then((r) => r.text()), post({ body: OTHER }).then((r) => r.text())]);
-  assert.deepEqual(heard, [
-    ["theirs", { status: 400, result: { applied: [], refused: ["reason=unsatisfiable"], evidence: [] } }],
-    ["mine", OK_COMPLETION()],
-  ]);
-});
+const GW = "http://{gw}/v1";
+const POST = "http://{gw}/v1/chat/completions";
+const BODY = '{"model":"demo-model","messages":[]}';
+const AUTH = [["authorization", "Bearer k"]] as const;
+const NOT_RELEASED = { do: "watch", as: "W", answer: "not released", base: GW } as const;
+const released = (as: string, extra: Partial<Extract<Step, { do: "release" }>> = {}): Step => ({ do: "release", as, owner: "o1", base: GW, context: AUTH, header: "zdr", body: BODY, ...extra });
+const posted = (extra: Partial<Extract<Step, { do: "fetch" }>> = {}): Step => ({ do: "fetch", url: POST, headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY, ...extra });
 
-test("C5: with mine (200 ms) leaving before theirs (20 ms), the callers' fetches finish in the order [theirs, mine]", async () => {
-  const OTHER = JSON.stringify({ model: "other-model", messages: [] });
-  release({ owner: { session: 1 } });
-  release({ owner: { session: 2 }, body: OTHER });
-  gateway.replies.inference = (request) => ({ status: 200, headers: {}, body: {}, delayMs: request.body === BODY ? 200 : 20 });
-  const finished: string[] = [];
-  const first = post().then(async (r) => {
-    await r.text();
-    finished.push("mine");
-  });
-  await until(() => gateway.inference().length === 1);
-  await Promise.all([first, post({ body: OTHER }).then(async (r) => {
-    await r.text();
-    finished.push("theirs");
-  })]);
-  assert.deepEqual(finished, ["theirs", "mine"]);
-});
-
-for (const status of [301, 302, 303, 307, 308]) {
-  test(`C1: a released POST answered ${status} with a location at another origin is not followed: the other origin receives nothing`, async () => {
-    const owner = release();
-    gateway.replies.inference = { status, headers: { location: `${elsewhere.base}/chat/completions` } };
-    const response = await post();
-    await response.text();
-    assert.deepEqual([response.status, elsewhere.requests, owner.completions.map((c) => c.status)], [status, [], [status]]);
-  });
-}
-
-for (const [lines, joined] of [
-  [["provider=aurora", "provider=basalt"], "provider=aurora, provider=basalt"],
-  [["provider=aurora", "provider=aurora"], "provider=aurora, provider=aurora"],
-] as const) {
-  test(`C3: Route-Applied lines ${JSON.stringify(lines)} reach the owner as the one value ${JSON.stringify(joined)}`, async () => {
-    const owner = release();
-    gateway.replies.inference = { status: 200, headers: { "route-applied": [...lines] }, body: {} };
-    await (await post()).text();
-    assert.deepEqual(owner.completions, [OK_COMPLETION([joined])]);
-  });
-}
-
-const G = (): string => new URL(gateway.base).origin;
-const PORT = (): string => new URL(gateway.base).port;
-type WireRow = { name: string; base: () => string; url: () => string; target: string | null; reason?: string };
-const WIRE: WireRow[] = [
-  { name: "base /v1/ and a POST to /v1/chat/completions", base: () => `${G()}/v1/`, url: () => `${G()}/v1/chat/completions`, target: "/v1/chat/completions" },
-  { name: "base /v1/ and a POST to /v1//chat/completions", base: () => `${G()}/v1/`, url: () => `${G()}/v1//chat/completions`, target: null },
-  { name: "base /v1 and a POST to /v1/x/../chat/completions", base: () => `${G()}/v1`, url: () => `${G()}/v1/x/../chat/completions`, target: "/v1/chat/completions" },
-  { name: "base /v1 and a POST to /v%31/chat/completions", base: () => `${G()}/v1`, url: () => `${G()}/v%31/chat/completions`, target: null },
-  { name: "base /v1 and a POST to the sibling /v123/chat/completions", base: () => `${G()}/v1`, url: () => `${G()}/v123/chat/completions`, target: null },
-  { name: "base /v1?q=a+b and a POST with ?q=a+b", base: () => `${G()}/v1?q=a+b`, url: () => `${G()}/v1/chat/completions?q=a+b`, target: "/v1/chat/completions?q=a+b" },
-  { name: "base /v1?q=a+b and a POST with ?q=a%20b", base: () => `${G()}/v1?q=a+b`, url: () => `${G()}/v1/chat/completions?q=a%20b`, target: null },
-  { name: "base /v1?q=%2b and a POST with ?q=%2B", base: () => `${G()}/v1?q=%2b`, url: () => `${G()}/v1/chat/completions?q=%2B`, target: null },
-  { name: "base /v1 and a POST to HTTP://127.0.0.1", base: () => `${G()}/v1`, url: () => `HTTP://127.0.0.1:${PORT()}/v1/chat/completions`, target: "/v1/chat/completions" },
-  { name: "base /v1 and a POST to 127.0.0.1. with a trailing dot", base: () => `${G()}/v1`, url: () => `http://127.0.0.1.:${PORT()}/v1/chat/completions`, target: "/v1/chat/completions" },
-  { name: "base /v1 and a POST with the fragment #part", base: () => `${G()}/v1`, url: () => `${G()}/v1/chat/completions#part`, target: "/v1/chat/completions" },
-  { name: "base /v1? and a POST with ?#part", base: () => `${G()}/v1?`, url: () => `${G()}/v1/chat/completions?#part`, target: "/v1/chat/completions?" },
-  { name: "base /v1? and a POST with no query", base: () => `${G()}/v1?`, url: () => `${G()}/v1/chat/completions`, target: null },
-  { name: "base /v1 and a POST to another port's /v1/chat/completions", base: () => `${G()}/v1`, url: () => `${elsewhere.base}/chat/completions`, target: null },
+const LIST: readonly Scenario[] = [
+  {
+    key: "g01",
+    ids: ["C1", "C3", "C5"],
+    rules: [
+      { on: "inference", nth: 1, reply: { status: 200, headers: { "route-applied": ["provider=aurora", "provider=basalt"] }, body: { choices: [] } } },
+      { on: "inference", nth: 2, reply: { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, raw: '{"error":  "unsatisfiable"}' } },
+    ],
+    steps: [NOT_RELEASED, released("A"), posted(), released("B"), posted(), posted()],
+  },
+  {
+    key: "g02",
+    ids: ["C1", "C14"],
+    steps: [
+      released("A"),
+      posted({ headers: { $headers: [["authorization", "Bearer k"], ["route-policy", "zdr"]] } }),
+      released("B"),
+      posted({ headers: [["authorization", "Bearer k"], ["route-policy", "zdr"]] }),
+      released("C"),
+      posted({ headers: [["Authorization", "Bearer k"], ["Route-Policy", "zdr"]] }),
+      released("D"),
+      posted({ headers: { Authorization: "Bearer k", "route-POLICY": "zdr" } }),
+      released("E"),
+      posted({ headers: { AUTHORIZATION: "Bearer k", "ROUTE-POLICY": "zdr" } }),
+      released("F"),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", ...Object.fromEntries(NOT_CONTEXT.filter((name) => name !== "route-policy" && name !== "content-length").map((name) => [name, "x"])) } }),
+    ],
+  },
+  {
+    key: "g03",
+    ids: ["C1", "C14"],
+    steps: [
+      NOT_RELEASED,
+      released("A"),
+      posted({ body: `${BODY} ` }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", "api-key": "k" } }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", cookie: "a=1" } }),
+      posted({ body: '{"model":"demo-model","messages":[],"provider":{"only":["x"]}}' }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", "proxy-authorization": "Basic x" } }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", "x-api-key": "k" } }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", "x-goog-api-key": "k" } }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr", "x-tenant-token": "t" } }),
+      posted({ headers: { authorization: "Bearer other", "route-policy": "zdr" } }),
+      posted({ headers: { authorization: "Bearer k" } }),
+      posted({ headers: { authorization: "Bearer k", "route-policy": "zdr+notrain" } }),
+      posted({ url: "http://{gw}/v1/other/../../other/chat/completions" }),
+      posted({ url: `${POST}?key=1` }),
+      posted({ headers: [["authorization", "Bearer k"], ["route-policy", "zdr"], ["route-policy", "zdr"]] }),
+      posted({ request: true }),
+      posted(),
+    ],
+  },
+  {
+    key: "g04",
+    ids: ["C1", "C14"],
+    steps: [
+      NOT_RELEASED,
+      released("A", { header: null }),
+      posted(),
+      posted({ headers: { authorization: "Bearer k" } }),
+    ],
+  },
+  {
+    key: "g05",
+    ids: ["C1", "C14"],
+    steps: [
+      NOT_RELEASED,
+      released("A", { context: [["authorization", "Bearer k"], ["x-tenant", "a, b"]] }),
+      posted({ headers: [["authorization", "  Bearer other  "], ["x-tenant", "a"], ["x-tenant", "b"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["x-tenant", "a"], ["x-tenant", "b"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["authorization", "Bearer k"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["authorization", "Bearer k"], ["x-tenant", "a,b"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["authorization", "Bearer k"], ["x-tenant", "a"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["authorization", "Bearer k"], ["x-tenant", "b"], ["x-tenant", "a"], ["route-policy", "zdr"]] }),
+      posted({ headers: [["authorization", "  Bearer k  "], ["x-tenant", "a"], ["X-Tenant", "b"], ["route-policy", "zdr"]] }),
+    ],
+  },
+  {
+    key: "g06",
+    ids: ["C1", "C14"],
+    steps: [
+      NOT_RELEASED,
+      released("A", { query: "" }),
+      posted({ url: `${POST}?` }),
+      posted({ url: `${POST}?t=1` }),
+      { do: "withdraw", as: "A" },
+      released("B", { query: "?" }),
+      posted(),
+      posted({ url: `${POST}?t=1` }),
+      { do: "withdraw", as: "B" },
+      released("C", { query: "?t=1" }),
+      posted(),
+      posted({ url: `${POST}?` }),
+      { do: "withdraw", as: "C" },
+      released("D", { query: "" }),
+      posted(),
+      released("E", { query: "?" }),
+      posted({ url: `${POST}?` }),
+      released("F", { query: "?t=1" }),
+      posted({ url: `${POST}?t=1` }),
+    ],
+  },
+  {
+    key: "g07",
+    ids: ["C1", "C14"],
+    origins: ["other"],
+    steps: [
+      { do: "watch", as: "W", answer: "not released" },
+      released("A"),
+      posted({ url: "http://{other}/v1/chat/completions" }),
+      posted({ url: "http://{gw}/v123/chat/completions" }),
+      posted({ url: "http://{gw}/v%31/chat/completions" }),
+      posted({ url: "http://{gw}/v1//chat/completions" }),
+      posted({ url: "http://{gw}/v1/x/../chat/completions" }),
+      released("B"),
+      posted({ url: "HTTP://{gw}/v1/chat/completions" }),
+      released("C"),
+      posted({ url: "http://127.0.0.1.:{gw.port}/v1/chat/completions" }),
+      released("D"),
+      posted({ url: `${POST}#part` }),
+      released("E", { query: "?" }),
+      posted({ url: `${POST}?#part` }),
+      released("F", { query: "?q=a+b" }),
+      posted({ url: `${POST}?q=a%20b` }),
+      posted({ url: `${POST}?q=a+b` }),
+      released("G", { query: "?q=%2b" }),
+      posted({ url: `${POST}?q=%2B` }),
+      released("H", { base: "http://{gw}/v1/" }),
+      posted(),
+      released("I"),
+      posted({ url: "http://{gw}/v1/" }),
+    ],
+  },
+  {
+    key: "g08",
+    ids: ["C1"],
+    origins: ["other"],
+    steps: [
+      released("A", { body: '{"model":"other"}' }),
+      NOT_RELEASED,
+      posted(),
+      { do: "fetch", method: "GET", url: "http://{gw}/v1/models", headers: { authorization: "Bearer k", "route-policy": "zdr" } },
+      posted({ url: "http://{other}/v1/chat/completions" }),
+      posted({ body: '{"model":"other"}' }),
+      { do: "unwatch", as: "W" },
+      { do: "watch", as: "N", answer: null },
+      { do: "watch", as: "T", answer: "throws" },
+      posted(),
+      { do: "unwatch", as: "T" },
+      posted(),
+      { do: "watch", as: "W2", answer: "second says no", base: GW },
+      posted(),
+      { do: "watch", as: "W3", answer: "third says no", base: GW },
+      posted(),
+    ],
+  },
+  {
+    key: "g09",
+    ids: ["C1", "C14"],
+    steps: [
+      NOT_RELEASED,
+      released("A"),
+      { do: "stale", as: "A" },
+      posted(),
+      posted(),
+      released("B"),
+      released("C", { owner: "o2" }),
+      posted(),
+      posted(),
+      { do: "withdraw-owner", owner: "o1" },
+      posted(),
+      { do: "withdraw", as: "C" },
+      posted(),
+    ],
+  },
+  {
+    key: "g10",
+    ids: ["C1", "C3", "C14"],
+    origins: ["other"],
+    rules: [301, 302, 303, 307, 308].map((status, i): Rule => ({ on: "inference", nth: i + 1, reply: { status, headers: { location: "http://{other}/v1/chat/completions", "route-applied": "provider=aurora" }, body: {} } })),
+    steps: [released("A"), posted(), released("B"), posted(), released("C"), posted(), released("D"), posted(), released("E"), posted()],
+  },
+  {
+    key: "g11",
+    ids: ["C5"],
+    rules: [
+      { on: "inference", query: "?a", reply: { status: 200, headers: { "route-applied": "provider=aurora" }, body: { choices: [] }, hold: "ga" } },
+      { on: "inference", query: "?b", reply: { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {}, hold: "gb" } },
+    ],
+    steps: [
+      released("A", { query: "?a" }),
+      released("B", { owner: "o2", query: "?b" }),
+      posted({ id: "a", url: `${POST}?a` }),
+      { do: "await-held", gate: "ga" },
+      posted({ id: "b", url: `${POST}?b` }),
+      { do: "await-held", gate: "gb" },
+      { do: "release-gate", gate: "gb" },
+      { do: "finish", id: "b" },
+      { do: "release-gate", gate: "ga" },
+      { do: "finish", id: "a" },
+    ],
+  },
+  {
+    key: "g12",
+    ids: ["C1"],
+    clock: true,
+    steps: [NOT_RELEASED, released("A"), { do: "tick", ms: 29_999 }, posted(), released("B"), { do: "tick", ms: 30_000 }, posted()],
+  },
+  {
+    key: "g13",
+    ids: ["C1"],
+    steps: [
+      { do: "watch", as: "W", answer: "not released", base: GW, throws: true },
+      released("A", { throws: true }),
+      posted(),
+      released("B", { throws: true, body: '{"model":"b"}' }),
+      { do: "stale", as: "B" },
+      posted({ body: '{"model":"b"}' }),
+      posted({ body: '{"model":"c"}' }),
+    ],
+  },
+  {
+    key: "g14",
+    ids: [],
+    origins: ["other"],
+    rules: [{ on: "inference", reply: { status: 307, headers: { location: "http://{other}/v1/chat/completions" }, body: {} } }],
+    steps: [{ do: "watch", as: "N", answer: null }, released("A", { body: '{"model":"unrelated"}' }), posted({ headers: { authorization: "Bearer k" } })],
+  },
+  {
+    key: "g15",
+    ids: [],
+    steps: [NOT_RELEASED, { do: "preconnect", url: "http://{gw}/v1" }],
+  },
+  {
+    key: "g16",
+    ids: ["C1", "C14"],
+    origins: ["other"],
+    steps: [
+      { do: "watch", as: "N", answer: null },
+      released("A"),
+      released("B", { owner: "o2", body: '{"model":"stale"}' }),
+      { do: "stale", as: "B" },
+      posted({ url: "http://{gw}/v123/chat/completions" }),
+      posted({ url: "http://{other}/v1/chat/completions" }),
+      posted({ url: `${POST}?q=x` }),
+      posted({ url: "http://{other}/v1/chat/completions", body: '{"model":"different"}' }),
+      posted({ url: "http://{other}/v1/chat/completions", headers: { authorization: "Bearer k" }, body: '{"model":"unrelated"}' }),
+      posted({ url: "http://{other}/v1/chat/completions", headers: { authorization: "Bearer k" }, body: '{"model":"stale"}' }),
+      posted(),
+    ],
+  },
 ];
-for (const row of WIRE) {
-  if (row.target === null) {
-    test(`C1, C14: with ${row.name}, the POST is stopped`, async () => {
-      removals.push(addWatcher({ check: () => "not released", stopped: () => {} }));
-      const read = placeOf(row.base());
-      assert.ok(read !== null && read.unexact === null);
-      release({ ...read.place });
-      const sending = fetch(row.url(), { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY });
-      if (row.reason === undefined) await stopped(sending, "not released");
-      else {
-        await assert.rejects(sending, /credentials/);
-        assert.deepEqual([gateway.requests, elsewhere.requests], [[], []]);
-      }
-    });
-  } else {
-    test(`C1, C14: with ${row.name}, the POST goes to ${row.target}`, async () => {
-      removals.push(addWatcher({ check: () => "not released", stopped: () => {} }));
-      const read = placeOf(row.base());
-      assert.ok(read !== null && read.unexact === null);
-      const owner = release({ ...read.place });
-      await (await fetch(row.url(), { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY })).text();
-      assert.deepEqual([gateway.requests.map((r) => r.path), owner.completions.length], [[row.target], 1]);
-    });
-  }
-}
 
-const TENANT: [string, string][] = [["authorization", "Bearer k"], ["x-tenant", "a, b"]];
-test('C1, C14: a POST with lines "  Bearer k  ", x-tenant a and X-Tenant b goes to a release read as authorization Bearer k and x-tenant "a, b", as one line each', async () => {
-  const owner = release({ context: TENANT });
-  await (await post({ headers: [["Authorization", "  Bearer k  "], ["x-tenant", "a"], ["X-Tenant", "b"], ["route-policy", "zdr"]] })).text();
-  const raw = gateway.inference()[0]?.rawHeaders ?? [];
-  const lines = (name: string): string[] => raw.flatMap((value, i) => (i % 2 === 1 && raw[i - 1]?.toLowerCase() === name ? [value] : []));
-  assert.deepEqual([owner.completions.length, lines("x-tenant"), lines("authorization")], [1, ["a, b"], ["Bearer k"]]);
-});
+const EXPECTED: Expected = {
+  g01: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora, provider=basalt\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora, provider=basalt | body \"{\\\"choices\\\":[]}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told B complete: {\"status\":400,\"result\":{\"applied\":[],\"refused\":[\"reason=unsatisfiable\"],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 400 | content-length: 27 | content-type: application/json | route-refused: reason=unsatisfiable | body \"{\\\"error\\\":  \\\"unsatisfiable\\\"}\"",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+    ],
+  },
+  g02: {
+    gate: [
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"$headers\":[[\"authorization\",\"Bearer k\"],[\"route-policy\",\"zdr\"]]} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told B complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=C owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"Authorization\",\"Bearer k\"],[\"Route-Policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | Authorization: Bearer k | Route-Policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told C complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=D owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"Authorization\":\"Bearer k\",\"route-POLICY\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | Authorization: Bearer k | route-POLICY: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told D complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=E owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"AUTHORIZATION\":\"Bearer k\",\"ROUTE-POLICY\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | AUTHORIZATION: Bearer k | ROUTE-POLICY: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told E complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=F owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"accept\":\"x\",\"accept-encoding\":\"x\",\"accept-language\":\"x\",\"content-type\":\"x\",\"user-agent\":\"x\",\"x-stainless-arch\":\"x\",\"x-stainless-lang\":\"x\",\"x-stainless-os\":\"x\",\"x-stainless-package-version\":\"x\",\"x-stainless-retry-count\":\"x\",\"x-stainless-runtime\":\"x\",\"x-stainless-runtime-version\":\"x\",\"x-stainless-timeout\":\"x\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | accept: x | accept-encoding: x | accept-language: x | content-type: x | user-agent: x | x-stainless-arch: x | x-stainless-lang: x | x-stainless-os: x | x-stainless-package-version: x | x-stainless-retry-count: x | x-stainless-runtime: x | x-stainless-runtime-version: x | x-stainless-timeout: x | sec-fetch-mode: cors | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told F complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g03: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]} ",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]} \"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"api-key\":\"k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"api-key\",\"k\"],[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"cookie\":\"a=1\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"cookie\",\"a=1\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[],\"provider\":{\"only\":[\"x\"]}}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[],\\\"provider\\\":{\\\"only\\\":[\\\"x\\\"]}}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"proxy-authorization\":\"Basic x\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"proxy-authorization\",\"Basic x\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"x-api-key\":\"k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-api-key\",\"k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"x-goog-api-key\":\"k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-goog-api-key\",\"k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\",\"x-tenant-token\":\"t\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-tenant-token\",\"t\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer other\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer other\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":null,\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr+notrain\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr+notrain\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/other/../../other/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/other/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "o1 told A stopped: this request to http://{gw}/other/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "POST http://{gw}/v1/other/../../other/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/other/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "== fetch url=http://{gw}/v1/chat/completions?key=1 headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?key=1\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions?key=1 threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"route-policy\",\"zdr\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr, zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]} request=true",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":null}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g04: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=null body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g05: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"a, b\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"  Bearer other  \"],[\"x-tenant\",\"a\"],[\"x-tenant\",\"b\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer other\"],[\"x-tenant\",\"a, b\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"x-tenant\",\"a\"],[\"x-tenant\",\"b\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"x-tenant\",\"a, b\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"a,b\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"a,b\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"a\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"a\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"b\"],[\"x-tenant\",\"a\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"],[\"x-tenant\",\"b, a\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions headers=[[\"authorization\",\"  Bearer k  \"],[\"x-tenant\",\"a\"],[\"X-Tenant\",\"b\"],[\"route-policy\",\"zdr\"]] body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | x-tenant: a, b | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g06: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=",
+      "== fetch url=http://{gw}/v1/chat/completions? headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions? threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions?t=1 headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?t=1\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions?t=1 threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== withdraw as=A",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions?t=1 headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?t=1\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions?t=1 threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== withdraw as=B",
+      "== release as=C owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?t=1",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions? headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions? threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== withdraw as=C",
+      "== release as=D owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told D complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=E owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?",
+      "== fetch url=http://{gw}/v1/chat/completions? headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions? | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told E complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions? -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=F owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?t=1",
+      "== fetch url=http://{gw}/v1/chat/completions?t=1 headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions?t=1 | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told F complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions?t=1 -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g07: {
+    gate: [
+      "== watch as=W answer=not released",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{other}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v123/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v123/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v123/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v%31/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v%31/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v%31/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1//chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1//chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1//chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/x/../chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/x/../chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=HTTP://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told B complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST HTTP://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=C owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://127.0.0.1.:{gw.port}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told C complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://127.0.0.1.:{gw.port}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=D owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions#part headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told D complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions#part -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=E owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?",
+      "== fetch url=http://{gw}/v1/chat/completions?#part headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions? | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told E complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions?#part -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=F owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?q=a+b",
+      "== fetch url=http://{gw}/v1/chat/completions?q=a%20b headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?q=a%20b\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions?q=a%20b threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch url=http://{gw}/v1/chat/completions?q=a+b headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions?q=a+b | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told F complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions?q=a+b -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=G owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?q=%2b",
+      "== fetch url=http://{gw}/v1/chat/completions?q=%2B headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?q=%2B\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions?q=%2B threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== release as=H owner=o1 base=http://{gw}/v1/ context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== release as=I owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/ headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/ threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+    ],
+  },
+  g08: {
+    gate: [
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"other\"}",
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== fetch method=GET url=http://{gw}/v1/models headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"}",
+      "gw <- GET /v1/models | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
+      "GET http://{gw}/v1/models -> 200 | content-length: 330 | content-type: application/json | body \"{\\\"data\\\":[{\\\"id\\\":\\\"demo-model\\\",\\\"routes\\\":[{\\\"provider\\\":\\\"aurora\\\",\\\"facts\\\":\\\"zdr+notrain+bits=8+region=us\\\"},{\\\"provider\\\":\\\"basalt\\\",\\\"facts\\\":\\\"bits=16+region=us,de+attest=weights,prompt\\\",\\\"evidence\\\":\\\"https://basalt.example/attestation\\\"},{\\\"provider\\\":\\\"cobalt\\\",\\\"facts\\\":\\\"\\\"}]},{\\\"id\\\":\\\"other-model\\\",\\\"routes\\\":[{\\\"provider\\\":\\\"cobalt\\\",\\\"facts\\\":\\\"notrain\\\"}]}]}\"",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "POST http://{other}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{other}/v1/chat/completions carries a Route-Policy header, and no session checked http://{other}/v1/chat/completions for it",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"other\"}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 17 | body \"{\\\"model\\\":\\\"other\\\"}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== unwatch as=W",
+      "== watch as=N answer=null",
+      "== watch as=T answer=throws",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher T asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: the plugin failed while checking the request: broken watcher",
+      "== unwatch as=T",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1/chat/completions carries a Route-Policy header, and no session checked http://{gw}/v1/chat/completions for it",
+      "== watch as=W2 answer=second says no base=http://{gw}/v1",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W2 asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W2 told stopped: second says no",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: second says no",
+      "== watch as=W3 answer=third says no base=http://{gw}/v1",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W2 asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W2 told stopped: second says no",
+      "watcher W3 asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W3 told stopped: third says no",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: second says no",
+    ],
+  },
+  g09: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== stale as=A",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "o1 told A stopped: the detection reply this request was checked against was discarded before it left; send it again",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: the detection reply this request was checked against was discarded before it left; send it again",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== release as=C owner=o2 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "o1 told B stopped: two sessions released this same request, so whose it is cannot be told",
+      "o2 told C stopped: two sessions released this same request, so whose it is cannot be told",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: two sessions released this same request, so whose it is cannot be told",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "o1 told B stopped: two sessions released this same request, so whose it is cannot be told",
+      "o2 told C stopped: two sessions released this same request, so whose it is cannot be told",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: two sessions released this same request, so whose it is cannot be told",
+      "== withdraw-owner owner=o1",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o2 told C complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== withdraw as=C",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+    ],
+  },
+  g10: {
+    gate: [
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":301,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 301 | content-length: 2 | content-type: application/json | location: http://{other}/v1/chat/completions | route-applied: provider=aurora | body \"{}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told B complete: {\"status\":302,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 302 | content-length: 2 | content-type: application/json | location: http://{other}/v1/chat/completions | route-applied: provider=aurora | body \"{}\"",
+      "== release as=C owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told C complete: {\"status\":303,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 303 | content-length: 2 | content-type: application/json | location: http://{other}/v1/chat/completions | route-applied: provider=aurora | body \"{}\"",
+      "== release as=D owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told D complete: {\"status\":307,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 307 | content-length: 2 | content-type: application/json | location: http://{other}/v1/chat/completions | route-applied: provider=aurora | body \"{}\"",
+      "== release as=E owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told E complete: {\"status\":308,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 308 | content-length: 2 | content-type: application/json | location: http://{other}/v1/chat/completions | route-applied: provider=aurora | body \"{}\"",
+    ],
+  },
+  g11: {
+    gate: [
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?a",
+      "== release as=B owner=o2 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} query=?b",
+      "== fetch url=http://{gw}/v1/chat/completions?a headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]} id=a",
+      "gw <- POST /v1/chat/completions?a | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "== await-held gate=ga",
+      "== fetch url=http://{gw}/v1/chat/completions?b headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]} id=b",
+      "gw <- POST /v1/chat/completions?b | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "== await-held gate=gb",
+      "== release-gate gate=gb",
+      "o2 told B complete: {\"status\":400,\"result\":{\"applied\":[],\"refused\":[\"reason=unsatisfiable\"],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions?b -> 400 | content-length: 2 | content-type: application/json | route-refused: reason=unsatisfiable | body \"{}\"",
+      "== finish id=b",
+      "== release-gate gate=ga",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions?a -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== finish id=a",
+    ],
+  },
+  g12: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== tick ms=29999",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== tick ms=30000",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+    ],
+  },
+  g13: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1 throws=true",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]} throws=true",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"b\"} throws=true",
+      "== stale as=B",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"b\"}",
+      "o1 told B stopped: the detection reply this request was checked against was discarded before it left; send it again",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: the detection reply this request was checked against was discarded before it left; send it again",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"c\"}",
+      "watcher W asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"c\\\"}\"}",
+      "watcher W told stopped: not released",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: not released",
+    ],
+  },
+  g14: {
+    gate: [
+      "== watch as=N answer=null",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"unrelated\"}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":null,\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "other <- POST /v1/chat/completions | host: {other} | connection: keep-alive | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g15: {
+    gate: [
+      "== watch as=W answer=not released base=http://{gw}/v1",
+      "== preconnect url=http://{gw}/v1",
+      "fetch.preconnect http://{gw}/v1",
+    ],
+  },
+  g16: {
+    gate: [
+      "== watch as=N answer=null",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"demo-model\",\"messages\":[]}",
+      "== release as=B owner=o2 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"stale\"}",
+      "== stale as=B",
+      "== fetch url=http://{gw}/v123/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v123/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "o1 told A stopped: this request to http://{gw}/v123/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "POST http://{gw}/v123/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v123/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "o1 told A stopped: this request to http://{other}/v1/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "POST http://{other}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{other}/v1/chat/completions is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "== fetch url=http://{gw}/v1/chat/completions?q=x headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "watcher N asked about {\"path\":\"http://{gw}/v1/chat/completions\",\"query\":\"?q=x\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
+      "o1 told A stopped: this request to http://{gw}/v1/chat/completions?q=x is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "POST http://{gw}/v1/chat/completions?q=x threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1/chat/completions?q=x is one released for http://{gw}/v1, and a release is sent only where it was released for",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"different\"}",
+      "watcher N asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":\"zdr\",\"body\":\"{\\\"model\\\":\\\"different\\\"}\"}",
+      "POST http://{other}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{other}/v1/chat/completions carries a Route-Policy header, and no session checked http://{other}/v1/chat/completions for it",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\"} body={\"model\":\"unrelated\"}",
+      "watcher N asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":null,\"body\":\"{\\\"model\\\":\\\"unrelated\\\"}\"}",
+      "other <- POST /v1/chat/completions | host: {other} | connection: keep-alive | authorization: Bearer k | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 21 | body \"{\\\"model\\\":\\\"unrelated\\\"}\"",
+      "POST http://{other}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== fetch url=http://{other}/v1/chat/completions headers={\"authorization\":\"Bearer k\"} body={\"model\":\"stale\"}",
+      "watcher N asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":null,\"body\":\"{\\\"model\\\":\\\"stale\\\"}\"}",
+      "other <- POST /v1/chat/completions | host: {other} | connection: keep-alive | authorization: Bearer k | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 17 | body \"{\\\"model\\\":\\\"stale\\\"}\"",
+      "POST http://{other}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"demo-model\",\"messages\":[]}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
+      "o1 told A complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+};
 
-for (const [name, lines] of [
-  ["no x-tenant", [["authorization", "Bearer k"]]],
-  ["x-tenant b then a", [["authorization", "Bearer k"], ["x-tenant", "b"], ["x-tenant", "a"]]],
-  ['x-tenant "a,b"', [["authorization", "Bearer k"], ["x-tenant", "a,b"]]],
-  ["x-tenant a alone", [["authorization", "Bearer k"], ["x-tenant", "a"]]],
-  ['authorization "  Bearer other  "', [["authorization", "  Bearer other  "], ["x-tenant", "a"], ["x-tenant", "b"]]],
-  ["no authorization", [["x-tenant", "a"], ["x-tenant", "b"]]],
-] as const) {
-  test(`C1, C14: a POST with ${name}, to a release read as authorization Bearer k and x-tenant "a, b", is stopped`, async () => {
-    watchAll();
-    release({ context: TENANT });
-    await stopped(post({ headers: [...lines.map(([n, v]) => [n, v] as [string, string]), ["route-policy", "zdr"]] }), "not released");
-  });
-}
-
-test('C1: a GET to the gateway, with a watcher answering "not released", goes', async () => {
-  watchAll();
-  await (await fetch(`${gateway.base}/models`)).text();
-  assert.deepEqual(gateway.requests.map((r) => r.method), ["GET"]);
-});
-
-test('C1: a GET to the gateway with the release\'s authorization and policy header, while that release waits, goes', async () => {
-  watchAll();
-  release();
-  await (await fetch(`${gateway.base}/chat/completions`, { headers: { authorization: "Bearer k", "route-policy": "zdr" } })).text();
-  assert.deepEqual(gateway.requests.map((r) => r.method), ["GET"]);
-});
-
-test('C1: a POST to another origin, with a watcher answering "not released" for the gateway only, goes', async () => {
-  watchAll();
-  await (await post({ url: `${elsewhere.base}/chat/completions` })).text();
-  assert.deepEqual(elsewhere.requests.map((r) => r.method), ["POST"]);
-});
+scenarios(LIST, EXPECTED);

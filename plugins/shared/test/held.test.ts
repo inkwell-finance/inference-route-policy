@@ -1,77 +1,49 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
-import { parsePolicy, type Policy } from "../../../core/src/index.ts";
+// The held policy (C10): what /route sets, what ROUTE_POLICY sets, what a stored entry restores, and how each is
+// described. Each row is an input and the whole result, written out.
+
 import { describeHeld, heldFromEntry, heldFromEnv, holdPolicy } from "../src/held.ts";
+import { P, table } from "./table.ts";
 
-const parsed = (text: string): Policy => {
-  const result = parsePolicy(text);
-  assert.ok(result.ok, text);
-  return result.value;
-};
+table("", "holdPolicy", ([text, source]: [string, "session" | "env"]) => holdPolicy(text, source), [
+  [["zdr+region=us,de", "session"], { kind: "policy", text: "zdr+region=us,de", policy: P({ zdr: true, region: ["us", "de"] }), source: "session" }],
+  [["zdr+zdr", "session"], { kind: "invalid", text: "zdr+zdr", detail: "repeated key", source: "session" }],
+  [["region=eu", "session"], { kind: "invalid", text: "region=eu", detail: "takes a list of assigned ISO 3166-1 alpha-2 codes", source: "session" }],
+  [["residency=eu", "session"], { kind: "invalid", text: "residency=eu", detail: "key not accepted", source: "session" }],
+  [["zdr+sort=price", "env"], { kind: "policy", text: "zdr+sort=price", policy: P({ zdr: true, sort: "price" }), source: "env" }],
+  [["", "session"], { kind: "invalid", text: "", detail: "malformed key in \"\"", source: "session" }],
+]);
 
-test("C10: with ROUTE_POLICY unset, heldFromEnv holds no policy", () => {
-  assert.deepEqual(heldFromEnv({}), { kind: "none" });
-});
+table("", "heldFromEnv", (env: Record<string, string>) => heldFromEnv(env), [
+  [{  }, { kind: "none" }],
+  [{ ROUTE_POLICY: "" }, { kind: "none" }],
+  [{ ROUTE_POLICY: "zdr+sort=price" }, { kind: "policy", text: "zdr+sort=price", policy: P({ zdr: true, sort: "price" }), source: "env" }],
+  [{ ROUTE_POLICY: "zdr+zdr" }, { kind: "invalid", text: "zdr+zdr", detail: "repeated key", source: "env" }],
+  [{ OTHER: "zdr" }, { kind: "none" }],
+]);
 
-test("C10: with ROUTE_POLICY empty, heldFromEnv holds no policy", () => {
-  assert.deepEqual(heldFromEnv({ ROUTE_POLICY: "" }), { kind: "none" });
-});
+table("", "heldFromEntry", heldFromEntry, [
+  [{ policy: "notrain" }, { kind: "policy", text: "notrain", policy: P({ notrain: true }), source: "session" }],
+  [{ policy: "zdr+sort=price" }, { kind: "policy", text: "zdr+sort=price", policy: P({ zdr: true, sort: "price" }), source: "session" }],
+  [{ policy: null }, { kind: "none" }],
+  [{ policy: "bits=0" }, { kind: "invalid", text: "bits=0", detail: "takes one integer from 1 to 64", source: "session" }],
+  ["notrain", null],
+  [7, null],
+  [[], null],
+  [null, null],
+  [undefined, null],
+  [{ policy: 3 }, null],
+  [{ policy: ["notrain"] }, null],
+  [{ policy: true }, null],
+  [{ policy: {  } }, null],
+  [{  }, null],
+]);
 
-test("C10: with ROUTE_POLICY=zdr+sort=price, heldFromEnv holds zdr+sort=price from the environment", () => {
-  assert.deepEqual(heldFromEnv({ ROUTE_POLICY: "zdr+sort=price" }), { kind: "policy", text: "zdr+sort=price", policy: parsed("zdr+sort=price"), source: "env" });
-});
-
-test("C10: with ROUTE_POLICY=zdr+zdr, heldFromEnv holds zdr+zdr as invalid from the environment", () => {
-  const held = heldFromEnv({ ROUTE_POLICY: "zdr+zdr" });
-  assert.deepEqual(held.kind === "invalid" ? [held.kind, held.text, held.source] : held, ["invalid", "zdr+zdr", "env"]);
-});
-
-test('C10: an invalid held zdr+zdr is described as "every request is blocked until it is fixed or cleared"', () => {
-  const held = heldFromEnv({ ROUTE_POLICY: "zdr+zdr" });
-  assert.ok(held.kind === "invalid");
-  assert.equal(describeHeld(held), `"zdr+zdr" is not a valid policy (${held.detail}); every request is blocked until it is fixed or cleared`);
-});
-
-for (const text of ["notrain", "zdr+sort=price"]) {
-  test(`C10: the stored entry {policy: "${text}"} restores ${text} as set in the session`, () => {
-    assert.deepEqual(heldFromEntry({ policy: text }), { kind: "policy", text, policy: parsed(text), source: "session" });
-  });
-}
-
-test("C10: the stored entry {policy: null} restores no policy", () => {
-  assert.deepEqual(heldFromEntry({ policy: null }), { kind: "none" });
-});
-
-test('C10: the stored entry {policy: "bits=0"} restores bits=0 as invalid', () => {
-  const held = heldFromEntry({ policy: "bits=0" });
-  assert.deepEqual(held?.kind === "invalid" ? [held.kind, held.text, held.source] : held, ["invalid", "bits=0", "session"]);
-});
-
-for (const [name, value] of [
-  ["{policy: 3}", { policy: 3 }],
-  ["{policy: true}", { policy: true }],
-  ['{policy: ["notrain"]}', { policy: ["notrain"] }],
-  ["{policy: {}}", { policy: {} }],
-  ["{}", {}],
-  ["[]", []],
-  ['"notrain"', "notrain"],
-  ["7", 7],
-  ["null", null],
-  ["undefined", undefined],
-] as const) {
-  test(`C10: the stored value ${name} is not an entry`, () => {
-    assert.equal(heldFromEntry(value), null);
-  });
-}
-
-test("C10: holdPolicy holds zdr+region=us,de with both regions", () => {
-  assert.deepEqual(holdPolicy("zdr+region=us,de", "session"), { kind: "policy", text: "zdr+region=us,de", policy: parsed("zdr+region=us,de"), source: "session" });
-  assert.deepEqual(parsed("zdr+region=us,de").region, ["us", "de"]);
-});
-
-for (const text of ["region=eu", "residency=eu", "zdr+zdr"]) {
-  test(`C10: holdPolicy holds ${text} as invalid`, () => {
-    const held = holdPolicy(text, "session");
-    assert.deepEqual(held.kind === "invalid" ? [held.kind, held.text, held.source] : held, ["invalid", text, "session"]);
-  });
-}
+/** A held policy as a row writes it: none, or the text and source it was held from. */
+type HeldRow = { kind: "none" } | { text: string; source: "session" | "env" };
+table("", "describeHeld", (row: HeldRow) => describeHeld("text" in row ? holdPolicy(row.text, row.source) : row), [
+  [{ kind: "none" }, "none"],
+  [{ text: "zdr", source: "session" }, "zdr (set in this session)"],
+  [{ text: "zdr+sort=price", source: "env" }, "zdr+sort=price (from ROUTE_POLICY)"],
+  [{ text: "zdr+zdr", source: "session" }, "\"zdr+zdr\" is not a valid policy (repeated key); every request is blocked until it is fixed or cleared"],
+  [{ text: "bits=0", source: "env" }, "\"bits=0\" is not a valid policy (takes one integer from 1 to 64); every request is blocked until it is fixed or cleared"],
+]);
