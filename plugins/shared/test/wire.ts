@@ -100,14 +100,29 @@ export function callArgs(shape: Shape, url: string, init: RequestInit): [Paramet
   }
 }
 
+/** The process's fetch gate table, as every copy of the plugin shares it under its global symbol; null before one. */
+function gateTable(): { releases: { release: unknown }[]; sweeper?: unknown } | null {
+  const registry: unknown = Reflect.get(globalThis, Symbol.for("inference-route-policy.fetch-gate"));
+  return typeof registry === "object" && registry !== null && "releases" in registry && Array.isArray(registry.releases) ? (registry as never) : null;
+}
+
 /**
- * Forgets every release in the process's fetch gate, revoked ones included, as their expiry would. The gate keeps a
- * revoked release for 30 seconds of a process that runs many scenarios; each scenario ends with this, so the next
- * starts with nothing held. The table is the one every copy of the plugin shares, under its global symbol.
+ * Forgets every release in the process's fetch gate, revoked ones included, as their expiry would, and its sweeper
+ * timer with them. The gate keeps a revoked release for 30 seconds of a process that runs many scenarios, and a
+ * scenario's mocked timers end with it; each scenario ends with this, so the next starts with nothing held.
  */
 export function forgetReleases(): void {
-  const registry: unknown = Reflect.get(globalThis, Symbol.for("inference-route-policy.fetch-gate"));
-  if (typeof registry === "object" && registry !== null && "releases" in registry && Array.isArray(registry.releases)) registry.releases.length = 0;
+  const table = gateTable();
+  if (table === null) return;
+  table.releases.length = 0;
+  clearTimeout(table.sweeper as NodeJS.Timeout | undefined);
+  table.sweeper = null;
+}
+
+/** What the gate's table holds: its entries, and how many of them still reach a body (through their release). */
+export function gateHolds(): { entries: number; bodies: number } {
+  const entries = gateTable()?.releases ?? [];
+  return { entries: entries.length, bodies: entries.filter((e) => e.release !== null).length };
 }
 
 // ---- Loopback origins.
@@ -385,7 +400,7 @@ function headline(line: string): string | null {
   if (blocked !== null) return `[${blocked[1]}] payload blocked: ${brief(blocked[2] ?? "", 70)}`;
   if (/^\[\d\] handler error/.test(line)) return brief(line, 60);
   if (/^fetch failed/.test(line)) return brief(line, 60);
-  if (/^fetch\.preconnect |^preconnect returned /.test(line)) return brief(line, 90);
+  if (/^fetch\.preconnect |^preconnect returned |^the gate holds |^a process holding only a release |^an expired release, /.test(line)) return brief(line, 100);
   // The gate tests' own lines: a fetch that threw, the response a fetch got, and what an owner was told.
   const threw = /^([A-Z]+) \S+ threw (.*)$/.exec(line);
   if (threw !== null) return `${threw[1]} threw ${brief(threw[2] ?? "", 80)}`;

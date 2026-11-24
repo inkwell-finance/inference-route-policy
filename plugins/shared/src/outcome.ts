@@ -14,7 +14,8 @@ export type Report =
   | { kind: "honored"; provider: string; checked: boolean; evidence: string | null }
   /** No policy left the client with the request, so there is nothing to check; `provider` is what it says served it. */
   | { kind: "served"; provider: string | null }
-  | { kind: "refused"; reason: RefusalReason | null; key: string | null }
+  /** `translated`: the request carried its policy in the gateway's own fields, so whether it applied is not known. */
+  | { kind: "refused"; reason: RefusalReason | null; key: string | null; translated?: true }
   | { kind: "not-honored"; why: string }
   /** `note` says what else is known of the response, such as a redirect that was not followed. */
   | { kind: "unconfirmed"; note?: string }
@@ -33,9 +34,10 @@ export function interpret(headers: ResultHeaders, sent: Sent): Report {
         return { kind: "honored", provider: outcome.provider, checked: outcome.checked, evidence: outcome.evidence };
     }
   }
-  // C5 holds for every response, whatever was sent: a key's own policy can be refused too.
+  // C5 holds for every response, whatever was sent: a key's own policy can be refused too. A translated request's
+  // refusal is still a refusal, and its policy is still unconfirmed (C8): the report says both.
   const refusal = readRefusal(headers);
-  if (refusal !== null) return { kind: "refused", ...refusal };
+  if (refusal !== null) return sent.kind === "translated" ? { kind: "refused", ...refusal, translated: true } : { kind: "refused", ...refusal };
   if (sent.kind === "translated") return { kind: "unconfirmed" };
   const applied = headers.applied.length === 1 ? parseApplied(headers.applied[0]!) : null;
   return { kind: "served", provider: applied?.ok ? applied.value : null };
@@ -56,10 +58,13 @@ export function describeReport(report: Report): string {
     case "served":
       // The client sent no policy; a key's own may still have applied, so nothing is said of one.
       return report.provider === null ? "no route policy sent with this request" : `no route policy sent with this request; the gateway names ${report.provider} as its route`;
-    case "refused":
-      return report.reason === null
-        ? "route policy refused by the gateway (its Route-Refused value could not be read)"
-        : `route policy refused by the gateway: ${report.reason}${report.key === null ? "" : ` (key ${report.key})`}`;
+    case "refused": {
+      const refused =
+        report.reason === null
+          ? "route policy refused by the gateway (its Route-Refused value could not be read)"
+          : `route policy refused by the gateway: ${report.reason}${report.key === null ? "" : ` (key ${report.key})`}`;
+      return report.translated === true ? `${refused}; the policy had been translated into the gateway's own fields, and its application was not confirmed` : refused;
+    }
     case "not-honored":
       return `route policy NOT honored: ${report.why}`;
     case "unconfirmed":

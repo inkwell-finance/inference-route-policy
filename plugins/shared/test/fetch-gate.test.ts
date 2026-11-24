@@ -4,10 +4,11 @@
 
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
+import { spawn } from "node:child_process";
 import { addRelease, addWatcher, withdrawReleases, type Release } from "../src/fetch-gate.ts";
 import { NOT_CONTEXT } from "../src/request.ts";
 import { describe } from "./fake-harness.ts";
-import { callArgs, deadline, forgetReleases, Log, log, Origins, recording, settle, SHAPES, summarize, type Expected, type Rule, type Shape } from "./wire.ts";
+import { callArgs, deadline, forgetReleases, gateHolds, Log, log, Origins, recording, settle, SHAPES, summarize, type Expected, type Rule, type Shape } from "./wire.ts";
 
 /** A record, an array of lines, or { $headers: lines } for a Headers object made of them. */
 type HeadersSpec = Readonly<Record<string, string>> | readonly (readonly [string, string])[] | { readonly $headers: readonly (readonly [string, string])[] };
@@ -34,16 +35,83 @@ type Step =
   | { do: "release-gate"; gate: string }
   | { do: "tick"; ms: number }
   /** Calls the global fetch's own preconnect member, a runtime's member the gate must keep. */
-  | { do: "preconnect"; url: string };
+  | { do: "preconnect"; url: string }
+  /** Logs how many releases the gate's table holds, and how many of them still reach a body. */
+  | { do: "held" }
+  /** Runs a separate process that adds one release; logs whether no timer then keeps its event loop alive. */
+  | { do: "idle-exit" }
+  /**
+   * Runs a separate process that adds a release, keeps the function that withdraws it, lets it expire on a mocked
+   * clock, and collects garbage; logs whether the release itself was collected.
+   */
+  | { do: "collected" };
 
 interface Scenario {
   key: string;
   ids: readonly string[];
   origins?: readonly string[];
   rules?: readonly Rule[];
-  /** Mock Date, so `tick` steps age releases. */
-  clock?: boolean;
+  /**
+   * Mock Date, so `tick` steps age releases; "timers" mocks setTimeout too, so they also fire the gate's own timer.
+   * Only the scenario that needs the gate's timer mocks setTimeout, so no other scenario's fetches run on it.
+   */
+  clock?: true | "timers";
   steps: readonly Step[];
+}
+
+/** The gate module's file URL, for a separate process to import; known only at run time. */
+const GATE_URL = new URL("../src/fetch-gate.ts", import.meta.url).href;
+const A_RELEASE = `{ owner: {}, base: "http://127.0.0.1:1/v1", query: "", context: [], header: null, body: "b", current: () => true, stopped: () => {}, complete: () => {} }`;
+
+/** Runs `script` as an ES module in a separate Node process and returns the first line it prints; the process is then ended. */
+async function runChild(script: string, flags: readonly string[] = []): Promise<string> {
+  const child = spawn(process.execPath, [...flags, "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "ignore"] });
+  let printed = "";
+  const line = new Promise<string>((resolve) => {
+    child.stdout.on("data", (chunk: Buffer) => {
+      printed += chunk.toString();
+      if (printed.includes("\n")) resolve(printed.split("\n")[0] ?? "");
+    });
+    child.on("close", () => resolve(printed.trim()));
+  });
+  try {
+    return await deadline(line, 8000, "the separate process to print");
+  } finally {
+    child.kill();
+  }
+}
+
+/**
+ * Whether anything the gate set up keeps a process alive once it holds a release: the timers among the resources
+ * Node says keep its event loop running, in a process that loaded the gate and added one release.
+ */
+async function nothingKeepsAlive(): Promise<string> {
+  return runChild(
+    `const { addRelease } = await import(${JSON.stringify(GATE_URL)}); addRelease(${A_RELEASE}); console.log(String(process.getActiveResourcesInfo().filter((r) => r === "Timeout").length === 0));`,
+  );
+}
+
+/**
+ * Whether an expired release can be collected while the function that withdraws it is still held, after a JSON body
+ * sent elsewhere had the gate compare it, as JSON, with that release.
+ */
+async function collectedAfterExpiry(): Promise<string> {
+  const script = [
+    `const { mock } = await import("node:test");`,
+    `const { addRelease } = await import(${JSON.stringify(GATE_URL)});`,
+    `mock.timers.enable({ apis: ["Date", "setTimeout"] });`,
+    `let release = ${A_RELEASE};`,
+    `const ref = new WeakRef(release);`,
+    `const withdraw = addRelease(release);`,
+    `release = null;`,
+    `fetch("http://127.0.0.1:1/elsewhere", { method: "POST", body: "{}" }).catch(() => {});`,
+    `mock.timers.tick(30_000);`,
+    `await new Promise((resolve) => setImmediate(resolve));`,
+    `globalThis.gc();`,
+    `console.log(String(ref.deref() === undefined && typeof withdraw === "function"));`,
+    `mock.timers.reset();`,
+  ].join("\n");
+  return runChild(script, ["--expose-gc"]);
 }
 
 type Lines = readonly (readonly [string, string])[];
@@ -132,7 +200,7 @@ async function run(scenario: Scenario): Promise<string[]> {
     const shown = [...response.headers].map(([name, value]) => `${name}: ${value}`);
     log(`${method} ${url} -> ${response.status} ${JSON.stringify(response.statusText)} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
   };
-  if (scenario.clock === true) mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  if (scenario.clock !== undefined) mock.timers.enable({ apis: scenario.clock === "timers" ? ["Date", "setTimeout"] : ["Date"], now: 1_000_000 });
   try {
     await recording(out, null, () =>
       deadline(
@@ -205,6 +273,9 @@ async function run(scenario: Scenario): Promise<string[]> {
               case "await-held":
                 await origins.held(step.gate);
                 break;
+              case "collected":
+                log(`an expired release, the function that withdraws it still held, was collected: ${await collectedAfterExpiry()}`);
+                break;
               case "release-gate":
                 origins.release(step.gate);
                 break;
@@ -217,6 +288,14 @@ async function run(scenario: Scenario): Promise<string[]> {
               case "tick":
                 mock.timers.tick(step.ms);
                 break;
+              case "held": {
+                const { entries, bodies } = gateHolds();
+                log(`the gate holds ${entries} release(s), ${bodies} of them with a body`);
+                break;
+              }
+              case "idle-exit":
+                log(`a process holding only a release has no timer keeping it alive: ${await nothingKeepsAlive()}`);
+                break;
             }
             await settle();
           }
@@ -226,7 +305,7 @@ async function run(scenario: Scenario): Promise<string[]> {
       ),
     );
   } finally {
-    if (scenario.clock === true) mock.timers.reset();
+    if (scenario.clock !== undefined) mock.timers.reset();
     for (const withdraw of withdrawals.values()) withdraw();
     for (const stop of unwatch.values()) stop();
     forgetReleases();
@@ -665,6 +744,42 @@ const LIST: readonly Scenario[] = [
       posted({ url: OTHER, headers: { authorization: "Bearer k" }, body: '{"model":"unrelated"}', bodyAs: "bytes" }),
       posted({ url: OTHER, headers: { authorization: "Bearer k" } }),
     ],
+  },
+  {
+    // Releases live and unused, used, withdrawn, and stale are all forgotten at their expiry by the gate's own timer,
+    // bodies and callbacks with them, with no request after them to clear them.
+    key: "g28",
+    ids: [],
+    clock: "timers",
+    steps: [
+      { do: "held" },
+      released("A", { body: '{"model":"a"}' }),
+      released("B", { body: '{"model":"b"}' }),
+      posted({ body: '{"model":"b"}' }),
+      released("C", { body: '{"model":"c"}' }),
+      { do: "withdraw", as: "C" },
+      released("D", { body: '{"model":"d"}' }),
+      { do: "stale", as: "D" },
+      { do: "held" },
+      { do: "tick", ms: 10_000 },
+      released("E", { body: '{"model":"e"}' }),
+      { do: "held" },
+      { do: "tick", ms: 19_999 },
+      { do: "held" },
+      { do: "tick", ms: 1 },
+      { do: "held" },
+      { do: "tick", ms: 9_999 },
+      { do: "held" },
+      { do: "tick", ms: 1 },
+      { do: "held" },
+    ],
+  },
+  {
+    // The gate's timer never keeps a process alive, and an expired release is collected even while the function
+    // that withdraws it is held.
+    key: "g29",
+    ids: [],
+    steps: [{ do: "idle-exit" }, { do: "collected" }],
   },
 ];
 
@@ -1586,6 +1701,48 @@ const EXPECTED: Expected = {
       "watcher N asked about {\"path\":\"http://{other}/v1/chat/completions\",\"query\":\"\",\"method\":\"POST\",\"context\":[[\"authorization\",\"Bearer k\"]],\"header\":null,\"body\":\"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"}",
       "other <- POST /v1/chat/completions | host: {other} | connection: keep-alive | authorization: Bearer k | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 36 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[]}\"",
       "POST http://{other}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+    ],
+  },
+  g28: {
+    gate: [
+      "== held",
+      "the gate holds 0 release(s), 0 of them with a body",
+      "== release as=A owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"a\"}",
+      "== release as=B owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"b\"}",
+      "== fetch url=http://{gw}/v1/chat/completions headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"} body={\"model\":\"b\"}",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 13 | body \"{\\\"model\\\":\\\"b\\\"}\"",
+      "o1 told B complete: {\"status\":200,\"result\":{\"applied\":[\"provider=aurora\"],\"refused\":[],\"evidence\":[]}}",
+      "POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "== release as=C owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"c\"}",
+      "== withdraw as=C",
+      "== release as=D owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"d\"}",
+      "== stale as=D",
+      "== held",
+      "the gate holds 3 release(s), 3 of them with a body",
+      "== tick ms=10000",
+      "== release as=E owner=o1 base=http://{gw}/v1 context=[[\"authorization\",\"Bearer k\"]] header=zdr body={\"model\":\"e\"}",
+      "== held",
+      "the gate holds 4 release(s), 4 of them with a body",
+      "== tick ms=19999",
+      "== held",
+      "the gate holds 4 release(s), 4 of them with a body",
+      "== tick ms=1",
+      "== held",
+      "the gate holds 1 release(s), 1 of them with a body",
+      "== tick ms=9999",
+      "== held",
+      "the gate holds 1 release(s), 1 of them with a body",
+      "== tick ms=1",
+      "== held",
+      "the gate holds 0 release(s), 0 of them with a body",
+    ],
+  },
+  g29: {
+    gate: [
+      "== idle-exit",
+      "a process holding only a release has no timer keeping it alive: true",
+      "== collected",
+      "an expired release, the function that withdraws it still held, was collected: true",
     ],
   },
 };

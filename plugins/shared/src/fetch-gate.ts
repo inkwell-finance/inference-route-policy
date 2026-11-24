@@ -52,7 +52,8 @@ const REGISTRY = Symbol.for("inference-route-policy.fetch-gate");
  * How long a release is kept. A harness sends right after the payload hook returns; one that has not sent by then
  * will not, and an old release would only make a later identical one ambiguous. A release withdrawn or gone stale
  * is kept, revoked, for the same time, so its content is still recognized wherever else it is sent; past this it
- * is forgotten, which keeps the table, and the bodies it holds, bounded by what one process sends in this time.
+ * is forgotten, on its own, whether or not anything is sent: the table, and the bodies and session callbacks it
+ * holds, never outlive this by more than a timer's lateness.
  */
 const RELEASE_TTL_MS = 30_000;
 
@@ -66,13 +67,13 @@ interface Entry {
   expires: number;
   revoked: boolean;
   settled: boolean;
-  /** The release's body as canonical JSON, once computed; null when it is not JSON. */
-  json?: string | null;
 }
 
 interface Registry {
   releases: Entry[];
   watchers: Set<Watcher>;
+  /** The one timer that forgets expired releases on its own, armed while any release is held; null when none is. */
+  sweeper?: NodeJS.Timeout | null;
 }
 
 function isRegistry(value: unknown): value is Registry {
@@ -110,11 +111,46 @@ function canonicalJson(text: string): string | null {
   }
 }
 
-/** Takes an entry out of the table and lets go of its release: when it is used, or when it expires. */
+/**
+ * Each release's body as canonical JSON, once computed (null when it is not JSON). Keyed weakly by the release, so a
+ * release the table has let go of takes its body's JSON with it, however long anything else holds its entry.
+ */
+const releasedJson = new WeakMap<Release, string | null>();
+
+function jsonOf(release: Release): string | null {
+  let json = releasedJson.get(release);
+  if (json === undefined) {
+    json = canonicalJson(release.body);
+    releasedJson.set(release, json);
+  }
+  return json;
+}
+
+/** Takes an entry out of the table and lets go of its release, and so of its body: when it is used, or when it expires. */
 function drop(registry: Registry, entry: Entry): void {
   entry.release = null;
   const index = registry.releases.indexOf(entry);
   if (index >= 0) registry.releases.splice(index, 1);
+}
+
+/** Forgets every expired release, then arms the sweeper for the next one to expire, if any is held. */
+function sweep(registry: Registry): void {
+  const now = Date.now();
+  for (const entry of registry.releases.filter((e) => e.expires <= now)) drop(registry, entry);
+  if (registry.sweeper !== undefined && registry.sweeper !== null) return;
+  if (registry.releases.length === 0) return;
+  const next = Math.min(...registry.releases.map((e) => e.expires));
+  const timer = setTimeout(
+    () => {
+      registry.sweeper = null;
+      sweep(registry);
+    },
+    // Every release left expires after now; at least a millisecond ahead, the timer can never fire in a loop.
+    Math.max(next - now, 1),
+  );
+  // It never keeps a process alive: an idle process exits, and the releases go with it.
+  timer.unref();
+  registry.sweeper = timer;
 }
 
 const tell = (notify: () => void): void => {
@@ -130,8 +166,7 @@ type Plan = { kind: "pass" } | { kind: "stop"; reason: string } | { kind: "send"
 /** What to do with one checked request. Never throws: a failure to decide is a stop. */
 function plan(registry: Registry, outgoing: Outgoing): Plan {
   try {
-    const now = Date.now();
-    for (const entry of registry.releases.filter((e) => e.expires <= now)) drop(registry, entry);
+    sweep(registry);
     // The oldest release this request is still one of, as before revocation: a stale one stops it, and a later
     // identical release is then the next one's. A withdrawn one counts only when no other is left.
     const found = registry.releases.filter((entry) => entry.release !== null && !entry.settled && matches(entry.release, outgoing));
@@ -188,13 +223,7 @@ function plan(registry: Registry, outgoing: Outgoing): Plan {
       if (elsewhere?.release) return stopAll(spent, `this request to ${where} is one released for ${elsewhere.release.base}${elsewhere.release.query}, and a release is sent only where it was released for`);
       // The same JSON in other bytes, compared by canonical text, computed once per release.
       const json = outgoing.body === null ? null : canonicalJson(outgoing.body);
-      const rewritten =
-        json === null
-          ? []
-          : held.filter((e) => {
-              if (e.json === undefined) e.json = e.release === null ? null : canonicalJson(e.release.body);
-              return e.json === json;
-            });
+      const rewritten = json === null ? [] : held.filter((e) => e.release !== null && jsonOf(e.release) === json);
       const [same] = rewritten;
       if (same?.release) {
         return stopAll(rewritten, `this request to ${where} carries, written differently, the JSON body of one released for ${same.release.base}${same.release.query}, and a release is sent only as it was released, where it was released for`);
@@ -249,6 +278,7 @@ export function addRelease(release: Release): () => void {
   const registry = install();
   const entry: Entry = { release, expires: Date.now() + RELEASE_TTL_MS, revoked: false, settled: false };
   registry.releases.push(entry);
+  sweep(registry);
   return () => {
     entry.revoked = true;
   };
