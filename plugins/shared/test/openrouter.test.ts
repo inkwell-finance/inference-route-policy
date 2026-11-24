@@ -4,56 +4,55 @@ import { combinePolicies } from "../../../core/src/index.ts";
 import { isOpenRouter, translateToOpenRouter } from "../src/openrouter.ts";
 import { policy } from "./fixtures.ts";
 
-const provider = (text: string): Record<string, unknown> => {
-  const translation = translateToOpenRouter(policy(text));
-  assert.ok(translation.ok, translation.ok ? "" : translation.why);
-  return translation.provider;
-};
-
-function refused(text: string, why: RegExp): void {
-  const translation = translateToOpenRouter(policy(text));
-  assert.ok(!translation.ok, `${text} should not translate`);
-  assert.match(translation.why, why);
+for (const [text, provider] of [
+  ["only=aurora,basalt", { only: ["aurora", "basalt"] }],
+  ["ignore=cobalt", { ignore: ["cobalt"] }],
+  ["ignore=cobalt,basalt", { ignore: ["cobalt", "basalt"] }],
+  ["sort=throughput+order=basalt,aurora", { sort: "throughput", order: ["basalt", "aurora"] }],
+  ["only=aurora+ignore=cobalt+sort=price", { only: ["aurora"], ignore: ["cobalt"], sort: "price" }],
+  ["only=aurora,cobalt+ignore=basalt,dante", { only: ["aurora", "cobalt"], ignore: ["basalt", "dante"] }],
+  ["sort=latency", { sort: "latency" }],
+] as const) {
+  test(`C9: ${text} translates to the OpenRouter provider field ${JSON.stringify(provider)}`, () => {
+    assert.deepEqual(translateToOpenRouter(policy(text)), { ok: true, provider });
+  });
 }
 
-test("C9: only and ignore map to the documented provider filters, and sort and order to the documented preferences", () => {
-  assert.deepEqual(provider("only=aurora,basalt"), { only: ["aurora", "basalt"] });
-  assert.deepEqual(provider("ignore=cobalt"), { ignore: ["cobalt"] });
-  assert.deepEqual(provider("ignore=cobalt,basalt"), { ignore: ["cobalt", "basalt"] });
-  assert.deepEqual(provider("sort=throughput+order=basalt,aurora"), { sort: "throughput", order: ["basalt", "aurora"] });
-  assert.deepEqual(provider("only=aurora+ignore=cobalt+sort=price"), { only: ["aurora"], ignore: ["cobalt"], sort: "price" });
-  assert.deepEqual(provider("sort=latency"), { sort: "latency" });
-});
+const REASONS: [string, string][] = [
+  ["zdr", "zdr has no hard filter there (its zdr field still admits Safety Retention endpoints)"],
+  ["notrain", "notrain has no hard filter there (data_collection covers the model providers, not OpenRouter itself)"],
+  ["bits=8", "bits has no hard filter there (quantizations names levels, not a floor on every weight)"],
+  ["region=us", "region has no request field there"],
+  ["attest=weights", "attest has no counterpart there"],
+];
+for (const [requirement, why] of REASONS) {
+  for (const beside of ["", "+only=aurora", "+sort=price"]) {
+    test(`C9: ${requirement}${beside} is refused for OpenRouter: ${why}`, () => {
+      assert.deepEqual(translateToOpenRouter(policy(`${requirement}${beside}`)), { ok: false, why: `cannot be translated for OpenRouter: ${why}` });
+    });
+  }
+}
 
-test("C9: each requirement with no documented hard filter refuses the whole policy, for its own reason", () => {
-  refused("zdr", /zdr has no hard filter there \(its zdr field still admits Safety Retention endpoints\)/);
-  refused("notrain", /notrain has no hard filter there \(data_collection covers the model providers, not OpenRouter itself\)/);
-  refused("bits=8", /bits has no hard filter there \(quantizations names levels, not a floor on every weight\)/);
-  refused("region=us", /region has no request field there/);
-  refused("attest=weights", /attest has no counterpart there/);
-  // Each one refuses a policy whose other parts map, for its own reason.
-  refused("only=aurora+zdr", /zdr has no hard filter/);
-  refused("only=aurora+notrain", /notrain has no hard filter/);
-  refused("only=aurora+bits=8", /bits has no hard filter/);
-  refused("only=aurora+region=us", /region has no request field/);
-  refused("only=aurora+attest=weights", /attest has no counterpart/);
-});
-
-test("C9: an only list that combined to empty is refused rather than sent as an empty filter", () => {
+test("C9: only=aurora on the header with only=basalt on the suffix is refused for OpenRouter: only combines to an empty list", () => {
   const empty = combinePolicies({ header: policy("only=aurora"), suffix: policy("only=basalt") });
-  const translation = translateToOpenRouter(empty);
-  assert.ok(!translation.ok);
-  assert.match(translation.why, /only combines to an empty list/);
+  assert.deepEqual(translateToOpenRouter(empty), { ok: false, why: "cannot be translated for OpenRouter: only combines to an empty list, which no route can meet" });
 });
 
-test("C9: translation applies only to OpenRouter's documented base URL", () => {
-  assert.ok(isOpenRouter("https://openrouter.ai/api/v1"));
-  assert.ok(isOpenRouter("https://openrouter.ai/api/v1/"));
-  assert.ok(!isOpenRouter("https://openrouter.ai/api/v2"));
-  assert.ok(!isOpenRouter("https://eu.openrouter.ai/api/v1"));
-  // Another scheme, another port, or a query is another base URL.
-  assert.ok(!isOpenRouter("http://openrouter.ai/api/v1"));
-  assert.ok(!isOpenRouter("https://openrouter.ai:8443/api/v1"));
-  assert.ok(!isOpenRouter("https://openrouter.ai/api/v1?tenant=east"));
-  assert.ok(!isOpenRouter("https://openrouter.ai/api/v1?"));
-});
+for (const base of ["https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/"]) {
+  test(`C9: ${base} is OpenRouter's base URL`, () => {
+    assert.equal(isOpenRouter(base), true);
+  });
+}
+
+for (const base of [
+  "https://openrouter.ai/api/v2",
+  "https://eu.openrouter.ai/api/v1",
+  "http://openrouter.ai/api/v1",
+  "https://openrouter.ai:8443/api/v1",
+  "https://openrouter.ai/api/v1?tenant=east",
+  "https://openrouter.ai/api/v1?",
+]) {
+  test(`C9: ${base} is not OpenRouter's base URL`, () => {
+    assert.equal(isOpenRouter(base), false);
+  });
+}

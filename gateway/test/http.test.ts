@@ -19,7 +19,7 @@ async function listening(t: TestContext, server: Server): Promise<string> {
 }
 
 for (const endpoint of ENDPOINTS) {
-  test(`G9 G25 ${endpoint}: adapter counts differently cased raw lines before fetch Headers can join them`, async (t) => {
+  test(`G9 ${endpoint}: differently cased Route-Policy lines return unsupported without a key`, async (t) => {
     let calls = 0;
     const handler = createGateway({ models: { [model]: [route("aurora", "http://aurora.example/v1")] }, fetch: () => { calls++; return new Response("served"); } });
     const base = await listening(t, serve(handler, 0));
@@ -46,7 +46,7 @@ for (const endpoint of ENDPOINTS) {
     assert.equal(calls, 0);
   });
 
-  test(`G16 G33 ${endpoint}: final headers are committed before the body finishes and an upstream stream error never retries`, async (t) => {
+  test(`G16 ${endpoint}: after the first SSE chunk the Aurora stream error leaves Basalt uncalled`, async (t) => {
     const calls: string[] = [];
     let ready: (controller: ReadableStreamDefaultController<Uint8Array>) => void;
     const controllerReady = new Promise<ReadableStreamDefaultController<Uint8Array>>((resolve) => { ready = resolve; });
@@ -70,7 +70,7 @@ for (const endpoint of ENDPOINTS) {
   });
 }
 
-test("G33 G35 G37: after a failed route, relay the next provider's redirect without replaying content", async (t) => {
+test("G33: after Aurora returns 502, the client receives Basalt's 307 without a call to the redirect target", async (t) => {
   const reached: string[] = [];
   const upstream = createServer((req, res) => {
     reached.push(req.url ?? "");
@@ -91,7 +91,7 @@ test("G33 G35 G37: after a failed route, relay the next provider's redirect with
   assert.deepEqual(reached, ["/aurora/v1/chat/completions", "/basalt/v1/chat/completions"]);
 });
 
-test("G14 G33: relay decoded gzip without the provider's content-encoding or length", async (t) => {
+test("G33: Basalt's gzip reply reaches the client decoded without its original encoding and length fields", async (t) => {
   const forwarded: { encoding: string | undefined; policy: string | string[] | undefined; body: string }[] = [];
   const payload = "served by basalt";
   const gzip = gzipSync(payload);
@@ -114,7 +114,7 @@ test("G14 G33: relay decoded gzip without the provider's content-encoding or len
   assert.deepEqual(forwarded, [{ encoding: "identity", policy: undefined, body: JSON.stringify({ model, stream: false }) }]);
 });
 
-test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, and plain has no detection", async (t) => {
+test("G17: the demo sends Basalt's evidence for attest=weights and omits it for only=basalt", async (t) => {
   const { server, base } = await startDemo(0);
   t.after(() => { server.closeAllConnections(); server.close(); });
   const detection = await fetch(`${base}/v1/route-policy`, { headers: { "x-api-key": "demo-key-zdr" } });

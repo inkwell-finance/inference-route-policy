@@ -168,7 +168,7 @@ const isBareError = (reply: Observation): boolean => isHttpError(reply.status) &
 // with Route-Refused is a separate, protocol-defined outcome.
 const transientBareError = (reply: Observation): boolean => noResult(reply) && (reply.status === 429 || reply.status === 503);
 
-function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
+export function resultContext(probe: Probe, scope: Scope | undefined): ResultContext {
   const model = member(jsonBody(probe), "model");
   const split = typeof model === "string" ? splitModel(model) : undefined;
   const routeMap = scope?.models.find(({ id }) => id === split?.id)?.routes;
@@ -684,7 +684,17 @@ export async function runConformance(options: Options): Promise<Report> {
       if (missing.length > 0) return `a combined-policy witness distinguishing omission of the ${missing.join(" and ")}`;
     });
     await run("G12", "the exercised empty intersections returned unsatisfiable in both carrier orders", async () => {
-      if (first === undefined || support === undefined || !knowBound) return "a published base model and interpretable key default";
+      if (support === undefined) {
+        // A missing advertisement does not tell us whether `only` is accepted.
+        // Either refusal is possible, but this pair cannot produce a relay.
+        const sample = models.find(({ routes }) => routes.size >= 2);
+        if (sample !== undefined) {
+          const [a, b] = sample.routes.keys();
+          await observeControl(inference(sample.id, `only=${a}`, `only=${b}`));
+        }
+        return "a valid detection reply to establish acceptance of the intersection policies";
+      }
+      if (first === undefined || !knowBound) return "a published base model and interpretable key default";
       const baseModel = models.find((model) => qualifying(model, withKey()).length > 0);
       let missing: string | undefined;
       let ran = false;

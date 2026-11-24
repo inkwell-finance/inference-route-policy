@@ -11,7 +11,7 @@ import type { ResultHeaders } from "../../../core/src/index.ts";
  * carries (a key in any header, a cookie, a proxy credential, a custom token) is context: the plugin reads
  * metadata with all of it and lets the request leave only with exactly that.
  */
-const NOT_CONTEXT: readonly string[] = [
+export const NOT_CONTEXT: readonly string[] = [
   // Content negotiation: what the client accepts back.
   "accept",
   "accept-encoding",
@@ -52,7 +52,7 @@ export function contextOf(headers: Headers): RequestContext {
  * Treating an unknown header as no credential can only reject a valid reply's `key_policy`, never accept one a
  * gateway sent to a caller it could not identify.
  */
-const CREDENTIAL_HEADERS: readonly string[] = ["authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie", "proxy-authorization"];
+export const CREDENTIAL_HEADERS: readonly string[] = ["authorization", "x-api-key", "x-goog-api-key", "api-key", "cookie", "proxy-authorization"];
 
 /** The names of the headers that carry a credential in a context, in order. */
 export const credentialNames = (context: RequestContext): string[] =>

@@ -24,7 +24,7 @@ import { RouteClient, type Located, type Prepared } from "./route-client.ts";
  * APIs that name the model in the URL, not the body; their requests may leave without a body `model`. The plugin
  * cannot see that URL before fetch, so such a request can carry a policy only on the header.
  */
-const MODEL_IN_URL_APIS: readonly string[] = ["google-generative-ai", "google-vertex", "google-gemini-cli", "bedrock-converse-stream"];
+export const MODEL_IN_URL_APIS: readonly string[] = ["google-generative-ai", "google-vertex", "google-gemini-cli", "bedrock-converse-stream"];
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 

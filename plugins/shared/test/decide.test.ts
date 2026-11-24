@@ -1,6 +1,8 @@
+// Each test is one request in one situation, and the one decision it gets, compared whole: its action, the model
+// and header it sends with, the policy it counts as sent, and the routes it holds (or why it is blocked).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatDetection, splitModel, type Detection } from "../../../core/src/index.ts";
+import { baselineSupport, formatDetection, formatPolicy, type Detection } from "../../../core/src/index.ts";
 import { decide, readLayers, type Carriers, type Decision, type GatewayState } from "../src/decide.ts";
 import { holdPolicy, type Held } from "../src/held.ts";
 import { OPENROUTER_BASE } from "../src/openrouter.ts";
@@ -33,190 +35,263 @@ function decideFor(situation: Situation): Decision {
   return decide(read.value, situation.carriers ?? "header", gateway);
 }
 
-function sent(decision: Decision): Extract<Decision, { action: "send" }> {
-  assert.ok(decision.action === "send", decision.action === "block" ? decision.reason : decision.action);
-  return decision;
+/** A decision as plain data: policies as their text, routes as their providers and evidence. */
+function view(decision: Decision): unknown {
+  const text = (p: Parameters<typeof formatPolicy>[0] | null): string | null => (p === null ? null : formatPolicy(p).ok ? (formatPolicy(p) as { value: string }).value : "unwritable");
+  switch (decision.action) {
+    case "block":
+      return decision;
+    case "translate":
+      return { action: "translate", model: decision.model, provider: decision.provider, sent: text(decision.sent) };
+    case "send":
+      return {
+        action: "send",
+        model: decision.model,
+        header: decision.header,
+        sent: text(decision.sent),
+        routes: decision.routes === null ? null : [...decision.routes].map(([provider, route]) => [provider, route?.evidence ?? null]),
+      };
+  }
 }
 
-function blockedFor(decision: Decision, pattern: RegExp): void {
-  assert.ok(decision.action === "block", `expected a block, got ${decision.action}`);
-  assert.match(decision.reason, pattern);
+const sendView = (model: string, header: string | null, sent: string | null, routes: unknown = null): unknown => ({ action: "send", model, header, sent, routes });
+const blockView = (reason: string): unknown => ({ action: "block", reason });
+const NO_DETECTION = `${BASE} has no valid detection reply (status is 404, not 200), so no requirement may be sent there`;
+const unlisted = (what: string): string => `${BASE} does not list ${what} in its detection reply`;
+const KEYS = [...baselineSupport().keys];
+const ATTEST = [...baselineSupport().attest];
+const SORTS = [...baselineSupport().sort];
+/** A detection reply listing everything the baseline does but `keys`, `attest`, and `sort` as given. */
+const listing = (keys: readonly string[], attest: readonly string[] = ATTEST, sort: readonly string[] = SORTS): Detection =>
+  detection({ ...formatDetection(baselineSupport()), keys: [...keys], attest: [...attest], sort: [...sort] });
+const USE: Readonly<Record<string, string>> = { zdr: "zdr", notrain: "notrain", bits: "bits=8", region: "region=us", attest: "attest=weights", only: "only=aurora", ignore: "ignore=cobalt", sort: "sort=price", order: "order=aurora" };
+/** A policy that uses `key` and carries a requirement, so that it needs detection (C2). */
+const using = (key: string): string => (key === "zdr" ? "zdr+notrain" : `zdr+${USE[key] ?? ""}`);
+
+// ---- C1: no valid detection reply.
+for (const carriers of ["header", "suffix"] as const) {
+  for (const [name, situation] of [
+    ["held zdr", { held: held("zdr") }],
+    ["typed +notrain", { model: "demo-model+notrain" }],
+    ["a configured Route-Policy bits=8", { configured: "bits=8" }],
+    ["held zdr and typed +notrain", { held: held("zdr"), model: "demo-model+notrain" }],
+    ["held sort=price and typed +zdr", { held: held("sort=price"), model: "demo-model+zdr" }],
+    ["held zdr and typed +sort=latency", { held: held("zdr"), model: "demo-model+sort=latency" }],
+  ] as const) {
+    test(`C1: with the ${carriers} carrier and no detection reply, a request with ${name} is blocked for having no valid detection reply`, () => {
+      assert.deepEqual(view(decideFor({ ...situation, carriers, detection: null })), blockView(NO_DETECTION));
+    });
+  }
 }
 
-const NO_DETECTION = /has no valid detection reply \(status is 404, not 200\), so no requirement may be sent there/;
+// ---- C1: what the reply must list.
+for (const carrier of ["held on the header", "typed into the model"] as const) {
+  test(`C1: for each of the ${KEYS.length} keys of baselineSupport(), a requirement using it ${carrier} is blocked when the reply lists every key but it`, () => {
+    assert.ok(KEYS.length > 0);
+    for (const key of KEYS) {
+      const policy = using(key);
+      const situation = carrier === "held on the header" ? { held: held(policy) } : { model: `demo-model+${policy}` };
+      assert.deepEqual(view(decideFor({ ...situation, detection: listing(KEYS.filter((k) => k !== key)) })), blockView(unlisted(key)), key);
+    }
+  });
+}
 
-test("C1: a requirement on either carrier is not sent to a base URL without a valid detection reply", () => {
-  for (const carriers of ["header", "suffix"] as const) {
-    blockedFor(decideFor({ held: held("zdr"), carriers, detection: null }), NO_DETECTION);
-    blockedFor(decideFor({ model: "demo-model+notrain", carriers, detection: null }), NO_DETECTION);
-    blockedFor(decideFor({ configured: "bits=8", carriers, detection: null }), NO_DETECTION);
-    // Both carriers at once, each with a requirement.
-    blockedFor(decideFor({ held: held("zdr"), model: "demo-model+notrain", carriers, detection: null }), NO_DETECTION);
-  }
+for (const [carrier, place] of [["held on the header", "held"], ["typed into the model", "typed"]] as const) {
+  test(`C1: for each of the ${ATTEST.length} attest values of baselineSupport(), zdr+attest=<it> ${carrier} is blocked when the reply lists every attest value but it`, () => {
+    assert.ok(ATTEST.length > 0);
+    for (const item of ATTEST) {
+      const policy = `zdr+attest=${item}`;
+      const situation = place === "held" ? { held: held(policy) } : { model: `demo-model+${policy}` };
+      assert.deepEqual(view(decideFor({ ...situation, detection: listing(KEYS, ATTEST.filter((a) => a !== item)) })), blockView(unlisted(`attest=${item}`)), item);
+    }
+  });
+  test(`C1: for each of the ${SORTS.length} sort values of baselineSupport(), zdr+sort=<it> ${carrier} is blocked when the reply lists every sort value but it`, () => {
+    assert.ok(SORTS.length > 0);
+    for (const order of SORTS) {
+      const policy = `zdr+sort=${order}`;
+      const situation = place === "held" ? { held: held(policy) } : { model: `demo-model+${policy}` };
+      assert.deepEqual(view(decideFor({ ...situation, detection: listing(KEYS, ATTEST, SORTS.filter((s) => s !== order)) })), blockView(unlisted(`sort=${order}`)), order);
+    }
+  });
+}
+
+for (const [name, situation, reply, missing] of [
+  ["held attest=weights,prompt, the reply listing prompt only", { held: held("attest=weights,prompt") }, listing(KEYS, ["prompt"]), "attest=weights"],
+  ["held attest=weights,prompt, the reply listing weights only", { held: held("attest=weights,prompt") }, listing(KEYS, ["weights"]), "attest=prompt"],
+  ["typed +zdr+attest=weights,prompt, the reply listing weights only", { model: "demo-model+zdr+attest=weights,prompt" }, listing(KEYS, ["weights"]), "attest=prompt"],
+  ["held attest=weights and typed +attest=prompt, the reply listing weights only", { held: held("attest=weights"), model: "demo-model+attest=prompt" }, listing(KEYS, ["weights"]), "attest=prompt"],
+  ["held attest=weights and typed +attest=prompt, the reply listing prompt only", { held: held("attest=weights"), model: "demo-model+attest=prompt" }, listing(KEYS, ["prompt"]), "attest=weights"],
+  ["held zdr+sort=price and typed +sort=latency, the reply listing latency only", { held: held("zdr+sort=price"), model: "demo-model+sort=latency" }, listing(KEYS, ATTEST, ["latency"]), "sort=price"],
+  ["held zdr+sort=throughput, the reply listing price and latency", { held: held("zdr+sort=throughput") }, listing(KEYS, ATTEST, ["price", "latency"]), "sort=throughput"],
+  ["held zdr and typed +bits=8, the reply not listing bits", { held: held("zdr"), model: "demo-model+bits=8" }, listing(KEYS.filter((k) => k !== "bits")), "bits"],
+  ["held bits=8 and typed +zdr, the reply not listing bits", { held: held("bits=8"), model: "demo-model+zdr" }, listing(KEYS.filter((k) => k !== "bits")), "bits"],
+  ["held zdr and a configured Route-Policy bits=8, the reply not listing bits", { held: held("zdr"), configured: "bits=8" }, listing(KEYS.filter((k) => k !== "bits")), "bits"],
+] as const) {
+  test(`C1: a request with ${name} is blocked for ${missing} not being listed`, () => {
+    assert.deepEqual(view(decideFor({ ...situation, detection: reply })), blockView(unlisted(missing)));
+  });
+}
+
+test("C1: held zdr+attest=prompt+sort=latency+order=aurora with typed +bits=8, the reply listing everything, is sent with header zdr+attest=prompt+sort=latency+order=aurora", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr+attest=prompt+sort=latency+order=aurora"), model: "demo-model+bits=8" })), sendView("demo-model+bits=8", "zdr+attest=prompt+sort=latency+order=aurora", "zdr+bits=8+attest=prompt+sort=latency+order=aurora"));
 });
 
-test("C1: the reply must list every key and every attest and sort value of every policy on the request, preferences included", () => {
-  const without = (keys: string[], attest = ["weights", "prompt"], sort = ["price", "latency", "throughput"]): Detection =>
-    detection({ route_policy: "1", keys, attest, sort });
-  const all = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"];
-  const lacking = (key: string) => without(all.filter((k) => k !== key));
-  const uses: Record<string, string> = { zdr: "zdr", notrain: "notrain", bits: "bits=8", region: "region=us", attest: "attest=weights", only: "only=aurora", ignore: "ignore=cobalt", sort: "sort=price", order: "order=aurora" };
-  // Every key, on each carrier: the held policy on the header, the typed one on the suffix. Each block names its
-  // key. A requirement goes with each (zdr, or notrain beside zdr itself): preferences alone need no detection (C2).
-  const withRequirement = (key: string): string => (key === "zdr" ? "zdr+notrain" : `zdr+${uses[key] ?? ""}`);
-  for (const key of all) {
-    const missing = new RegExp(`does not list ${key} in its detection reply`);
-    blockedFor(decideFor({ held: held(withRequirement(key)), detection: lacking(key) }), missing);
-    blockedFor(decideFor({ model: `demo-model+${withRequirement(key)}`, detection: lacking(key) }), missing);
-  }
-  // Two policies with requirements, one on each carrier, exactly one of them unsupported: blocked, whichever it is.
-  blockedFor(decideFor({ held: held("zdr"), model: "demo-model+bits=8", detection: lacking("bits") }), /does not list bits in its detection reply/);
-  blockedFor(decideFor({ held: held("bits=8"), model: "demo-model+zdr", detection: lacking("bits") }), /does not list bits in its detection reply/);
-  // A policy with two attest values, the second unlisted; on the header, and on the suffix.
-  blockedFor(decideFor({ held: held("attest=weights,prompt"), detection: without(all, ["weights"]) }), /does not list attest=prompt in/);
-  blockedFor(decideFor({ held: held("zdr"), model: "demo-model+attest=weights,prompt", detection: without(all, ["weights"]) }), /does not list attest=prompt in/);
-  // A sort value unlisted on the header carrier too.
-  blockedFor(decideFor({ held: held("zdr+sort=price"), detection: without(all, undefined, ["latency"]) }), /does not list sort=price in/);
-  // Every attest value and every sort value, each the only one missing.
-  for (const item of ["weights", "prompt"]) {
-    blockedFor(decideFor({ held: held(`attest=${item}`), detection: without(all, ["weights", "prompt"].filter((a) => a !== item)) }), new RegExp(`does not list attest=${item} in`));
-  }
-  for (const order of ["price", "latency", "throughput"]) {
-    blockedFor(decideFor({ held: held("zdr"), model: `demo-model+sort=${order}`, detection: without(all, undefined, ["price", "latency", "throughput"].filter((s) => s !== order)) }), new RegExp(`does not list sort=${order} in`));
-  }
-  sent(decideFor({ held: held("zdr+attest=prompt+sort=latency+order=aurora"), model: "demo-model+bits=8" }));
+// ---- C2: preferences alone need no detection.
+test("C2: held sort=price+order=basalt with typed +sort=latency and no detection reply is sent with header sort=price+order=basalt and the model as typed", () => {
+  assert.deepEqual(view(decideFor({ held: held("sort=price+order=basalt"), model: "demo-model+sort=latency", detection: null })), sendView("demo-model+sort=latency", "sort=price+order=basalt", "sort=latency+order=basalt"));
 });
 
-test("C2: a request whose policies hold only preferences is sent without detection", () => {
-  const decision = sent(decideFor({ held: held("sort=price+order=basalt"), model: "demo-model+sort=latency", detection: null }));
-  assert.equal(decision.header, "sort=price+order=basalt");
-  assert.equal(decision.model, "demo-model+sort=latency");
+// ---- C1: no policy at all.
+for (const [name, reply] of [
+  ["no detection reply", null],
+  ["a full detection reply", detection({ route_policy: "1" })],
+  ["a detection reply listing no keys", detection({ route_policy: "1", keys: [] })],
+  ["a detection reply with key policy zdr", detection({ route_policy: "1", key_policy: "zdr" })],
+] as const) {
+  test(`C1: a request with no policy and ${name} is sent as it is`, () => {
+    assert.deepEqual(view(decideFor({ detection: reply })), sendView("demo-model", null, null));
+  });
+}
+
+test("C1: a request for vendor/model with no policy at OpenRouter's base URL and no detection reply is sent as it is", () => {
+  assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, detection: null, model: "vendor/model" })), sendView("vendor/model", null, null));
 });
 
-test("C10: with both carriers the held policy goes by the header and a typed suffix stays as typed", () => {
-  // As typed, byte for byte: a suffix whose keys are not in the order a writer would put them stays that way.
-  assert.equal(sent(decideFor({ held: held("zdr"), model: "demo-model+sort=latency+notrain", carriers: "header" })).model, "demo-model+sort=latency+notrain");
-  const decision = sent(decideFor({ held: held("zdr+sort=price"), model: "demo-model+notrain+sort=latency", carriers: "header" }));
-  assert.equal(decision.header, "zdr+sort=price");
-  assert.equal(decision.model, "demo-model+notrain+sort=latency");
-  assert.deepEqual(
-    { zdr: decision.sent?.zdr, notrain: decision.sent?.notrain, sort: decision.sent?.sort },
-    { zdr: true, notrain: true, sort: "latency" },
-    "what was sent combines both, the suffix the more specific",
-  );
+// ---- C10: carriers.
+test("C10: with the header carrier, held zdr+sort=price and typed +notrain+sort=latency is sent with header zdr+sort=price and model demo-model+notrain+sort=latency", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr+sort=price"), model: "demo-model+notrain+sort=latency", carriers: "header" })), sendView("demo-model+notrain+sort=latency", "zdr+sort=price", "zdr+notrain+sort=latency"));
 });
 
-test("C10: with one carrier the two are combined into the suffix, the typed one the more specific", () => {
-  const decision = sent(decideFor({ held: held("zdr+region=us,de+sort=price"), model: "demo-model+region=de,fr+sort=latency", carriers: "suffix" }));
-  assert.equal(decision.header, null);
-  assert.equal(decision.model, "demo-model+zdr+region=de+sort=latency");
+test("C10: with the header carrier, held zdr and typed +sort=latency+notrain is sent with model demo-model+sort=latency+notrain as typed", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr"), model: "demo-model+sort=latency+notrain", carriers: "header" })), sendView("demo-model+sort=latency+notrain", "zdr", "zdr+notrain+sort=latency"));
 });
 
-test("C10: with one carrier, a combination that cannot be written blocks the request and nothing weaker is sent", () => {
-  const unwritable = /the held policy and the typed suffix combine to one that cannot be written as a policy .*no weaker one is sent/;
-  blockedFor(decideFor({ held: held("region=us"), model: "demo-model+region=de", carriers: "suffix" }), unwritable);
-  // Nine ignored providers held and eight typed are each a valid list; their union of seventeen is over the limit.
-  const ignore = (prefix: string, count: number) => `ignore=${Array.from({ length: count }, (_, i) => `${prefix}${i}`).join(",")}`;
-  const situation = { held: held(`zdr+${ignore("a", 9)}`), model: `demo-model+${ignore("b", 8)}` };
-  blockedFor(decideFor({ ...situation, carriers: "suffix" }), unwritable);
-  // With both carriers nothing has to be combined, so the same request goes.
-  sent(decideFor({ ...situation, carriers: "header" }));
+test("C10: with the suffix carrier, held zdr+region=us,de+sort=price and typed +region=de,fr+sort=latency is sent with model demo-model+zdr+region=de+sort=latency and no header", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr+region=us,de+sort=price"), model: "demo-model+region=de,fr+sort=latency", carriers: "suffix" })), sendView("demo-model+zdr+region=de+sort=latency", null, "zdr+region=de+sort=latency"));
 });
 
-test("C10: a held policy and a configured Route-Policy header combine into the one header the plugin sends", () => {
-  assert.equal(sent(decideFor({ held: held("zdr+sort=price"), configured: "bits=8+sort=latency", carriers: "header" })).header, "zdr+bits=8+sort=price");
-  blockedFor(decideFor({ held: held("region=us"), configured: "region=de", carriers: "header" }), /the held policy and the configured Route-Policy header combine to one that cannot be written/);
-  // Where the plugin cannot set headers, the configured one goes as it is and the held one rides the suffix.
-  const suffixOnly = sent(decideFor({ held: held("zdr"), configured: "bits=8", carriers: "suffix" }));
-  assert.deepEqual([suffixOnly.header, suffixOnly.model], ["bits=8", "demo-model+zdr"]);
+const UNWRITABLE = (detail: string): string => `the held policy and the typed suffix combine to one that cannot be written as a policy (${detail}); no weaker one is sent in its place`;
+test("C10: with the suffix carrier, held region=us and typed +region=de is blocked: they combine to one that cannot be written", () => {
+  assert.deepEqual(view(decideFor({ held: held("region=us"), model: "demo-model+region=de", carriers: "suffix" })), blockView(UNWRITABLE('malformed item ""')));
 });
 
-test("C10: an invalid held policy, typed suffix, or configured header blocks instead of being dropped", () => {
-  blockedFor(decideFor({ held: holdPolicy("zdr+zdr", "env") }), /the held policy "zdr\+zdr" is not valid/);
-  blockedFor(decideFor({ model: "demo-model+zdr=1" }), /the model id "demo-model\+zdr=1" carries a suffix that is not a valid policy/);
-  blockedFor(decideFor({ configured: "bits=0" }), /the configured Route-Policy header "bits=0" is not a valid policy/);
+const ignore = (prefix: string, count: number): string => `ignore=${Array.from({ length: count }, (_, i) => `${prefix}${i}`).join(",")}`;
+test("C10: with the suffix carrier, held zdr plus 9 ignored providers and typed 8 other ignored providers is blocked: they combine to one that cannot be written", () => {
+  assert.deepEqual(view(decideFor({ held: held(`zdr+${ignore("a", 9)}`), model: `demo-model+${ignore("b", 8)}`, carriers: "suffix" })), blockView(UNWRITABLE("more than 16 items")));
 });
 
-const UNMET = /no route the model list publishes for demo-model meets the policy, so the gateway would refuse it/;
-
-test("C16: with the model list held, a request no published route meets is not sent", () => {
-  // Each model by its own routes: demo-model's aurora meets zdr; other-model's only route does not.
-  const two = { data: [...MODEL_LIST.data, { id: "other-model", routes: [{ provider: "cobalt", facts: "notrain" }] }] };
-  sent(decideFor({ held: held("zdr"), model: "demo-model", list: two }));
-  blockedFor(decideFor({ held: held("zdr"), model: "other-model", list: two }), /no route the model list publishes for other-model meets the policy/);
-  sent(decideFor({ held: held("notrain"), model: "other-model", list: two }));
-  blockedFor(decideFor({ held: held("only=nosuch"), list: MODEL_LIST }), UNMET);
-  // The same policy without a list goes, and the gateway decides.
-  sent(decideFor({ held: held("only=nosuch") }));
-  // Each route meets part of zdr+bits=16; none meets all of it.
-  blockedFor(decideFor({ held: held("zdr"), model: "demo-model+bits=16", list: MODEL_LIST }), UNMET);
-  const ok = sent(decideFor({ held: held("zdr"), model: "demo-model+bits=8", list: MODEL_LIST }));
-  assert.deepEqual([...(ok.routes?.keys() ?? [])], ["aurora", "basalt", "cobalt"], "routes are looked up by the id without its suffix");
+test("C10: with the header carrier, held zdr plus 9 ignored providers and typed 8 other ignored providers is sent, each on its own carrier", () => {
+  assert.deepEqual(view(decideFor({ held: held(`zdr+${ignore("a", 9)}`), model: `demo-model+${ignore("b", 8)}`, carriers: "header" })), sendView(`demo-model+${ignore("b", 8)}`, `zdr+${ignore("a", 9)}`, "unwritable"));
 });
 
-test("C16: a route meets attest only when it publishes a valid evidence URI", () => {
-  const list = (evidence: unknown) => ({ data: [{ id: "demo-model", routes: [{ provider: "basalt", facts: "attest=weights", evidence }] }] });
-  sent(decideFor({ held: held("attest=weights"), list: list("https://basalt.example/attestation") }));
-  blockedFor(decideFor({ held: held("attest=weights"), list: list("http://basalt.example/attestation") }), UNMET);
-  // No evidence member at all, null, or not a string: not published either.
-  const without = { data: [{ id: "demo-model", routes: [{ provider: "basalt", facts: "attest=weights" }] }] };
-  blockedFor(decideFor({ held: held("attest=weights"), list: without }), UNMET);
-  for (const evidence of [null, 7, ["https://basalt.example/attestation"]]) blockedFor(decideFor({ held: held("attest=weights"), list: list(evidence) }), UNMET);
+test("C10: with the header carrier, held zdr+sort=price and a configured Route-Policy bits=8+sort=latency is sent with header zdr+bits=8+sort=price", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr+sort=price"), configured: "bits=8+sort=latency", carriers: "header" })), sendView("demo-model", "zdr+bits=8+sort=price", "zdr+bits=8+sort=price"));
 });
 
-const keyed = (keyPolicy: string, keys = ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"]) =>
-  detection({ ...formatDetection({ keys: new Set(), attest: new Set(["weights", "prompt"]), sort: new Set(["price"]) }), keys, key_policy: keyPolicy });
-
-test("C16, C12: an interpretable key policy joins the check; one the client cannot interpret is relied on for nothing", () => {
-  // notrain is met by aurora alone; the key's only=cobalt excludes it.
-  blockedFor(decideFor({ held: held("notrain"), list: MODEL_LIST, detection: keyed("only=cobalt") }), /meets the policy combined with the key's own/);
-  // A key from a later revision makes the key policy uninterpretable: it plays no part, so aurora still qualifies.
-  sent(decideFor({ held: held("notrain"), list: MODEL_LIST, detection: keyed("only=cobalt+future", ["zdr", "notrain", "only", "future"]) }));
+test("C10: with the header carrier, held region=us and a configured Route-Policy region=de is blocked: they combine to one that cannot be written", () => {
+  assert.deepEqual(view(decideFor({ held: held("region=us"), configured: "region=de", carriers: "header" })), blockView('the held policy and the configured Route-Policy header combine to one that cannot be written as a policy (malformed item "")'));
 });
 
-test("C16: a key policy's requirements count when the request carries only preferences, or no policy at all", () => {
-  blockedFor(decideFor({ held: held("sort=price"), list: MODEL_LIST, detection: keyed("only=nosuch") }), /meets the policy combined with the key's own/);
-  blockedFor(decideFor({ list: MODEL_LIST, detection: keyed("only=nosuch") }), /meets the key's own policy/);
-  // The same key with a list that a route of meets: nothing to stop.
-  sent(decideFor({ list: MODEL_LIST, detection: keyed("only=aurora") }));
+test("C10: with the suffix carrier, held zdr and a configured Route-Policy bits=8 is sent with header bits=8 and model demo-model+zdr", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr"), configured: "bits=8", carriers: "suffix" })), sendView("demo-model+zdr", "bits=8", "zdr+bits=8"));
 });
 
-test("C9: with no detection reply, a policy for OpenRouter is translated into its provider field and the suffix is removed", () => {
-  const decision = decideFor({ base: OPENROUTER_BASE, detection: null, held: held("only=aurora+ignore=cobalt"), model: "vendor/model+sort=price", carriers: "suffix" });
-  assert.ok(decision.action === "translate", decision.action);
-  assert.equal(decision.model, "vendor/model");
-  assert.deepEqual(decision.provider, { only: ["aurora"], ignore: ["cobalt"], sort: "price" });
-  assert.equal(splitModel(decision.model).policy, null);
+for (const [name, situation, reason] of [
+  ["held zdr+zdr", { held: holdPolicy("zdr+zdr", "env") }, 'the held policy "zdr+zdr" is not valid: repeated key'],
+  ["model demo-model+zdr=1", { model: "demo-model+zdr=1" }, 'the model id "demo-model+zdr=1" carries a suffix that is not a valid policy: takes no value'],
+  ["a configured Route-Policy bits=0", { configured: "bits=0" }, 'the configured Route-Policy header "bits=0" is not a valid policy: takes one integer from 1 to 64'],
+] as const) {
+  test(`C10: a request with ${name} is blocked: "${reason}"`, () => {
+    assert.deepEqual(view(decideFor(situation)), blockView(reason));
+  });
+}
+
+// ---- C16: with the model list held.
+const UNMET = (model: string, what: string): string => `no route the model list publishes for ${model} meets the ${what}, so the gateway would refuse it only after receiving the content`;
+const TWO = { data: [...MODEL_LIST.data, { id: "other-model", routes: [{ provider: "cobalt", facts: "notrain" }] }] };
+test("C16: held only=nosuch with MODEL_LIST held is blocked: no published route meets it", () => {
+  assert.deepEqual(view(decideFor({ held: held("only=nosuch"), list: MODEL_LIST })), blockView(UNMET("demo-model", "policy")));
+});
+test("C16: held only=nosuch with no model list held is sent with header only=nosuch", () => {
+  assert.deepEqual(view(decideFor({ held: held("only=nosuch") })), sendView("demo-model", "only=nosuch", "only=nosuch"));
+});
+test("C16: held zdr with typed +bits=16 and MODEL_LIST held is blocked: no published route meets both", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr"), model: "demo-model+bits=16", list: MODEL_LIST })), blockView(UNMET("demo-model", "policy")));
+});
+test("C16: held zdr with typed +bits=8 and MODEL_LIST held is sent with demo-model's routes aurora, basalt, and cobalt", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr"), model: "demo-model+bits=8", list: MODEL_LIST })), sendView("demo-model+bits=8", "zdr", "zdr+bits=8", [["aurora", null], ["basalt", "https://basalt.example/attestation"], ["cobalt", null]]));
+});
+test("C16: held zdr for other-model, whose only route cobalt publishes notrain, is blocked", () => {
+  assert.deepEqual(view(decideFor({ held: held("zdr"), model: "other-model", list: TWO })), blockView(UNMET("other-model", "policy")));
+});
+test("C16: held notrain for other-model, whose only route cobalt publishes notrain, is sent with route cobalt", () => {
+  assert.deepEqual(view(decideFor({ held: held("notrain"), model: "other-model", list: TWO })), sendView("other-model", "notrain", "notrain", [["cobalt", null]]));
 });
 
-test("C9: a requirement OpenRouter has no hard filter for blocks the whole request", () => {
-  for (const [policy, why] of [["zdr", /zdr has no hard filter/], ["notrain", /notrain has no hard filter/], ["bits=8", /bits has no hard filter/], ["region=us", /region has no request field/], ["attest=weights", /attest has no counterpart/]] as const) {
-    blockedFor(decideFor({ base: OPENROUTER_BASE, detection: null, held: held(`only=aurora+${policy}`) }), why);
-  }
-  // A configured Route-Policy header could not be removed by a harness without a header hook, so it blocks there.
-  blockedFor(decideFor({ base: OPENROUTER_BASE, detection: null, configured: "only=aurora", carriers: "suffix" }), /gives the plugin no way to remove it from a translated request/);
-  assert.equal(decideFor({ base: OPENROUTER_BASE, detection: null, configured: "only=aurora", carriers: "header" }).action, "translate");
+const basalt = (evidence?: unknown): unknown => ({ data: [{ id: "demo-model", routes: [{ provider: "basalt", facts: "attest=weights", ...(evidence === undefined ? {} : { evidence }) }] }] });
+test("C16: held attest=weights with basalt publishing evidence https://basalt.example/attestation is sent with that route", () => {
+  assert.deepEqual(view(decideFor({ held: held("attest=weights"), list: basalt("https://basalt.example/attestation") })), sendView("demo-model", "attest=weights", "attest=weights", [["basalt", "https://basalt.example/attestation"]]));
+});
+for (const [name, evidence] of [
+  ["evidence http://basalt.example/attestation", "http://basalt.example/attestation"],
+  ["no evidence member", undefined],
+  ["evidence null", null],
+  ["evidence 7", 7],
+  ['evidence ["https://basalt.example/attestation"]', ["https://basalt.example/attestation"]],
+  ["a 513-byte evidence URI", `https://basalt.example/${"a".repeat(513 - "https://basalt.example/".length)}`],
+] as const) {
+  test(`C16: held attest=weights with basalt publishing ${name} is blocked: no published route meets it`, () => {
+    assert.deepEqual(view(decideFor({ held: held("attest=weights"), list: basalt(evidence) })), blockView(UNMET("demo-model", "policy")));
+  });
+}
+
+const keyed = (keyPolicy: string, keys: readonly string[] = KEYS): Detection =>
+  detection({ ...formatDetection({ keys: new Set(), attest: new Set(["weights", "prompt"]), sort: new Set(["price"]) }), keys: [...keys], key_policy: keyPolicy });
+test("C16, C12: held notrain with key policy only=cobalt and MODEL_LIST held is blocked: no route meets both", () => {
+  assert.deepEqual(view(decideFor({ held: held("notrain"), list: MODEL_LIST, detection: keyed("only=cobalt") })), blockView(UNMET("demo-model", "policy combined with the key's own")));
+});
+test("C16, C12: held notrain with the uninterpretable key policy only=cobalt+future and MODEL_LIST held is sent with demo-model's routes", () => {
+  assert.deepEqual(view(decideFor({ held: held("notrain"), list: MODEL_LIST, detection: keyed("only=cobalt+future", ["zdr", "notrain", "only", "future"]) })), sendView("demo-model", "notrain", "notrain", [["aurora", null], ["basalt", "https://basalt.example/attestation"], ["cobalt", null]]));
+});
+test("C16: held sort=price with key policy only=nosuch and MODEL_LIST held is blocked: no route meets the key's own policy with it", () => {
+  assert.deepEqual(view(decideFor({ held: held("sort=price"), list: MODEL_LIST, detection: keyed("only=nosuch") })), blockView(UNMET("demo-model", "policy combined with the key's own")));
+});
+test("C16: no policy with key policy only=nosuch and MODEL_LIST held is blocked: no route meets the key's own policy", () => {
+  assert.deepEqual(view(decideFor({ list: MODEL_LIST, detection: keyed("only=nosuch") })), blockView(UNMET("demo-model", "key's own policy")));
+});
+test("C16: no policy with key policy only=aurora and MODEL_LIST held is sent with demo-model's routes", () => {
+  assert.deepEqual(view(decideFor({ list: MODEL_LIST, detection: keyed("only=aurora") })), sendView("demo-model", null, null, [["aurora", null], ["basalt", "https://basalt.example/attestation"], ["cobalt", null]]));
 });
 
-test("C9: a gateway at the OpenRouter base that answers detection is spoken to in this protocol", () => {
-  // Its carriers, as for any gateway: the header where the harness has one, the suffix where it has not.
-  const byHeader = sent(decideFor({ base: `${OPENROUTER_BASE}/`, held: held("zdr"), model: "vendor/model", carriers: "header" }));
-  assert.deepEqual([byHeader.model, byHeader.header], ["vendor/model", "zdr"]);
-  const bySuffix = sent(decideFor({ base: OPENROUTER_BASE, held: held("zdr"), model: "vendor/model", carriers: "suffix" }));
-  assert.deepEqual([bySuffix.model, bySuffix.header], ["vendor/model+zdr", null]);
+// ---- C9: OpenRouter.
+test("C9: at OpenRouter's base URL with no detection reply, held only=aurora+ignore=cobalt and typed vendor/model+sort=price is translated to model vendor/model and provider {only, ignore, sort}", () => {
+  assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, detection: null, held: held("only=aurora+ignore=cobalt"), model: "vendor/model+sort=price", carriers: "suffix" })), {
+    action: "translate",
+    model: "vendor/model",
+    provider: { only: ["aurora"], ignore: ["cobalt"], sort: "price" },
+    sent: "only=aurora+ignore=cobalt+sort=price",
+  });
 });
-
-test("C1: a request no policy reaches is sent as it is, whatever detection says: none, a full reply, an empty one, or one with a key policy", () => {
-  const replies: [string, Detection | null][] = [
-    ["none", null],
-    ["full", detection({ route_policy: "1" })],
-    ["empty", detection({ route_policy: "1", keys: [] })],
-    ["key policy", detection({ route_policy: "1", key_policy: "zdr" })],
-  ];
-  for (const [name, reply] of replies) {
-    const decision = sent(decideFor({ detection: reply }));
-    assert.deepEqual([decision.model, decision.header, decision.sent], ["demo-model", null, null], name);
-  }
-  // To OpenRouter too: with nothing to translate, nothing is rewritten.
-  assert.deepEqual(sent(decideFor({ base: OPENROUTER_BASE, detection: null, model: "vendor/model" })).model, "vendor/model");
+for (const [policy, why] of [
+  ["zdr", "zdr has no hard filter there (its zdr field still admits Safety Retention endpoints)"],
+  ["notrain", "notrain has no hard filter there (data_collection covers the model providers, not OpenRouter itself)"],
+  ["bits=8", "bits has no hard filter there (quantizations names levels, not a floor on every weight)"],
+  ["region=us", "region has no request field there"],
+  ["attest=weights", "attest has no counterpart there"],
+] as const) {
+  test(`C9: at OpenRouter's base URL with no detection reply, held only=aurora+${policy} is blocked: ${why}`, () => {
+    assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, detection: null, held: held(`only=aurora+${policy}`) })), blockView(`the policy cannot be translated for OpenRouter: ${why}`));
+  });
+}
+test("C9: at OpenRouter's base URL with no detection reply and the suffix carrier, a configured Route-Policy only=aurora is blocked: it cannot be removed", () => {
+  assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, detection: null, configured: "only=aurora", carriers: "suffix" })), blockView("a Route-Policy header is configured for this provider, and this harness gives the plugin no way to remove it from a translated request"));
+});
+test("C9: at OpenRouter's base URL with no detection reply and the header carrier, a configured Route-Policy only=aurora is translated to provider {only: [aurora]}", () => {
+  assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, detection: null, configured: "only=aurora", carriers: "header" })), { action: "translate", model: "demo-model", provider: { only: ["aurora"] }, sent: "only=aurora" });
+});
+test("C9: at OpenRouter's base URL with a valid detection reply and the header carrier, held zdr for vendor/model is sent with header zdr", () => {
+  assert.deepEqual(view(decideFor({ base: `${OPENROUTER_BASE}/`, held: held("zdr"), model: "vendor/model", carriers: "header" })), sendView("vendor/model", "zdr", "zdr"));
+});
+test("C9: at OpenRouter's base URL with a valid detection reply and the suffix carrier, held zdr for vendor/model is sent with model vendor/model+zdr", () => {
+  assert.deepEqual(view(decideFor({ base: OPENROUTER_BASE, held: held("zdr"), model: "vendor/model", carriers: "suffix" })), sendView("vendor/model+zdr", null, "zdr"));
 });

@@ -59,11 +59,14 @@ async function assertRefusal(response: Response, status: number, reason: string)
   return response.json().catch((error: unknown) => assert.fail(`expected the gateway's JSON refusal body: ${String(error)}`));
 }
 
+const delta: Route = { ...routes[2]!, provider: "delta", url: "http://delta.example/v1", facts: "region=de+attest=prompt",
+  evidence: "https://delta.example/report" };
+
 for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
   const mode = `${endpoint}, stream=${stream}`;
   const call = (id = model, key = "open", header?: string) => inference(endpoint, formatBody(id, stream), key, header === undefined ? undefined : { "rOuTe-PoLiCy": header });
 
-  test(`G1 G2 G4 G8 G9 G11 G29 ${mode}: verify carrier order, whole-string limits and no calls on unsupported`, async () => {
+  test(`G2 ${mode}: a bits=0 header names bits ahead of a malformed only suffix`, async () => {
     const { gateway, calls } = setup();
     const cases: [string, string | undefined, string][] = [
       [`${model}+only=x,x`, "bits=0", "reason=unsupported+key=bits"],
@@ -90,21 +93,24 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(calls, []);
   });
 
-  test(`G3 G4 G10 G11 G12 G13 ${mode}: three carriers narrow, and unsatisfiable sends nothing`, async () => {
-    const germanRoute: Route = { ...routes[2]!, provider: "delta", url: "http://delta.example/v1", facts: "region=de" };
-    const { gateway, calls } = setup(undefined, { models: { [model]: [...routes, germanRoute] } });
+  test(`G4 ${mode}: a bits=0 header returns unsupported before a provider attempt`, async () => {
+    const { gateway, calls } = setup();
+    await assertRefusal(await gateway(call(model, "open", "bits=0")), 400, "reason=unsupported+key=bits");
+    assert.deepEqual(calls, []);
+  });
+
+  test(`G12 ${mode}: a region=us header and region=de suffix refuse before a provider attempt`, async () => {
+    const { gateway, calls } = setup(undefined, { models: { [model]: [...routes, delta] } });
     for (const [id, key, header] of [
       [model, "open", "bits=64"], [model, "open", "ignore=aurora,basalt,cobalt,delta"],
       [`${model}+region=de`, "open", "region=us"], [`${model}+only=aurora`, "open", "only=basalt"],
       [`${model}+region=us`, "open", "region=de"], [`${model}+only=basalt`, "open", "only=aurora"],
       [`${model}+bits=16`, "open", "zdr"], [`${model}+only=aurora`, "open", "ignore=aurora"],
       [`${model}+only=basalt`, "locked", undefined], [model, "locked", "only=basalt"], [`${model}+bits=16`, "locked", "region=us,de"],
-      [`${model}+bits=1`, "precise", "only=aurora"], [`${model}+region=us,de`, "region", "only=basalt"],
-      [`${model}+attest=prompt`, "attest", "only=aurora"], [model, "attest", "only=aurora"],
+      [model, "attest", "only=aurora"],
     ] as const) await assertRefusal(await gateway(call(id, key, header)), 400, "reason=unsatisfiable");
     assert.equal(calls.length, 0);
     for (const [id, key, header, provider] of [
-      [model, "locked", undefined, "aurora"], [model, "precise", undefined, "basalt"],
       [model, "open", "region=us", "aurora"], [`${model}+region=de`, "open", undefined, "delta"],
     ] as const) {
       const relayed = await gateway(call(id, key, header));
@@ -112,10 +118,39 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     }
     const narrowed = await gateway(call(`${model}+bits=1+only=aurora,basalt`, "locked", "region=us,de+ignore=cobalt"));
     assert.equal(narrowed.headers.get("route-applied"), "provider=aurora");
-    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "basalt", "aurora", "delta", "aurora"]);
+    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "delta", "aurora"]);
   });
 
-  test(`G6 G7 G14 G15 G17 G18 G19 G23 G32 G33 S19 ${mode}: relay only the matching route, strip hop-by-hop and provider result headers, and rewrite only the top-level model`, async () => {
+  for (const [key, requirement, provider] of [
+    ["precise", "bits=1", "aurora"], ["region", "region=us,de", "basalt"],
+    ["attest", "attest=prompt", "delta"], ["pinned", "only=basalt", "basalt"],
+  ] as const) for (const carrier of ["header", "suffix"] as const) {
+    const text = requirement.startsWith("only=") ? requirement : `${requirement}+only=${provider}`;
+    test(`G13 ${mode}: ${key} plus ${carrier} ${text} refuses before reaching ${provider}`, async () => {
+      const { gateway, calls } = setup(undefined, {
+        keys: { ...keys, pinned: { policy: "only=aurora" } }, models: { [model]: [...routes, delta] },
+      });
+      await assertRefusal(await gateway(call(carrier === "suffix" ? `${model}+${text}` : model, key, carrier === "header" ? text : undefined)),
+        400, "reason=unsatisfiable");
+      assert.equal(calls.length, 0);
+      const control = await gateway(call(model, "open", text));
+      assert.equal(control.headers.get("route-applied"), `provider=${provider}`);
+      assert.deepEqual(calls.map((row) => row.provider), [provider]);
+    });
+  }
+
+  for (const carrier of ["authorization", "x-api-key"] as const) for (const [key, provider] of [["locked", "aurora"], ["precise", "basalt"]] as const) {
+    test(`G10 ${mode}: ${carrier} with ${key} and no explicit policy calls ${provider}`, async () => {
+      const { gateway, calls } = setup(undefined, { models: { [model]: [routes[2]!, ...routes.slice(0, 2)] } });
+      const headers = new Headers({ [carrier]: carrier === "authorization" ? `Bearer ${key}` : key });
+      const response = await gateway(new Request(`${root}/${endpoint}`, { method: "POST", headers, body: formatBody(model, stream) }));
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("route-applied"), `provider=${provider}`);
+      assert.deepEqual(calls.map((row) => row.provider), [provider]);
+    });
+  }
+
+  test(`G14 ${mode}: the basalt override rewrites duplicate top-level model fields but preserves nested model bytes`, async () => {
     const payload = stream ? ["data: served by ", "basalt\n\n"] : ["{\"text\":", "\"served by basalt\"}"];
     const { gateway, calls } = setup(() => {
       let i = 0;
@@ -168,7 +203,7 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(calls.map((row) => row.provider), ["basalt", "basalt", "basalt", "aurora", "aurora"]);
   });
 
-  test(`G5 G18 G26 G33 G34 G35 G37 G39 ${mode}: retry eligible failures; name the retried provider and strip its result headers without policy`, async () => {
+  test(`G37 ${mode}: a basalt network error leaves the relayed cobalt 418 attributed to cobalt`, async () => {
     const { gateway, calls } = setup(({ provider }) => {
       if (provider === "aurora") return new Response("do not relay 429", { status: 429 });
       if (provider === "basalt") throw new TypeError("network error");
@@ -201,12 +236,31 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(allFail.calls.map((row) => row.provider), ["aurora", "basalt", "cobalt", "basalt"]);
   });
 
-  test(`G24 G25 G31 G34 S19 ${mode}: unknown provider semantics, own errors before all policy checks, normal error envelopes`, async () => {
+  test(`G5 ${mode}: after eligible Aurora 429 and Basalt network errors, excluded Cobalt is not tried`, async () => {
+    const { gateway, calls } = setup(({ provider }) => {
+      if (provider === "aurora") return new Response("retry", { status: 429 });
+      if (provider === "basalt") throw new TypeError("network error");
+      return new Response("incorrect fallback");
+    });
+    await assertRefusal(await gateway(call(`${model}+only=aurora,basalt`)), 503, "reason=unavailable");
+    assert.deepEqual(calls.map(({ provider }) => provider), ["aurora", "basalt"]);
+  });
+
+  test(`G39 ${mode}: without a policy, Aurora's HTTP 418 and body are relayed unchanged`, async () => {
+    const { gateway, calls } = setup(() => new Response("upstream result", { status: 418 }));
+    const response = await gateway(call());
+    assert.equal(response.status, 418);
+    assert.equal(await response.text(), "upstream result");
+    assert.deepEqual(calls.map(({ provider }) => provider), ["aurora"]);
+    noHeaders(response);
+  });
+
+  test(`G25 ${mode}: a numeric model remains a headerless 400 with a repeated invalid policy`, async () => {
     const { gateway, calls } = setup();
     const requestWithInvalidHeader = (body: string, key = "open") => inference(endpoint, body, key, { "Route-Policy": "bits=0" });
     const cases: [string, string, number][] = [
       [formatBody(`${model}+bits=0`, stream), "wrong", 401], ["{", "open", 400], ["null", "open", 400], ["[]", "open", 400],
-      ['{"model":7}', "open", 400], ['{"model":"demo-model","model":7}', "open", 400], ["{}", "open", 400],
+      [`{"model":7,"stream":${stream}}`, "open", 400], [`{"model":"demo-model","model":7,"stream":${stream}}`, "open", 400], ["{}", "open", 400],
       [formatBody("unknown+bits=0", stream), "open", 404], [formatBody("+bits=0", stream), "open", 404],
     ];
     for (const [body, key, status] of cases) {
@@ -236,9 +290,30 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     }
     assert.deepEqual(calls.map((row) => row.provider), ["aurora", "basalt", "basalt"]);
   });
+
+  test(`G31 ${mode}: the unknown model with bits=0 returns 404 without forwarding`, async () => {
+    const { gateway, calls } = setup();
+    const response = await gateway(call("unknown+bits=0"));
+    assert.equal(response.status, 404);
+    noHeaders(response);
+    assert.deepEqual(calls, []);
+  });
+
+  test(`G34 ${mode}: bits=0 and a numeric model return the same error envelope`, async () => {
+    const { gateway } = setup();
+    const ordinary = await gateway(inference(endpoint, `{"model":7,"stream":${stream}}`));
+    const policy = await assertRefusal(await gateway(call(model, "open", "bits=0")), 400, "reason=unsupported+key=bits");
+    assert.equal(ordinary.status, 400);
+    const body: unknown = await ordinary.json();
+    const type = "invalid_request_error";
+    assert.deepEqual(body, endpoint === "messages" ? { type: "error", error: { type, message: "Expected a string model" } }
+      : { error: { type, message: "Expected a string model" } });
+    assert.deepEqual(policy, endpoint === "messages" ? { type: "error", error: { type, message: "Route policy unsupported" } }
+      : { error: { type, message: "Route policy unsupported" } });
+  });
 }
 
-test("G20 G21 G22 G23 G38: advertise the actual subset, publish independent facts, reveal only the supplied key's policy", async () => {
+test("G38: the locked and precise credentials return different key_policy strings at detection", async () => {
   const { gateway } = setup(undefined, {
     accept: { keys: ["zdr", "sort", "attest", "only", "bits", "region", "ignore", "order"], attest: ["weights"], sort: ["price"] },
     keys: { open: {}, locked: { policy: "sort=price+zdr" }, precise: { policy: "bits=16" } },
@@ -260,13 +335,21 @@ test("G20 G21 G22 G23 G38: advertise the actual subset, publish independent fact
   for (const [policy, key] of [["notrain", "notrain"], ["attest=prompt", "attest"], ["attest=weights,prompt", "attest"], ["sort=latency", "sort"]]) {
     await assertRefusal(await gateway(inference("chat/completions", formatBody(model, false), "open", { "Route-Policy": policy! })), 400, `reason=unsupported+key=${key}`);
   }
-  for (const policy of ["bits=64", "region=jp,de", "only=0,a-b_c.d", "ignore=0,a-b_c.d", "order=0,a-b_c.d", "attest=weights", "sort=price"]) {
+  for (const [policy, provider] of [
+    ["bits=64", null], ["region=jp,de", null], ["only=0,a-b_c.d", null], ["ignore=0,a-b_c.d", "aurora"],
+    ["order=0,a-b_c.d", "aurora"], ["attest=weights", "basalt"], ["sort=price", "basalt"],
+  ] as const) {
     const response = await gateway(inference("chat/completions", formatBody(model, false), "open", { "Route-Policy": policy }));
-    assert.ok(!response.headers.get("route-refused")?.includes("unsupported"));
+    if (provider === null) await assertRefusal(response, 400, "reason=unsatisfiable");
+    else {
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("route-refused"), null);
+      assert.equal(response.headers.get("route-applied"), `provider=${provider}`);
+    }
   }
 });
 
-test("G36 G32: reject invalid configuration at startup and keep the validated route facts independent of caller mutation", async () => {
+test("G36: a key policy containing bits=01 fails gateway creation with an invalid-policy error", async () => {
   const route = routes[0]!;
   const withRoute = (patch: object) => ({ models: { x: [{ ...route, ...patch }] } });
   const withPolicy = (policy: unknown) => ({ models: {}, keys: { k: { policy } } });
@@ -298,8 +381,10 @@ test("G36 G32: reject invalid configuration at startup and keep the validated ro
     [{ models: {}, accept: { sort: "price" } }, /^accept.sort must be a list$/],
     [{ models: {}, fetch: "fetch" }, /^fetch must be a function$/],
   ] as const) assert.throws(() => createGateway(invalid), { name: "TypeError", message }, JSON.stringify(invalid));
+});
 
-  const mutable = { ...route, facts: "zdr" };
+test("G32: mutating the loaded Aurora route to empty facts leaves both publication and zdr routing unchanged", async () => {
+  const mutable = { ...routes[0]!, facts: "zdr" };
   const { gateway, calls } = setup(undefined, { models: { [model]: [mutable] } });
   mutable.facts = "";
   mutable.provider = "unexpected";
@@ -309,7 +394,7 @@ test("G36 G32: reject invalid configuration at startup and keep the validated ro
   assert.deepEqual(calls.map((row) => row.provider), ["aurora"]);
 });
 
-test("G11 G35: sort keys and explicit order rank every retry, with suffix over header over key per preference", async () => {
+test("G35: suffix sort=latency orders cobalt before basalt after the header puts aurora first", async () => {
   const { gateway, calls } = setup(() => new Response("retry", { status: 500 }));
   for (const [suffix, key, header, expected] of [
     [undefined, "preferences", undefined, ["basalt", "cobalt", "aurora"]],

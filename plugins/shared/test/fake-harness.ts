@@ -3,7 +3,6 @@
 // header (pi), and the transport serializes the payload before it sends anything, through the global fetch.
 
 import type { ExtensionAPI } from "../src/plugin.ts";
-import type { HeldEntry } from "../src/held.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -22,7 +21,8 @@ export interface Sent {
 export class FakeHarness {
   readonly handlers = new Map<string, Handler[]>();
   readonly commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
-  readonly entries: { type: "custom"; customType: string; data: HeldEntry }[] = [];
+  /** The session branch: the plugin's own entries, and any other a harness or plugin wrote. */
+  readonly entries: { type: string; customType: string; data: unknown }[] = [];
   readonly shown: Shown[] = [];
   /** Errors the runtime caught from handlers, as it would report them. */
   readonly handlerErrors: string[] = [];
