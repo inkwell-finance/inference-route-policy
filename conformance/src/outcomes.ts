@@ -1,23 +1,9 @@
 import { isEvidenceUri, meets, parseApplied, parseRefused, providerAllowed, REFUSAL_STATUS, type Policy, type PublishedRoute, type RefusalReason } from "../../core/src/index.ts";
 import { sent, type Observation, type Probe } from "./http.ts";
 
-// G34 — compare only observations from the same endpoint and credential:
-// Input                                               | Verdict and claim
-// No refusal, or JSON refusal with no own-error body   | SKIP: no comparable observation.
-// Empty refusal, media mismatch, invalid declared JSON | FAIL: a positive contradiction.
-// A JSON member has no observed type at its known path | FAIL: a positive contradiction.
-// Non-JSON refusal without a media contradiction      | SKIP: structure not compared.
-// Body with an uninspectable content coding             | SKIP if its shape is needed.
-// JSON shape equals one complete own-error sample     | PASS: that shape was observed.
-// JSON shape differs only by fields or their grouping  | SKIP: name the unverified difference.
-// Array shapes ignore order and repetitions, not element structure. Only a
-// single body can establish a match; pooled controls can diagnose differences.
-
 export interface Exchange {
   probe: Probe;
   reply: Observation;
-  unverifiedOrdinaryControl?: string;
-  ordinaryControl?: string;
   missingRefusal?: boolean;
 }
 
@@ -35,15 +21,12 @@ export interface ResultContext {
   expectedRefusal?: { reason: "unsupported"; key: string | null } | { reason: "unsatisfiable" };
 }
 
-export type AuditId = "G1" | "G2" | "G3" | "G6" | "G7" | "G10" | "G13" | "G15" | "G17" | "G19" | "G21" | "G24" | "G26" | "G29" | "G34";
+export type AuditId = "G1" | "G2" | "G3" | "G6" | "G7" | "G10" | "G13" | "G15" | "G17" | "G19" | "G21" | "G24" | "G26" | "G29";
 export interface ResultAudit {
   failures: Map<AuditId, string>;
   catalogRelays: Exchange[];
   attestedRelays: Exchange[];
   results: Exchange[];
-  refusals: Exchange[];
-  shapeControlsNeeded: Set<Probe["credential"]>;
-  shapeUnverified?: string;
 }
 
 const precedence: Readonly<Record<RefusalReason, number>> = { unsupported: 0, unsatisfiable: 1, unavailable: 2 };
@@ -56,129 +39,10 @@ export function applied(reply: Observation): string | null {
   return parsed.ok ? parsed.value : null;
 }
 
-interface Shape {
-  contradiction?: string;
-  unseen?: string;
-  missing?: string[];
-  unparsed?: string;
-}
-
-function jsonType(value: unknown): string {
-  return value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
-}
-
-// Intern a flat description of each node using its children's IDs. Unlike
-// recursive shape strings, descriptors don't grow with subtree depth.
-function shapeIndex() {
-  const ids = new Map<string, number>();
-  const nodes = new WeakMap<object, number>();
-  function intern(description: string): number {
-    let id = ids.get(description);
-    if (id === undefined) ids.set(description, id = ids.size);
-    return id;
-  }
-  return function shapeId(value: unknown): number {
-    if (value === null || typeof value !== "object") return intern(jsonType(value));
-    const cached = nodes.get(value);
-    if (cached !== undefined) return cached;
-    const description = Array.isArray(value)
-      ? `a${JSON.stringify([...new Set(value.map(shapeId))].sort((a, b) => a - b))}`
-      : `o${JSON.stringify(Object.keys(value).sort().map((key) => [key, shapeId(Reflect.get(value, key))]))}`;
-    const id = intern(description);
-    nodes.set(value, id);
-    return id;
-  };
-}
-
-// Only called once we know the IDs differ; it locates a difference for SKIP.
-function shapeDifference(value: unknown, sample: unknown, shapeId: (value: unknown) => number, path: string): string {
-  if (jsonType(value) !== jsonType(sample)) return path;
-  if (Array.isArray(value)) return `${path}[]`;
-  if (value !== null && typeof value === "object" && sample !== null && typeof sample === "object") {
-    const fields: [string, unknown][] = Object.entries(value);
-    for (const [key, field] of fields) {
-      const member = `${path}.${key}`;
-      if (!Object.hasOwn(sample, key)) return member;
-      const counterpart: unknown = Reflect.get(sample, key);
-      if (shapeId(field) !== shapeId(counterpart)) return shapeDifference(field, counterpart, shapeId, member);
-    }
-    const extra = Object.keys(sample).find((key) => !Object.hasOwn(value, key));
-    if (extra !== undefined) return `${path}.${extra}`;
-  }
-  return path;
-}
-
-function compareJsonShape(value: unknown, controls: readonly unknown[], path: string): Shape {
-  if (controls.length === 0) return { unseen: path };
-  const type = jsonType(value);
-  const similar = controls.filter((sample) => jsonType(sample) === type);
-  if (similar.length === 0) return { contradiction: `${path} has type ${type}, which no control shows` };
-  let unseen: string | undefined;
-  const missing: string[] = [];
-  if (Array.isArray(value)) {
-    const items: unknown[] = similar.flatMap((sample) => Array.isArray(sample) ? sample : []);
-    for (const item of value) {
-      const result = compareJsonShape(item, items, `${path}[]`);
-      if (result.contradiction !== undefined) return result;
-      if (result.missing !== undefined) missing.push(...result.missing);
-      unseen ??= result.unseen;
-    }
-  } else if (value !== null && typeof value === "object") {
-    const objects = similar.filter((sample) => sample !== null && typeof sample === "object");
-    for (const key of Object.keys(objects[0]!)) {
-      if (!Object.hasOwn(value, key) && objects.every((sample) => Object.hasOwn(sample, key))) {
-        missing.push(`${path}.${key}`);
-      }
-    }
-    const fields: [string, unknown][] = Object.entries(value);
-    for (const [key, field] of fields) {
-      const members: unknown[] = objects.filter((sample) => Object.hasOwn(sample, key)).map((sample) => Reflect.get(sample, key));
-      const result = compareJsonShape(field, members, `${path}.${key}`);
-      if (result.contradiction !== undefined) return result;
-      unseen ??= result.unseen;
-      if (result.missing !== undefined) missing.push(...result.missing);
-    }
-  }
-  return { ...(missing.length === 0 ? {} : { missing }), ...(unseen === undefined ? {} : { unseen }) };
-}
-
-function mediaType(reply: Observation): string | undefined {
-  return reply.contentType?.split(";", 1)[0]?.trim().toLowerCase();
-}
-
-function compareErrorShape(reply: Observation, controls: readonly Observation[], shapeId: (value: unknown) => number): Shape {
-  if (reply.bodyUnavailable !== undefined) return { unparsed: `inspectable refusal body (${reply.bodyUnavailable})` };
-  const media = mediaType(reply);
-  const sameMedia = controls.filter((sample) => mediaType(sample) === media);
-  if (controls.length > 0 && sameMedia.length === 0) {
-    return { contradiction: `media type ${media ?? "(none)"} was not used by any ordinary error control` };
-  }
-  if (media !== "application/json" && !media?.endsWith("+json")) {
-    return { unparsed: `refusal body is ${media ?? "of unspecified media type"}; structure not compared` };
-  }
-  if (reply.body === undefined) return { contradiction: "expected a JSON error body" };
-  const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
-  const refusalId = shapeId(reply.body);
-  if (json.some((sample) => shapeId(sample) === refusalId)) return {};
-  const unreadable = sameMedia.find((sample) => sample.bodyUnavailable !== undefined)?.bodyUnavailable;
-  if (unreadable !== undefined) return { unseen: `inspectable ordinary error control (${unreadable})` };
-  if (json.length === 0) return { unseen: "an ordinary JSON error body under the same credential" };
-  const shape = compareJsonShape(reply.body, json, "$");
-  return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
-    ? shape : { unseen: `one ordinary error control with the same whole refusal shape (difference at ${shapeDifference(reply.body, json[0], shapeId, "$")})` };
-}
-
-function sameCredential(a: Probe, b: Probe): boolean {
-  return a.credential?.header === b.credential?.header && a.credential?.key === b.credential?.key;
-}
-
 export function auditResults(exchanges: readonly Exchange[], contextFor: (probe: Probe) => ResultContext): ResultAudit {
   const audit: ResultAudit = {
-    failures: new Map(), catalogRelays: [], attestedRelays: [], results: [], refusals: [], shapeControlsNeeded: new Set(),
+    failures: new Map(), catalogRelays: [], attestedRelays: [], results: [],
   };
-  const ordinary = exchanges.filter(({ ordinaryControl, reply }) => ordinaryControl && reply.hasBody && noResult(reply));
-  const unverified = exchanges.filter(({ unverifiedOrdinaryControl, reply }) => unverifiedOrdinaryControl && reply.hasBody && noResult(reply));
-  const shapeId = shapeIndex();
   for (const exchange of exchanges) {
     const { probe, reply, missingRefusal } = exchange;
     const fail = (id: AuditId, required: string) => {
@@ -196,7 +60,6 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     if (carriesPolicy === false && (reply.refused.length > 0 || reply.evidence.length > 0)) fail("G26", "no Route-Refused or Route-Evidence without a policy");
 
     if (reply.refused.length > 0) {
-      audit.refusals.push(exchange);
       audit.results.push(exchange);
       const parsed = parseRefused(reply.refused[0]!);
       if (!parsed.ok || reply.status !== REFUSAL_STATUS[parsed.value.reason]) fail("G19", "S15: one valid Route-Refused value with its corresponding HTTP status");
@@ -229,35 +92,6 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
         fail("G3", "unavailable presupposes a qualifying route, but none meets even the known requirements");
         fail("G29", "unavailable must not mask a refusal before routing");
       }
-      const references = ordinary.filter((entry) => entry.probe.path === probe.path && sameCredential(entry.probe, probe));
-      const sampled = () => {
-        const kinds = new Set(references.map(({ ordinaryControl, reply: sample }) =>
-          `${ordinaryControl}, HTTP ${sample.status} ${mediaType(sample) ?? "(no media type)"}`));
-        return `${references.length} sampled ordinary errors${kinds.size === 0 ? "" : ` (${[...kinds].join("; ")})`}`;
-      };
-      if (!reply.hasBody) {
-        fail("G34", `a refusal has a nonempty error body; the refusal was empty (compared with ${sampled()})`);
-        continue;
-      }
-      let shape = compareErrorShape(reply, references.map(({ reply }) => reply), shapeId);
-      if ((shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined) && reply.body !== undefined) {
-        const possible = unverified.find((entry) => entry.probe.path === probe.path && sameCredential(entry.probe, probe)
-          && mediaType(entry.reply) === mediaType(reply) && entry.reply.body !== undefined && shapeId(entry.reply.body) === shapeId(reply.body));
-        if (possible !== undefined) shape = { unseen: `an ordinary error with this refusal shape; ${possible.unverifiedOrdinaryControl}` };
-      }
-      if (shape.contradiction !== undefined) {
-        audit.shapeControlsNeeded.add(probe.credential);
-        fail("G34", `the refusal uses this endpoint's ordinary error format; ${shape.contradiction} (based on ${sampled()})`);
-      }
-      if (shape.unseen !== undefined || shape.missing !== undefined) {
-        audit.shapeControlsNeeded.add(probe.credential);
-        const missing = shape.missing === undefined ? undefined
-          : `requiredness of missing refusal members ${[...new Set(shape.missing)].join(", ")} cannot be established from sampled ordinary errors`;
-        const unseen = shape.unseen?.startsWith("$") ? `an ordinary error control showing refusal member ${shape.unseen}` : shape.unseen;
-        const issue = missing !== undefined && unseen !== undefined ? `${missing}; also need ${unseen}` : missing ?? unseen;
-        if (issue !== undefined) audit.shapeUnverified ??= issue;
-      }
-      if (shape.unparsed !== undefined) audit.shapeUnverified ??= shape.unparsed;
       continue;
     }
 

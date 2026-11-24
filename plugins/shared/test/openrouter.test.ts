@@ -5,8 +5,8 @@ import { combinePolicies, parsePolicy } from "../../../core/src/index.ts";
 import { isOpenRouter, OPENROUTER_BASE, OPENROUTER_PROVIDER_APIS, translateToOpenRouter } from "../src/openrouter.ts";
 import { sameList, table } from "./table.ts";
 
-sameList("C9", "OPENROUTER_PROVIDER_APIS", OPENROUTER_PROVIDER_APIS, ["openai-completions", "openai-responses", "anthropic-messages"]);
-sameList("C9", "OPENROUTER_BASE", OPENROUTER_BASE, "https://openrouter.ai/api/v1");
+sameList("", "OPENROUTER_PROVIDER_APIS", OPENROUTER_PROVIDER_APIS, ["openai-completions", "openai-responses", "anthropic-messages"]);
+sameList("", "OPENROUTER_BASE", OPENROUTER_BASE, "https://openrouter.ai/api/v1");
 
 /** A policy as a row writes it: its text, or a header and a suffix the gateway would combine. */
 function translated(row: string | { header: string; suffix: string }): unknown {
@@ -46,7 +46,7 @@ table("C9", "translateToOpenRouter", translated, [
   ["order=cobalt", { ok: true, provider: { order: ["cobalt"] } }],
 ]);
 
-table("C9", "isOpenRouter", isOpenRouter, [
+table("", "isOpenRouter", isOpenRouter, [
   ["https://openrouter.ai/api/v1", true],
   ["https://openrouter.ai/api/v1/", true],
   ["https://openrouter.ai/api/v1//", true],

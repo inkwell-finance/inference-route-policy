@@ -114,11 +114,15 @@ table("", "interpret", read, [
   [{ applied: ["provider=aurora", "provider=basalt"], sent: "translated" }, { kind: "unconfirmed" }],
 ]);
 
-table("", "describeReport", (report: Report) => describeReport(report), [
+// Honored results, compared or not, with evidence or without: the words never present a fact or evidence as verified.
+table("C7", "describeReport", (report: Report) => describeReport(report), [
   [{ kind: "honored", provider: "aurora", checked: false, evidence: null }, "route policy honored: served by aurora; its published facts were not compared: no model list was held"],
   [{ kind: "honored", provider: "aurora", checked: true, evidence: null }, "route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client)"],
   [{ kind: "honored", provider: "basalt", checked: false, evidence: "https://basalt.example/attestation" }, "route policy honored: served by basalt; its published facts were not compared: no model list was held; evidence at https://basalt.example/attestation, not verified by this client"],
   [{ kind: "honored", provider: "basalt", checked: true, evidence: "https://basalt.example/attestation" }, "route policy honored: served by basalt; its published facts meet the policy (they are the gateway's claims, not verified by this client); evidence at https://basalt.example/attestation, not verified by this client"],
+]);
+
+table("", "describeReport", (report: Report) => describeReport(report), [
   [{ kind: "served", provider: null }, "no route policy sent with this request"],
   [{ kind: "served", provider: "cobalt" }, "no route policy sent with this request; the gateway names cobalt as its route"],
   [{ kind: "refused", reason: "unsatisfiable", key: null }, "route policy refused by the gateway: unsatisfiable"],

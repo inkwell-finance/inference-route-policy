@@ -12,7 +12,7 @@ const entry = (policy: string | null): { type: string; customType: string; data:
 const LIST: readonly Scenario[] = [
   {
     key: "m01",
-    ids: ["C10", "C16"],
+    ids: ["C16"],
     steps: [
       { do: "route", args: "notrain" },
       { do: "request", payload: { model: "other-model", messages: [] } },
@@ -24,7 +24,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "m02",
-    ids: ["C10"],
+    ids: [],
     session: { model: { id: "demo-model+notrain" } },
     steps: [
       { do: "request", payload: { model: "other-model", messages: [] } },
@@ -36,7 +36,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "m03",
-    ids: ["C1"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     timers: true,
     session: { auth: "never" },
@@ -44,7 +44,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "m04",
-    ids: ["C10"],
+    ids: ["C7"],
     steps: [
       { do: "branch", entries: [entry("zdr")] },
       { do: "emit", event: "session_switch" },
@@ -80,7 +80,7 @@ const EXPECTED: Expected = {
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 45 | body \"{\\\"model\\\":\\\"other-model+notrain\\\",\\\"messages\\\":[]}\"",
       "[1] setStatus route-policy \"route policy NOT honored: provider \\\"aurora\\\" is not among the model's published routes (request for other-model+notrain to http://{gw}/v1)\"",
       "[1] notify warning \"route policy NOT honored: provider \\\"aurora\\\" is not among the model's published routes (request for other-model+notrain to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== route args=zdr",
       "[1] appendEntry inference-route-policy {\"policy\":\"zdr\"}",
       "[1] notify info \"Route policy set: zdr\"",
@@ -119,7 +119,7 @@ const EXPECTED: Expected = {
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 45 | body \"{\\\"model\\\":\\\"other-model+notrain\\\",\\\"messages\\\":[]}\"",
       "[1] setStatus route-policy \"route policy NOT honored: provider \\\"aurora\\\" is not among the model's published routes (request for other-model+notrain to http://{gw}/v1)\"",
       "[1] notify warning \"route policy NOT honored: provider \\\"aurora\\\" is not among the model's published routes (request for other-model+notrain to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== request payload={\"model\":\"other-model+zdr\",\"messages\":[]}",
       "[1] getApiKeyAndHeaders \"demo-model+notrain\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
       "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: the request names the model \\\"other-model+zdr\\\" while \\\"demo-model+notrain\\\" is selected; the policy typed into one is not in the other\"",
@@ -165,7 +165,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model+zdr\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 96 | body \"{\\\"model\\\":\\\"demo-model+zdr\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model+zdr to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"zdr\"}},{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"notrain\"}}]",
       "== emit event=session_branch",
       "[1] setStatus route-policy undefined",
@@ -174,7 +174,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model+notrain\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 100 | body \"{\\\"model\\\":\\\"demo-model+notrain\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model+notrain to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"zdr\"}},{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":null}}]",
       "== emit event=session_tree",
       "[1] setStatus route-policy undefined",
@@ -183,7 +183,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"no route policy sent with this request; the gateway names aurora as its route (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"bits=8\"}},{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":7}}]",
       "== emit event=session_start",
       "[1] setStatus route-policy undefined",
@@ -192,7 +192,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model+bits=8\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 99 | body \"{\\\"model\\\":\\\"demo-model+bits=8\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model+bits=8 to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
 };

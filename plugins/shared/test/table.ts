@@ -1,5 +1,6 @@
 // Table tests for pure functions: each row an input literal and the complete expected output literal, the title
-// generated from both, so it says no more than the row pins.
+// generated from both, so it says no more than the row pins. What is compared, and printed, is the output as plain
+// data (`plain` below), and the title says so.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -20,7 +21,7 @@ const literal = (value: unknown): string => (typeof value === "string" ? JSON.st
 /** One test per row: `run(input)`, as plain data, must equal the row's expected value. */
 export function table<I>(ids: string, fn: string, run: (input: I) => unknown, rows: readonly (readonly [I, unknown])[]): void {
   for (const [input, want] of rows) {
-    test(`${ids === "" ? "" : `${ids}: `}${fn}(${literal(input)}) => ${literal(want)}`, async () => {
+    test(`${ids === "" ? "" : `${ids}: `}${fn}(${literal(input)}) as plain data => ${literal(want)}`, async () => {
       assert.deepEqual(plain(await run(input)), want);
     });
   }
@@ -28,7 +29,7 @@ export function table<I>(ids: string, fn: string, run: (input: I) => unknown, ro
 
 /** A source list must be exactly the members a table spans, so removing one fails here, not silently there. */
 export function sameList(ids: string, name: string, actual: unknown, want: unknown): void {
-  test(`${ids === "" ? "" : `${ids}: `}${name} is ${literal(want)}`, () => {
+  test(`${ids === "" ? "" : `${ids}: `}${name} as plain data is ${literal(want)}`, () => {
     assert.deepEqual(plain(actual), want);
   });
 }

@@ -69,8 +69,11 @@ export type Step =
 export interface Scenario {
   /** A short handle, used to find the scenario's expected record. */
   key: string;
-  /** The requirements this scenario is a case of. */
-  ids: readonly string[];
+  /**
+   * The requirements this scenario is a case of: a tag is here only when a source mutation that breaks that
+   * requirement changes this scenario's record. By adapter name where that holds for one adapter only.
+   */
+  ids: readonly string[] | Readonly<Record<string, readonly string[]>>;
   env?: { ROUTE_POLICY?: string };
   /** Loopback origins besides "gw", which always runs. */
   origins?: readonly string[];
@@ -335,8 +338,9 @@ class Session {
       return;
     }
     const text = await response.text();
-    const shown = [...response.headers].filter(([name]) => name !== "connection" && name !== "keep-alive").map(([name, value]) => `${name}: ${value}`);
-    this.#log(`POST ${target} -> ${response.status} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
+    // Every header the caller's Response has, hop-by-hop ones (connection, keep-alive) included, and its status text.
+    const shown = [...response.headers].map(([name, value]) => `${name}: ${value}`);
+    this.#log(`POST ${target} -> ${response.status} ${JSON.stringify(response.statusText)} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
   }
 
   /** One provider request as the harness makes it: hooks, serialization, then the HTTP call. */
@@ -476,6 +480,7 @@ export async function run(scenario: Scenario, adapter: Adapter): Promise<string[
     if (before === undefined) delete process.env["ROUTE_POLICY"];
     else process.env["ROUTE_POLICY"] = before;
   }
+  origins.assertEveryRuleAnswered();
   return out.lines;
 }
 
@@ -484,7 +489,8 @@ export function scenarios(list: readonly Scenario[], adapters: readonly Adapter[
   for (const scenario of list) {
     for (const adapter of adapters) {
       const want = expected[scenario.key]?.[adapter.name];
-      const title = `${scenario.key}${scenario.ids.length === 0 ? "" : ` ${scenario.ids.join(", ")}`}: ${adapter.name}: ${describeScenario(scenario)} => ${want === undefined ? "(no expected record)" : summarize(want)}`;
+      const ids = Array.isArray(scenario.ids) ? scenario.ids : ((scenario.ids as Readonly<Record<string, readonly string[]>>)[adapter.name] ?? []);
+      const title = `${scenario.key}${ids.length === 0 ? "" : ` ${ids.join(", ")}`}: ${adapter.name}: ${describeScenario(scenario)} => ${want === undefined ? "(no expected record)" : summarize(want)}`;
       test(title, async () => {
         const [key, variant, actual] = [scenario.key, adapter.name, await run(scenario, adapter)];
         assert.ok(want !== undefined, `no expected record for ${key} in ${variant}`);

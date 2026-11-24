@@ -10,10 +10,10 @@ import { baselineSupport } from "../../../core/src/index.ts";
 /** The model list the rows name as MODEL_LIST: aurora meets zdr, basalt attests with evidence, cobalt publishes nothing. */
 const MODEL_LIST = { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr+notrain+bits=8+region=us" }, { provider: "basalt", facts: "bits=16+region=us,de+attest=weights,prompt", evidence: "https://basalt.example/attestation" }, { provider: "cobalt", facts: "" }] }, { id: "other-model", routes: [{ provider: "cobalt", facts: "notrain" }] }] };
 
-// The keys, attest values, and sort values the C1 rows below span, one row each: the source lists are these.
-sameList("C1", "baselineSupport().keys", baselineSupport().keys, ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"]);
-sameList("C1", "baselineSupport().attest", baselineSupport().attest, ["weights", "prompt"]);
-sameList("C1", "baselineSupport().sort", baselineSupport().sort, ["price", "latency", "throughput"]);
+// The keys, attest values, and sort values the decide rows below span, one row each: the source lists are these.
+sameList("", "baselineSupport().keys", baselineSupport().keys, ["zdr", "notrain", "bits", "region", "attest", "only", "ignore", "sort", "order"]);
+sameList("", "baselineSupport().attest", baselineSupport().attest, ["weights", "prompt"]);
+sameList("", "baselineSupport().sort", baselineSupport().sort, ["price", "latency", "throughput"]);
 
 interface DecideRow {
   held: string | null;
@@ -153,7 +153,7 @@ interface LayerRow {
 }
 const layered = (row: LayerRow): ReturnType<typeof readLayers> => readLayers(row.held === null ? { kind: "none" } : holdPolicy(row.held, "session"), row.model, row.configured);
 
-table("C10", "readLayers", layered, [
+table("", "readLayers", layered, [
   [{ held: null, model: "demo-model", configured: null }, { ok: true, value: { model: "demo-model", typed: null, configured: null, held: null } }],
   [{ held: "zdr", model: "demo-model+notrain", configured: "bits=8" }, { ok: true, value: { model: "demo-model+notrain", typed: P({ notrain: true }), configured: { text: "bits=8", policy: P({ bits: 8 }) }, held: P({ zdr: true }) } }],
   [{ held: "zdr+zdr", model: "demo-model", configured: null }, { ok: false, reason: "the held policy \"zdr+zdr\" is not valid: repeated key" }],
@@ -175,7 +175,7 @@ table("", "anyPolicy and anyRequirement", (row: LayerRow) => {
   [{ held: null, model: "demo-model+sort=latency", configured: null }, { anyPolicy: true, anyRequirement: false }],
 ]);
 
-table("C10", "carriedPolicy", ([model, header]: [string | null, string | null]) => carriedPolicy(model, header), [
+table("", "carriedPolicy", ([model, header]: [string | null, string | null]) => carriedPolicy(model, header), [
   [[null, null], { ok: true, value: null }],
   [["m+zdr", null], { ok: true, value: P({ zdr: true }) }],
   [[null, "notrain"], { ok: true, value: P({ notrain: true }) }],

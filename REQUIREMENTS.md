@@ -8,7 +8,10 @@ file and the spec disagree, that is a defect in this file.
 Each gateway rule has a kind, which says how it can be checked:
 
 - **BB**: from outside, over HTTP, against any gateway, from what its
-  responses carry. The conformance suite checks these.
+  responses carry. The conformance suite checks these. A rule is BB
+  only when a breach of it can be shown from outside. One that can be
+  seen to hold there but not shown to be broken, such as G34, is WB:
+  which shapes a gateway uses for its own errors is known only to it.
 - **WB**: only with control of the gateway's configuration or of the
   providers behind it, to see what was bound, what reached a provider,
   or what a provider returned. The reference gateway's own tests check
@@ -83,7 +86,7 @@ own-error checks of G25.
 | G31 | No content reaches any provider for a request answered with an own error. | WB | Result |
 | G32 | The published facts are the facts routing uses. | WB | Facts |
 | G33 | A relayed response has the status and the body of the route's response. A refusal never carries a provider's body. | WB | Result |
-| G34 | A refusal's body is an error in the shape the gateway uses for its own errors on that endpoint. | BB | Refusal |
+| G34 | A refusal's body is an error in the shape the gateway uses for its own errors on that endpoint. | WB | Refusal |
 | G35 | A gateway that tries qualifying routes tries them in order: `order` providers first as listed, then the rest by `sort`, or in the gateway's default order without it, with `sort` and `order` taken from the carriers as the Combining table says. If it tries another after one fails, it is the next in that order. | WB | Keys, Result |
 | G36 | A gateway does not bind to a key a policy that fails the order of checks. | WB | Carriers |
 | G37 | The provider `Route-Applied` names is the one whose response is relayed. | WB | Result |

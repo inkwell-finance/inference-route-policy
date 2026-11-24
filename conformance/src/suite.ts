@@ -206,11 +206,7 @@ export function resultContext(probe: Probe, scope: Scope | undefined): ResultCon
   return result;
 }
 
-/**
- * Tests observable witnesses, not every input or internal routing decision.
- * A finite sample of ordinary errors cannot prove which other shapes an
- * endpoint might emit.
- */
+/** Tests observable witnesses, not every input or internal routing decision. */
 export async function runConformance(options: Options): Promise<Report> {
   const base = parseBase(options.base);
   const endpoints = options.endpoints ?? INFERENCE_ENDPOINTS;
@@ -428,10 +424,9 @@ export async function runConformance(options: Options): Promise<Report> {
       if (typeof id === "string" && byModel.has(id)) return byModel.get(id);
       for (const text of byModel.values()) if (text !== undefined) return text;
     }
-    // A headerless error from unmodified input can be a provider relay. Sample
-    // only its body, after corroborating origin with an accepted policy on the
-    // same input, endpoint and credentials.
-    async function establishOwnError(plain: Probe, kind: string, options?: {
+    // A headerless error from unmodified input can be a provider relay.
+    // Corroborate it on the same input, endpoint and credentials.
+    async function establishOwnError(plain: Probe, options?: {
       sample?: Exchange;
       discoverScope?: () => Promise<Scope>;
       corroborate?: (sample: Exchange) => Promise<string | undefined>;
@@ -450,16 +445,12 @@ export async function runConformance(options: Options): Promise<Report> {
       let missing: string;
       if (checked !== undefined && isBareError(checked.reply) && checked.reply.status === control.reply.status) {
         const reason = await options?.corroborate?.(control);
-        if (reason === undefined) {
-          control.ordinaryControl = kind;
-          return { sample: control };
-        }
+        if (reason === undefined) return { sample: control };
         missing = reason;
       } else {
         missing = witness === undefined ? "no accepted policy with a qualifying published route to establish error origin"
           : `accepted-policy control did not establish error origin (no-policy HTTP ${control.reply.status}; ${checked === undefined ? "no response" : `HTTP ${checked.reply.status}`})`;
       }
-      control.unverifiedOrdinaryControl = `${kind}: ${missing}`;
       return { missing };
     }
     async function compareOwn(before: Exchange, probe: Probe): Promise<void> {
@@ -866,7 +857,7 @@ export async function runConformance(options: Options): Promise<Report> {
     await run("G25", "corroborated ordinary errors retained their status and no route headers when challenged with a policy", async () => {
       const missing: string[] = [];
       async function compareIfRejected(plain: Probe, challenged: Probe, kind: string): Promise<Exchange | undefined> {
-        const established = await establishOwnError(plain, kind);
+        const established = await establishOwnError(plain);
         if ("missing" in established) {
           missing.push(`${kind} subcase: ${established.missing}`);
           return undefined;
@@ -887,7 +878,7 @@ export async function runConformance(options: Options): Promise<Report> {
       else {
         const credential: Credential = { key: `route-conformance-invalid-${crypto.randomUUID()}`, header: authHeaderFor(endpoint) };
         const plain = { ...inference(first.id), credential };
-        const established = await establishOwnError(plain, "bad credential", {
+        const established = await establishOwnError(plain, {
           async discoverScope() {
             const current: Scope = { credential, models: [] };
             const detection = await observeControl(metadata("route-policy", current));
@@ -915,7 +906,7 @@ export async function runConformance(options: Options): Promise<Report> {
         const plain = policyInference(throttleModel.id);
         const before = await observeControl(plain);
         if (before !== undefined && before.reply.status === 429 && isBareError(before.reply)) {
-          const established = await establishOwnError(plain, "rate limit", { sample: before });
+          const established = await establishOwnError(plain, { sample: before });
           if ("missing" in established) missing.push(`rate-limit subcase: ${established.missing}`);
           else {
             // Bracket the challenge; a throttle that has cleared proves nothing.
@@ -943,40 +934,7 @@ export async function runConformance(options: Options): Promise<Report> {
       await expect(inference(negative.model.id, "bits=0", negative.text), "invalid header takes precedence over unsatisfiable suffix", (r) => refusal(r, "unsupported", "bits"));
       await expect(inference(negative.model.id, negative.text, "bits=0"), "invalid suffix takes precedence over unsatisfiable header", (r) => refusal(r, "unsupported", "bits"));
     });
-    const contextFor = (probe: Probe) => resultContext(probe, scopeFor(probe));
-    let audit = auditResults(exchanges.slice(firstExchange), contextFor);
-    if (audit.shapeControlsNeeded.size > 0) {
-      const observed = exchanges.slice(firstExchange);
-      for (const credential of audit.shapeControlsNeeded.keys()) {
-        const seen = new Set(observed.filter(({ probe, ordinaryControl, unverifiedOrdinaryControl }) =>
-          (ordinaryControl !== undefined || unverifiedOrdinaryControl !== undefined) && probe.credential === credential).map(({ probe }) => probe.raw));
-        // Change the kind of input error, not the endpoint or credential.
-        const scopedProbe = (raw: string): Probe => ({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) });
-        for (const raw of ["{", '{"model":4}', "{}", "[]", '{"model":null}', "", '{"model":false}', '{"model":{}}']) {
-          if (seen.has(raw)) continue;
-          await establishOwnError(scopedProbe(raw), raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field");
-        }
-        const current = scopeFor(scopedProbe("{}"));
-        const model = current?.models[0];
-        if (current !== undefined && model !== undefined) {
-          // Field validation may be done by a provider rather than the gateway.
-          const field = endpoint === "responses" ? "input" : "messages";
-          const limit = endpoint === "responses" ? "max_output_tokens" : "max_tokens";
-          const body = bodyFor(endpoint, model.id);
-          for (const [kind, edit] of [
-            ["null input field", { [field]: null }],
-            ["wrong input type", { [field]: 4 }],
-            ["negative token limit", { [limit]: -1 }],
-            ["unknown input field", { route_conformance_unknown_field: true }],
-          ] as const) {
-            await establishOwnError(scopedProbe(JSON.stringify({ ...body, ...edit })), kind);
-          }
-          const synthetic = unused(new Set(current.models.map(({ id }) => id)), "route-conformance-shape-");
-          await establishOwnError(on(endpoint, credential)(synthetic), "unknown model");
-        }
-      }
-      audit = auditResults(exchanges.slice(firstExchange), contextFor);
-    }
+    const audit = auditResults(exchanges.slice(firstExchange), (probe) => resultContext(probe, scopeFor(probe)));
     const audited = (id: AuditId, detail: string, observed: readonly Exchange[] = [], missing?: string) => {
       const failure = audit.failures.get(id);
       const existing = checks.find((entry) => entry.id === id && entry.endpoint === endpoint);
@@ -994,8 +952,6 @@ export async function runConformance(options: Options): Promise<Report> {
       audit.attestedRelays.length > 0 ? undefined : "a relay with a known attest requirement and published evidence");
     audited("G19", "observed refusals and policy relays used exclusive single result headers", audit.results,
       audit.results.length > 0 ? undefined : "an observed policy refusal or relay");
-    audited("G34", "each observed refusal matches an ordinary error shape observed on this endpoint and credential", audit.refusals,
-      audit.refusals.length > 0 ? audit.shapeUnverified : "an observed refusal");
   }
 
   return { checks, passed: checks.filter((c) => c.status === "PASS").length, failed: checks.filter((c) => c.status === "FAIL").length, skipped: checks.filter((c) => c.status === "SKIP").length };

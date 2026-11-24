@@ -299,17 +299,28 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.deepEqual(calls, []);
   });
 
-  test(`G34 ${mode}: bits=0 and a numeric model return the same error-envelope shape`, async () => {
-    const { gateway } = setup();
-    const ordinary = await gateway(inference(endpoint, `{"model":7,"stream":${stream}}`));
-    const policy = await assertRefusal(await gateway(call(model, "open", "bits=0")), 400, "reason=unsupported+key=bits");
-    assert.equal(ordinary.status, 400);
-    const body: unknown = await ordinary.json();
-    const type = "invalid_request_error";
-    assert.deepEqual(body, endpoint === "messages" ? { type: "error", error: { type, message: "Expected a string model" } }
-      : { error: { type, message: "Expected a string model" } });
-    assert.deepEqual(policy, endpoint === "messages" ? { type: "error", error: { type, message: "Route policy unsupported" } }
-      : { error: { type, message: "Route policy unsupported" } });
+  for (const [reason, status, policy, key, errorType] of [
+    ["unsupported", 400, "bits=0", "+key=bits", "invalid_request_error"],
+    ["unsatisfiable", 400, "only=missing", "", "invalid_request_error"],
+    ["unavailable", 503, "only=aurora", "", "overloaded_error"],
+  ] as const) test(`G34 ${mode}: a ${reason} refusal uses the malformed-request error shape and media type`, async () => {
+    const { gateway, calls } = setup(() => new Response("upstream failed", { status: 502 }));
+    const malformed = await gateway(inference(endpoint, "{"));
+    const refusal = await gateway(call(model, "open", policy));
+    const error = (type: string, message: string) => endpoint === "messages"
+      ? { type: "error", error: { type, message } } : { error: { type, message } };
+    assert.deepEqual(
+      [
+        [malformed.status, malformed.headers.get("content-type"), malformed.headers.get("route-refused"), await malformed.json()],
+        [refusal.status, refusal.headers.get("content-type"), refusal.headers.get("route-refused"), await refusal.json()],
+        calls.map(({ provider }) => provider),
+      ],
+      [
+        [400, "application/json", null, error("invalid_request_error", "Expected a JSON body")],
+        [status, "application/json", `reason=${reason}${key}`, error(errorType, `Route policy ${reason}`)],
+        reason === "unavailable" ? ["aurora"] : [],
+      ],
+    );
   });
 }
 

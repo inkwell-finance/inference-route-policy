@@ -78,7 +78,7 @@ export interface Reply {
   destroy?: boolean;
 }
 
-/** Which requests a reply is for. The first rule that matches a request answers it. */
+/** Which requests a reply is for. The first rule that matches a request answers it; a rule that answers none fails its scenario. */
 export interface Rule {
   /** The origin; "gw" when omitted. */
   at?: string;
@@ -133,6 +133,8 @@ export class Origins {
   readonly #servers = new Map<string, { server: Server; port: number }>();
   readonly #rules: readonly Rule[];
   readonly #matched = new Map<Rule, number>();
+  /** The configured rules that answered at least one request. */
+  readonly #answered = new Set<Rule>();
   readonly #gates = new Map<string, Gate>();
   readonly #log: Log;
 
@@ -181,6 +183,9 @@ export class Origins {
     const server = createServer((request, response) => {
       void this.#answer(name, request, response);
     });
+    // Its Keep-Alive header reaches every recorded response, so its timeout is set here, not left to the
+    // runtime's default (5 seconds in Node 26, 65 in later versions).
+    server.keepAliveTimeout = 5000;
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const address = server.address();
@@ -188,7 +193,8 @@ export class Origins {
     this.#servers.set(name, { server, port: address.port });
   }
 
-  #reply(name: string, method: string, target: string, request: IncomingMessage): Reply {
+  /** The reply to a request, and the 1-based number of the configured rule that answered it (null for a default reply). */
+  #reply(name: string, method: string, target: string, request: IncomingMessage): { reply: Reply; rule: number | null } {
     const path = target.split("?")[0] ?? "";
     const query = target.includes("?") ? target.slice(target.indexOf("?")) : "";
     const kind = kindOf(method, path);
@@ -202,8 +208,20 @@ export class Origins {
       return true;
     });
     const rule = counted.find((r) => r.nth === undefined || r.nth === this.#matched.get(r));
-    if (rule !== undefined) return rule.reply;
-    return kind === "detection" ? DEFAULT_DETECTION : kind === "models" ? DEFAULT_MODELS : kind === "inference" ? DEFAULT_INFERENCE : NOT_FOUND;
+    if (rule === undefined) return { reply: kind === "detection" ? DEFAULT_DETECTION : kind === "models" ? DEFAULT_MODELS : kind === "inference" ? DEFAULT_INFERENCE : NOT_FOUND, rule: null };
+    this.#answered.add(rule);
+    return { reply: rule.reply, rule: this.#rules.indexOf(rule) + 1 };
+  }
+
+  /** The configured rules that answered no request: a fixture the scenario configured and never exercised. */
+  unanswered(): Rule[] {
+    return this.#rules.filter((rule) => !this.#answered.has(rule));
+  }
+
+  /** Fails, naming them, when a configured rule answered no request: a title prints every rule as an input the run used. */
+  assertEveryRuleAnswered(): void {
+    const dead = this.unanswered().map((rule) => JSON.stringify(rule));
+    assert.deepEqual(dead, [], `configured reply rules that answered no request: ${dead.join("; ")}`);
   }
 
   async #answer(name: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -213,8 +231,9 @@ export class Origins {
     const target = request.url ?? "";
     const lines: string[] = [];
     for (let i = 0; i + 1 < request.rawHeaders.length; i += 2) lines.push(`${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}`);
-    this.#log.push(`${name} <- ${method} ${target} | ${lines.join(" | ")} | body ${JSON.stringify(body)}`);
-    const reply = this.#reply(name, method, target, request);
+    // Chosen before the arrival is written, so the line says which configured rule, if any, answered it.
+    const { reply, rule } = this.#reply(name, method, target, request);
+    this.#log.push(`${name} <- ${method} ${target} | ${lines.join(" | ")} | body ${JSON.stringify(body)}${rule === null ? "" : ` | answered by rule ${rule}`}`);
     if (reply.destroy === true) {
       request.socket.destroy();
       return;
@@ -299,8 +318,9 @@ export function brief(value: unknown, max = 60): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-/** One record line, shortened for a title: arrivals by method and target, UI by channel and text. */
+/** One record line, shortened for a title: arrivals by method and target, UI by channel and text. Step markers ("== ...") echo inputs, not outcomes, so they never reach it. */
 function headline(line: string): string | null {
+  if (line.startsWith("== ")) return null;
   const arrival = /^(\w+) <- (\S+) (\S*) \|/.exec(line);
   if (arrival !== null) {
     const policy = /\| route-policy: ([^|]*?) \|/i.exec(line)?.[1];
@@ -318,6 +338,14 @@ function headline(line: string): string | null {
   if (blocked !== null) return `[${blocked[1]}] payload blocked: ${brief(blocked[2] ?? "", 70)}`;
   if (/^\[\d\] handler error/.test(line)) return brief(line, 60);
   if (/^fetch failed/.test(line)) return brief(line, 60);
+  if (/^fetch\.preconnect |^preconnect returned /.test(line)) return brief(line, 90);
+  // The gate tests' own lines: a fetch that threw, the response a fetch got, and what an owner was told.
+  const threw = /^([A-Z]+) \S+ threw (.*)$/.exec(line);
+  if (threw !== null) return `${threw[1]} threw ${brief(threw[2] ?? "", 80)}`;
+  const got = /^([A-Z]+) \S+ -> (\d+ [^|]*?) \|/.exec(line);
+  if (got !== null) return `${got[1]} response ${got[2]}`;
+  const told = /^(\S+ told \S+ (?:stopped|complete)): (.*)$/.exec(line);
+  if (told !== null) return `${told[1]} ${brief(told[2] ?? "", 70)}`;
   const reported = /^report (.*)$/.exec(line);
   if (reported !== null) return `report ${brief(reported[1] ?? "", 70)}`;
   const outcome = /^(?:\S+ )?(decide|describe|check|stopped|complete|isCurrent|interpret)\b(.*)$/.exec(line);
@@ -328,7 +356,7 @@ function headline(line: string): string | null {
 /** What a record pins, shortened: the title's right-hand side. */
 export function summarize(lines: readonly string[], max = 420): string {
   const parts = lines.map(headline).filter((part) => part !== null);
-  const text = parts.length === 0 ? "(nothing observable but the steps)" : parts.join("; ");
+  const text = parts.length === 0 ? "(no summarized events)" : parts.join("; ");
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 

@@ -13,7 +13,7 @@ const entry = (policy: string | null): { type: string; customType: string; data:
 const LIST: readonly Scenario[] = [
   {
     key: "n01",
-    ids: ["C10"],
+    ids: ["C7"],
     env: { ROUTE_POLICY: "zdr" },
     steps: [
       { do: "set", model: { headers: { "ROUTE-POLICY": "bits=8" } } },
@@ -24,7 +24,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n02",
-    ids: ["C1"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     steps: [
       { do: "payload" },
@@ -38,7 +38,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n03",
-    ids: ["C1", "C14"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     steps: [
       { do: "headers" },
@@ -55,14 +55,14 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n04",
-    ids: ["C1"],
+    ids: ["C7"],
     env: { ROUTE_POLICY: "zdr" },
     session: { auth: [{ throws: "keychain locked" }, { result: { ok: true, apiKey: "demo-key" } }] },
     steps: [{ do: "request" }, { do: "request" }],
   },
   {
     key: "n05",
-    ids: ["C1"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     timers: true,
     steps: [
@@ -77,7 +77,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n06",
-    ids: ["C1"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     steps: [
       { do: "request", payload: { model: "other-model", messages: [] } },
@@ -88,7 +88,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n07",
-    ids: ["C14"],
+    ids: ["C7", "C14"],
     env: { ROUTE_POLICY: "zdr" },
     rules: [{ on: "inference", nth: 1, reply: NOT_HONORED }],
     steps: [
@@ -102,7 +102,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n08",
-    ids: ["C10"],
+    ids: ["C7"],
     steps: [
       { do: "branch", entries: [entry("zdr"), entry("notrain")] },
       { do: "emit", event: "session_tree" },
@@ -121,7 +121,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "n10",
-    ids: ["C1"],
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     steps: [{ do: "headers", headers: "none" }, { do: "payload" }],
   },
@@ -144,7 +144,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr+bits=8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== set model={\"headers\":{\"Route-Policy\":\"bits=8\",\"route-policy\":\"notrain\"}}",
       "== request",
       "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
@@ -153,7 +153,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr+notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
   n02: {
@@ -231,7 +231,7 @@ const EXPECTED: Expected = {
       "== post body=b",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"no route policy sent with this request; the gateway names aurora as its route (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
   n04: {
@@ -255,7 +255,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
   n05: {
@@ -328,10 +328,10 @@ const EXPECTED: Expected = {
       "[1] before_provider_headers -> {\"Route-Policy\":\"zdr\"}",
       "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
-      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
+      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\" | answered by rule 1",
       "[1] setStatus route-policy \"route policy NOT honored: no Route-Applied (request for demo-model to http://{gw}/v1)\"",
       "[1] notify warning \"route policy NOT honored: no Route-Applied (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | body \"{\\\"choices\\\":[]}\"",
       "== headers as=fresh",
       "[1] getApiKeyAndHeaders \"demo-model\" -> {\"ok\":true,\"apiKey\":\"demo-key\"}",
       "gw <- GET /v1/route-policy | host: {gw} | connection: keep-alive | authorization: Bearer demo-key | accept: application/json | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | body \"\"",
@@ -347,7 +347,7 @@ const EXPECTED: Expected = {
       "== post headers=fresh body=b",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: zdr | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
   n08: {
@@ -368,7 +368,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
       "== branch entries=[{\"type\":\"custom\",\"customType\":\"inference-route-policy\",\"data\":{\"policy\":\"zdr\"}}]",
       "== emit event=session_switch",
       "== request",
@@ -378,7 +378,7 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | Route-Policy: notrain | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 92 | body \"{\\\"model\\\":\\\"demo-model\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
       "[1] setStatus route-policy \"route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client) (request for demo-model to http://{gw}/v1)\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 | content-length: 14 | content-type: application/json | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
     ],
   },
   n09: {
