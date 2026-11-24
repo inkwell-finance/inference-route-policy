@@ -344,25 +344,83 @@ reportTest("G20: discovery uses GET when HEAD returns 405 and OPTIONS returns 20
   expectReport(report, expected);
 });
 
-reportTest("G23: HTTP 204 from /models skips catalog validation", {
-  "G23": skip("an inspectable model list; /models returned HTTP 204 No Content"),
-  "G1 [chat/completions]": "SKIP", "G2 [chat/completions]": "SKIP", "G3 [chat/completions]": "SKIP",
-  "G6 [chat/completions]": "SKIP", "G7 [chat/completions]": "SKIP", "G8 [chat/completions]": "SKIP",
-  "G9 [chat/completions]": "SKIP", "G10 [chat/completions]": "SKIP", "G11 [chat/completions]": "SKIP",
-  "G12 [chat/completions]": "SKIP", "G13 [chat/completions]": "SKIP", "G15 [chat/completions]": "SKIP",
-  "G17 [chat/completions]": "SKIP", "G21 [chat/completions]": "SKIP", "G24 [chat/completions]": "SKIP",
-  "G25 [chat/completions]": "SKIP", "G26 [chat/completions]": "SKIP", "G29 [chat/completions]": "SKIP",
-  "G19 [chat/completions]": "SKIP",
+const missingCatalog = skip("a valid /models catalog in this endpoint's credential scopes");
+const withoutCatalog = {
+  "G1 [chat/completions]": missingCatalog, "G2 [chat/completions]": missingCatalog, "G3 [chat/completions]": missingCatalog,
+  "G6 [chat/completions]": missingCatalog, "G7 [chat/completions]": missingCatalog, "G8 [chat/completions]": missingCatalog,
+  "G9 [chat/completions]": missingCatalog, "G10 [chat/completions]": missingCatalog, "G11 [chat/completions]": missingCatalog,
+  "G12 [chat/completions]": missingCatalog, "G13 [chat/completions]": missingCatalog, "G15 [chat/completions]": missingCatalog,
+  "G17 [chat/completions]": missingCatalog, "G19 [chat/completions]": missingCatalog, "G21 [chat/completions]": missingCatalog,
+  "G24 [chat/completions]": missingCatalog, "G25 [chat/completions]": missingCatalog, "G26 [chat/completions]": missingCatalog,
+  "G29 [chat/completions]": missingCatalog,
+};
+
+for (const [status, body, contentType] of [
+  [204, null, null],
+  [205, null, null],
+  [200, null, null],
+  [200, "not JSON", "text/plain"],
+  [206, '{"data":{}}', "application/json"],
+] as const) reportTest(`G23: /models HTTP ${status} with ${body === null ? "no body" : JSON.stringify(body)}`, {
+  ...withoutCatalog,
+  G23: failure(get("/models"), received(status, body ?? "", [], [], [], contentType), "models response must be an object with a data array"),
 }, async (t, expected) => {
-  let catalogs = 0;
-  const report = await run(t, fixture(({ path, next }) => {
-    if (path !== "/v1/models") return next();
-    catalogs++;
-    return new Response(null, { status: 204 });
+  const observed: string[] = [];
+  const report = await run(t, fixture(({ request, path, auth, next }) => {
+    if (path === "/v1/models") {
+      observed.push(`${request.method} ${auth}`);
+      return new Response(body, { status, ...(contentType === null ? {} : { headers: { "content-type": contentType } }) });
+    }
+    if (request.method === "POST") observed.push(`POST ${path}`);
+    return next();
   }));
-  assert.equal(catalogs, 2);
+  assert.deepEqual(observed, [`GET Bearer ${key}`, `GET Bearer ${policyKey}`]);
   expectReport(report, expected);
 });
+
+for (const status of [200, 203]) reportTest(`G23: /models HTTP ${status} with a valid empty data array`, {
+  ...expectedByCase.capabilities["/models returns an empty data array"],
+  G23: ["PASS", `validated model and route entries in all 2 requested catalog scopes; observed 2 × HTTP ${status}`],
+}, async (t, expected) => {
+  const report = await run(t, fixture(({ path, next }) => path === "/v1/models"
+    ? Response.json({ data: [] }, { status }) : next()));
+  expectReport(report, expected);
+});
+
+reportTest("G23: /models HTTP 302 redirect leaves the catalog unavailable", {
+  ...withoutCatalog,
+  G23: skip("an accessible /models response for each supplied credential"),
+}, async (t, expected) => {
+  let redirects = 0;
+  const report = await run(t, fixture(({ path, next }) => {
+    if (path !== "/v1/models") return next();
+    redirects++;
+    return new Response(null, { status: 302, headers: { location: "/somewhere-else" } });
+  }));
+  assert.equal(redirects, 2);
+  expectReport(report, expected);
+});
+
+for (const [path, rule, overrides, required] of [
+  ["/route-policy", "G20", {
+    ...expectedByCase.coding["route-policy"],
+    G22: skip("an inspectable detection object under each supplied credential and anonymously"),
+  }, "a complete valid detection reply"],
+  ["/models", "G23", withoutCatalog, "a valid model list"],
+] as const) for (const coding of ["gzip", "deflate", "br", "zstd"]) {
+  const invalidEncoding = `could not decode Content-Encoding ${coding}`;
+  reportTest(`${rule}: HTTP 200 ${path} with corrupt ${coding}`, {
+    ...overrides,
+    [rule]: failure(get(path, rule === "G20" ? null : "authorization"), {
+      status: 200, contentType: "application/json", applied: [], refused: [], evidence: [], invalidEncoding,
+    }, `${required}: ${invalidEncoding}`),
+  }, async (t, expected) => {
+    const report = await run(t, fixture(({ path: requested, next }) => requested === `/v1${path}`
+      ? new Response("not valid data", { headers: { "content-type": "application/json", "content-encoding": coding } })
+      : next()));
+    expectReport(report, expected);
+  });
+}
 
 const contentCodings = [
   ["gzip", gzipSync],

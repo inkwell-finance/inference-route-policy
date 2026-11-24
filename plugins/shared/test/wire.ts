@@ -63,6 +63,53 @@ globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init
   // A member of its own, as a runtime's fetch may have (Bun's preconnect): a gate on top must keep it.
 }, realFetch, { preconnect: (url: string): void => log(`fetch.preconnect ${url}`) });
 
+// ---- How a caller passes a request to fetch.
+
+/**
+ * The ways a caller can hand `fetch` one request: "init" a URL string and init; "url" a URL object and init;
+ * "request" a `Request` built from them and no init; and a `Request` built from them with a second argument that
+ * keeps its body ("request+headers" its headers again, "request+null" body null, "request+undefined" body
+ * undefined, "request+PUT", "+PATCH", "+DELETE" another method) or replaces it ("request+string": the `Request`
+ * is built with other text, and init's body is the request's own).
+ */
+export const SHAPES = ["init", "url", "request", "request+headers", "request+null", "request+undefined", "request+PUT", "request+PATCH", "request+DELETE", "request+string"] as const;
+export type Shape = (typeof SHAPES)[number];
+
+/** The two arguments a caller of the given shape passes to `fetch` for the request `url` and `init` describe. */
+export function callArgs(shape: Shape, url: string, init: RequestInit): [Parameters<typeof fetch>[0], RequestInit | undefined] {
+  switch (shape) {
+    case "init":
+      return [url, init];
+    case "url":
+      return [new URL(url), init];
+    case "request":
+      return [new Request(url, init), undefined];
+    case "request+headers":
+      return [new Request(url, init), { headers: init.headers ?? {} }];
+    case "request+null":
+      return [new Request(url, init), { body: null }];
+    case "request+undefined":
+      // JavaScript callers pass this; the strict compiler option for optional members does not admit it as written.
+      return [new Request(url, init), { body: undefined } as unknown as RequestInit];
+    case "request+PUT":
+    case "request+PATCH":
+    case "request+DELETE":
+      return [new Request(url, init), { method: shape.slice("request+".length) }];
+    case "request+string":
+      return [new Request(url, { ...init, body: "a request body the init replaces" }), { body: init.body ?? null }];
+  }
+}
+
+/**
+ * Forgets every release in the process's fetch gate, revoked ones included, as their expiry would. The gate keeps a
+ * revoked release for 30 seconds of a process that runs many scenarios; each scenario ends with this, so the next
+ * starts with nothing held. The table is the one every copy of the plugin shares, under its global symbol.
+ */
+export function forgetReleases(): void {
+  const registry: unknown = Reflect.get(globalThis, Symbol.for("inference-route-policy.fetch-gate"));
+  if (typeof registry === "object" && registry !== null && "releases" in registry && Array.isArray(registry.releases)) registry.releases.length = 0;
+}
+
 // ---- Loopback origins.
 
 export interface Reply {
@@ -330,10 +377,10 @@ function headline(line: string): string | null {
   }
   const ui = /^\[(\d)\] (notify|setStatus) (?:\S+ )?(.*?)( \(threw\))?$/.exec(line);
   if (ui !== null) return `[${ui[1]}] ${ui[2]}${ui[4] === undefined ? "" : " (threw)"} ${brief(ui[3] ?? "", 70)}`;
-  const response = /^\[(\d)\] POST (\S+) -> (\d+)/.exec(line);
+  const response = /^\[(\d)\] POST (\S+)(?: \[\S+\])? -> (\d+)/.exec(line);
   if (response !== null) return `[${response[1]}] response ${response[3]}`;
-  const stopped = /^\[(\d)\] POST \S+ stopped: Blocked by the route policy plugin, nothing was sent: (.*)$/.exec(line);
-  if (stopped !== null) return `[${stopped[1]}] POST stopped: ${brief(stopped[2] ?? "", 70)}`;
+  const stopped = /^\[(\d)\] POST \S+( \[\S+\])? stopped: Blocked by the route policy plugin, nothing was sent: (.*)$/.exec(line);
+  if (stopped !== null) return `[${stopped[1]}] POST${stopped[2] ?? ""} stopped: ${brief(stopped[3] ?? "", 70)}`;
   const blocked = /^\[(\d)\] before_provider_request -> throws Error: Blocked by the route policy plugin, nothing was sent: (.*)$/.exec(line);
   if (blocked !== null) return `[${blocked[1]}] payload blocked: ${brief(blocked[2] ?? "", 70)}`;
   if (/^\[\d\] handler error/.test(line)) return brief(line, 60);

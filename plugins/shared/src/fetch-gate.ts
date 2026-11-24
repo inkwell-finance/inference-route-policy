@@ -4,21 +4,24 @@
  * Both harnesses send provider requests through the process's `fetch`, which this wraps once per process. One
  * release table serves every plugin session in the process. A session releases a request by its exact bytes:
  * base URL and query, context (every header but those known not to identify the caller), `Route-Policy`
- * header, and serialized body. Every POST, and every request of any other method that sends a body, is checked;
- * a request that matches exactly one session's release goes, once: the release is used up, so a harness's resend
- * of the same request is not released again. It goes with redirects off, so a gateway cannot move the body
- * elsewhere, and the response to that very call goes back to the session that released it. A checked request no
- * release matches fails before a byte is written when a session watching its base URL says a policy is at stake,
- * or, where no session says so, when it carries an outstanding release's body (the same bytes, or the same JSON
+ * header, and serialized body. Every POST, and every request of any other method that sends a body (its own, or a
+ * `Request` input's that `fetch` would send), is checked; a request the gate cannot read is not sent at all. A
+ * request that matches exactly one session's release goes, once, while what its decision relied on holds: the
+ * release is used up, so a harness's resend of the same request is not released again. A release withdrawn (its
+ * session ended) or gone stale is revoked: it is never sent, and until it expires its body is still recognized.
+ * A released request goes with redirects off, so a gateway cannot move the body elsewhere, and the response to
+ * that very call goes back to the session that released it. A checked request no usable release matches fails
+ * before a byte is written when a session watching its base URL says a policy is at stake, or, where no session
+ * says so, when it carries the body of a release still held, live or revoked (the same bytes, or the same JSON
  * written differently: a release is sent only as and where it was released for), when its body cannot be read as
- * text while any release is outstanding (it cannot be compared with them), or when it carries a `Route-Policy`
- * header no session checked for that place. Anything else goes untouched.
+ * text while any release is held (it cannot be compared with them), or when it carries a policy no session
+ * checked for that place, in a `Route-Policy` header or a model suffix. Anything else goes untouched.
  *
  * Why here: the harness hooks decide on what the harness tells them, which is not always what goes on the wire,
  * and both harnesses skip their response hook for a non-2xx response, which is how a refusal arrives.
  */
 
-import { completionOf, contextKey, outgoingOf, type Completion, type Outgoing } from "./request.ts";
+import { completionOf, contextKey, modelIn, outgoingOf, type Completion, type Outgoing } from "./request.ts";
 
 /** A request a session let go, as it must leave, and what to do with it. */
 export interface Release {
@@ -46,15 +49,23 @@ export interface Watcher {
 const REGISTRY = Symbol.for("inference-route-policy.fetch-gate");
 
 /**
- * How long an unused release waits for its request. A harness sends right after the payload hook returns; one
- * that has not sent by then will not, and an old release would only make a later identical one ambiguous.
+ * How long a release is kept. A harness sends right after the payload hook returns; one that has not sent by then
+ * will not, and an old release would only make a later identical one ambiguous. A release withdrawn or gone stale
+ * is kept, revoked, for the same time, so its content is still recognized wherever else it is sent; past this it
+ * is forgotten, which keeps the table, and the bodies it holds, bounded by what one process sends in this time.
  */
 const RELEASE_TTL_MS = 30_000;
 
-/** A release while it waits. Used or withdrawn, it lets go of the release, and with it the body. */
+/**
+ * A release from when it is added until it is used once or expires. Withdrawn (its session ended, or its client
+ * let go of it) or gone stale, it is revoked, not forgotten: it can no longer be spent, but its body is still
+ * recognized. Settled, it has stopped the one request it was released for, and matches no other.
+ */
 interface Entry {
   release: Release | null;
   expires: number;
+  revoked: boolean;
+  settled: boolean;
   /** The release's body as canonical JSON, once computed; null when it is not JSON. */
   json?: string | null;
 }
@@ -99,13 +110,7 @@ function canonicalJson(text: string): string | null {
   }
 }
 
-/** Whether a fetch call sends a body: `init`'s when it names one, else a `Request` input's own. */
-function sendsBody(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): boolean {
-  const body = init !== undefined && "body" in init ? init.body : input instanceof Request ? input.body : null;
-  return body !== undefined && body !== null;
-}
-
-/** Takes an entry out of the table and lets go of its release. */
+/** Takes an entry out of the table and lets go of its release: when it is used, or when it expires. */
 function drop(registry: Registry, entry: Entry): void {
   entry.release = null;
   const index = registry.releases.indexOf(entry);
@@ -127,23 +132,31 @@ function plan(registry: Registry, outgoing: Outgoing): Plan {
   try {
     const now = Date.now();
     for (const entry of registry.releases.filter((e) => e.expires <= now)) drop(registry, entry);
-    const found = registry.releases.filter((entry) => entry.release !== null && matches(entry.release, outgoing));
-    const candidates = found.flatMap((entry) => (entry.release === null ? [] : [entry.release]));
+    // The oldest release this request is still one of, as before revocation: a stale one stops it, and a later
+    // identical release is then the next one's. A withdrawn one counts only when no other is left.
+    const found = registry.releases.filter((entry) => entry.release !== null && !entry.settled && matches(entry.release, outgoing));
+    const active = found.filter((entry) => !entry.revoked);
+    const candidates = active.flatMap((entry) => (entry.release === null ? [] : [entry.release]));
     const owners = new Set(candidates.map((release) => release.owner));
     if (owners.size > 1) {
       for (const release of candidates) tell(() => release.stopped("two sessions released this same request, so whose it is cannot be told"));
       return { kind: "stop", reason: "two sessions released this same request, so whose it is cannot be told" };
     }
-    const [release] = candidates;
-    const [entry] = found;
-    if (release !== undefined && entry !== undefined) {
-      drop(registry, entry);
-      if (!release.current()) {
-        const reason = "the detection reply this request was checked against was discarded before it left; send it again";
-        tell(() => release.stopped(reason));
-        return { kind: "stop", reason };
+    const [entry] = active.length > 0 ? active : found;
+    const release = entry?.release;
+    if (entry !== undefined && release !== null && release !== undefined) {
+      if (!entry.revoked && release.current()) {
+        drop(registry, entry);
+        return { kind: "send", release };
       }
-      return { kind: "send", release };
+      // Withdrawn, or stale (which revokes it): this request is stopped, and the release is kept until it expires.
+      const reason = entry.revoked
+        ? "this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent"
+        : "the detection reply this request was checked against was discarded before it left; send it again";
+      entry.revoked = true;
+      entry.settled = true;
+      tell(() => release.stopped(reason));
+      return { kind: "stop", reason };
     }
     let stop: string | null = null;
     for (const watcher of registry.watchers) {
@@ -153,40 +166,49 @@ function plan(registry: Registry, outgoing: Outgoing): Plan {
       tell(() => watcher.stopped(reason));
     }
     if (stop !== null) return { kind: "stop", reason: stop };
-    // No session claims this request. It still fails closed when it is a release being spent somewhere other than
-    // its own place, or as other bytes; when its body cannot be compared with a release that is outstanding; or
-    // when it carries a policy that no session checked for where it goes.
+    // No session claims this request. It still fails closed when it carries the body of a release still held, live,
+    // stale, or revoked (the same bytes, or the same JSON written differently), anywhere but where that release is
+    // spent; when its body cannot be compared with a release still held; or when it carries a policy, on either
+    // carrier, that no session checked for where it goes.
     const where = `${outgoing.path}${outgoing.query}`;
-    const live = registry.releases.filter((e) => e.release !== null && e.release.current());
-    const told = new Set<object>();
-    const stopAll = (entries: readonly Entry[], reason: string): Plan => {
-      for (const { release } of entries) {
-        if (release === null || told.has(release.owner)) continue;
-        told.add(release.owner);
-        tell(() => release.stopped(reason));
+    const held = registry.releases.filter((e) => e.release !== null);
+    // With nothing held there is nothing to compare a body with, so none is compared, parsed, or rewritten.
+    if (held.length > 0) {
+      const told = new Set<object>();
+      const stopAll = (entries: readonly Entry[], reason: string): Plan => {
+        for (const { release } of entries) {
+          if (release === null || told.has(release.owner)) continue;
+          told.add(release.owner);
+          tell(() => release.stopped(reason));
+        }
+        return { kind: "stop", reason };
+      };
+      const spent = held.filter((e) => e.release?.body === outgoing.body);
+      const [elsewhere] = spent;
+      if (elsewhere?.release) return stopAll(spent, `this request to ${where} is one released for ${elsewhere.release.base}${elsewhere.release.query}, and a release is sent only where it was released for`);
+      // The same JSON in other bytes, compared by canonical text, computed once per release.
+      const json = outgoing.body === null ? null : canonicalJson(outgoing.body);
+      const rewritten =
+        json === null
+          ? []
+          : held.filter((e) => {
+              if (e.json === undefined) e.json = e.release === null ? null : canonicalJson(e.release.body);
+              return e.json === json;
+            });
+      const [same] = rewritten;
+      if (same?.release) {
+        return stopAll(rewritten, `this request to ${where} carries, written differently, the JSON body of one released for ${same.release.base}${same.release.query}, and a release is sent only as it was released, where it was released for`);
       }
-      return { kind: "stop", reason };
-    };
-    const spent = live.filter((e) => e.release?.body === outgoing.body);
-    const [elsewhere] = spent;
-    if (elsewhere?.release) return stopAll(spent, `this request to ${where} is one released for ${elsewhere.release.base}${elsewhere.release.query}, and a release is sent only where it was released for`);
-    // The same JSON in other bytes, compared by canonical text, computed once per release.
-    const json = outgoing.body === null ? null : canonicalJson(outgoing.body);
-    const rewritten =
-      json === null
-        ? []
-        : live.filter((e) => {
-            if (e.json === undefined) e.json = e.release === null ? null : canonicalJson(e.release.body);
-            return e.json === json;
-          });
-    const [same] = rewritten;
-    if (same?.release) {
-      return stopAll(rewritten, `this request to ${where} carries, written differently, the JSON body of one released for ${same.release.base}${same.release.query}, and a release is sent only as it was released, where it was released for`);
-    }
-    if (outgoing.body === null && live.length > 0) {
-      return { kind: "stop", reason: `this request to ${where} has a body that cannot be read as text, so it cannot be compared with the requests released and not yet sent` };
+      if (outgoing.body === null) {
+        return { kind: "stop", reason: `this request to ${where} has a body that cannot be read as text, so it cannot be compared with the requests released and not yet expired` };
+      }
     }
     if (outgoing.header !== null) return { kind: "stop", reason: `this request to ${where} carries a Route-Policy header, and no session checked ${where} for it` };
+    // The other carrier: a model suffix. Only a body with a "+" in it, written or escaped, can have one, so only such
+    // a body is parsed.
+    if (outgoing.body !== null && /\+|\\u002b/i.test(outgoing.body) && (modelIn(outgoing.body) ?? "").includes("+")) {
+      return { kind: "stop", reason: `this request to ${where} carries a policy in its model suffix, and no session checked ${where} for it` };
+    }
     return { kind: "pass" };
   } catch (error) {
     return { kind: "stop", reason: `the plugin failed while checking the request: ${error instanceof Error ? error.message : "unknown error"}` };
@@ -203,13 +225,12 @@ function install(): Registry {
     let outgoing: Outgoing;
     try {
       outgoing = outgoingOf(input, init);
-    } catch {
-      // Headers `fetch` itself cannot read make `fetch` fail, before anything is sent.
-      return original(input, init);
+    } catch (error) {
+      // A URL or headers `fetch` cannot send either: nothing can be checked, so nothing is sent.
+      throw new Error(`Blocked by the route policy plugin, nothing was sent: the request could not be read (${error instanceof Error ? error.message : "unknown error"})`);
     }
-    // A request that sends no body, other than a POST, carries no content to release; everything else is checked,
-    // whether or not any session has released or watches anything yet.
-    if (outgoing.method !== "POST" && !sendsBody(input, init)) return original(input, init);
+    // The one request the gate does not check: not a POST, and no body (`outgoingOf` decides that, as `fetch` does).
+    if (outgoing.method !== "POST" && outgoing.body === "") return original(input, init);
     const next = plan(registry, outgoing);
     if (next.kind === "stop") throw new Error(`Blocked by the route policy plugin, nothing was sent: ${next.reason}`);
     if (next.kind === "pass") return original(input, init);
@@ -223,12 +244,14 @@ function install(): Registry {
   return registry;
 }
 
-/** Adds a release to the process's table. Returns the function that withdraws it, if it is still unused. */
+/** Adds a release to the process's table. Returns the function that withdraws it: revoked, if it is still unused. */
 export function addRelease(release: Release): () => void {
   const registry = install();
-  const entry: Entry = { release, expires: Date.now() + RELEASE_TTL_MS };
+  const entry: Entry = { release, expires: Date.now() + RELEASE_TTL_MS, revoked: false, settled: false };
   registry.releases.push(entry);
-  return () => drop(registry, entry);
+  return () => {
+    entry.revoked = true;
+  };
 }
 
 /** Puts a session's watcher in front of every `fetch`. Returns the function that removes it. */
@@ -238,8 +261,8 @@ export function addWatcher(watcher: Watcher): () => void {
   return () => registry.watchers.delete(watcher);
 }
 
-/** Withdraws every unused release of a session, as when it ends. */
+/** Revokes every unused release of a session, as when it ends: none can be spent, each is still recognized. */
 export function withdrawReleases(owner: object): void {
   const registry = install();
-  for (const entry of registry.releases.filter((e) => e.release?.owner === owner)) drop(registry, entry);
+  for (const entry of registry.releases.filter((e) => e.release?.owner === owner)) entry.revoked = true;
 }

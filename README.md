@@ -213,20 +213,26 @@ result, `/route <policy>` sets it, and `/route clear` removes it.
 - A request is decided in the harness's `before_provider_request` hook
   and checked again where it leaves, in the process's `fetch`. Every
   POST, and every request of another method that has a body, is
-  checked. To a base URL the plugin has decided for, it goes out only
-  if its URL, headers, `Route-Policy` header, and body are exactly
-  those of a request the plugin released, once, and without following
-  redirects.
-- Sent anywhere else, a request is stopped when it carries a
-  `Route-Policy` header, when its body is that of a released request
-  not yet used (the same bytes, or the same JSON written differently),
-  or when its body cannot be read as text while a released request is
-  outstanding. Content changed in any other way, such as by
-  compression or by being placed inside a larger body, is not
-  recognized there.
-- A harness feature that sends other content to some other base URL
-  without the hook is not covered, and neither is a transport that does
-  not use the process's `fetch`.
+  checked; a body that a `Request` object brings with it counts. A
+  request whose URL or headers cannot be read is not sent.
+- To a base URL the plugin has decided for, a request goes out only if
+  its URL, headers, `Route-Policy` header, and body are exactly those
+  of a request the plugin released, once, without following redirects,
+  and while the detection reply it relied on still stands.
+- A released request whose session ended, or whose detection reply
+  was discarded, is revoked: it is not sent. For 30 seconds after it
+  was released, its body is stopped wherever it is sent, as the same
+  bytes or the same JSON written differently, and so is any body that
+  cannot be read as text when it goes to a base URL the plugin has not
+  decided for.
+- A `Route-Policy` header, or a policy in a model name, that the
+  plugin did not check for the base URL it is going to is stopped.
+- Not covered: a request that does not go through the process's
+  `fetch`; a harness feature that sends other content to some other
+  base URL without the hook; released content changed in any other way
+  on its way to another base URL, such as compressed or placed inside
+  a larger body; and, once 30 seconds have passed, a body that cannot
+  be read as text.
 - A release is used once. A harness's automatic retry of the same
   request is stopped, so a retryable error ends the turn and the user
   sends again.

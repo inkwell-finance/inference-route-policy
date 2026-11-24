@@ -6,8 +6,10 @@
 
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
+import { addWatcher } from "../src/fetch-gate.ts";
 import type { ExtensionAPI } from "../src/plugin.ts";
-import { brief, deadline, Log, log, Origins, recording, settle, summarize, type Expected, type Rule } from "./wire.ts";
+import type { Outgoing } from "../src/request.ts";
+import { brief, callArgs, deadline, forgetReleases, Log, log, Origins, recording, settle, summarize, type Expected, type Rule, type Shape } from "./wire.ts";
 
 export interface Adapter {
   name: string;
@@ -42,6 +44,8 @@ export interface Wire {
   url?: string;
   /** Changes made last, as a transport the plugin cannot see into might. */
   rewrite?: readonly (readonly ["set" | "append", string, string] | readonly ["delete", string])[];
+  /** How the transport passes the request to fetch (see `callArgs`); a URL string and init by default. */
+  shape?: Shape;
 }
 
 /** A payload: a plain object; with `$toJSON`, one whose own toJSON returns that value; or one whose accessor throws. */
@@ -82,6 +86,13 @@ export interface Scenario {
   session?: SessionConfig;
   /** Mock setTimeout for the whole scenario, so `tick` steps move the plugin's deadlines. */
   timers?: boolean;
+  /** Mock Date for the whole scenario, so `tick` steps age the fetch gate's releases. */
+  clock?: boolean;
+  /**
+   * Log what the fetch gate reads of every request it checks against its watchers, through one more watcher that
+   * stops nothing: with the origin's arrivals, the record shows what was inspected next to what was sent.
+   */
+  inspect?: boolean;
   steps: readonly Step[];
 }
 
@@ -104,6 +115,8 @@ export function describeScenario(scenario: Scenario): string {
   for (const rule of scenario.rules ?? []) parts.push(`rule ${describe({ ...rule })}`);
   if (scenario.session !== undefined) parts.push(`session ${describe({ ...scenario.session })}`);
   if (scenario.timers === true) parts.push("mocked timers");
+  if (scenario.clock === true) parts.push("mocked clock");
+  if (scenario.inspect === true) parts.push("gate inspections logged");
   parts.push(`steps: ${scenario.steps.map((step) => describe(step, 50)).join("; ")}`);
   return parts.join("; ");
 }
@@ -312,7 +325,7 @@ class Session {
   async post(headers: Readonly<Record<string, unknown>> | undefined, body: string): Promise<void> {
     const model = this.model();
     const wire = new Headers({ "content-type": "application/json" });
-    const { key = "demo-key", extra = {}, url, rewrite = [] } = this.config.wire;
+    const { key = "demo-key", extra = {}, url, rewrite = [], shape = "init" } = this.config.wire;
     if (key !== null) {
       if (model["api"] === "anthropic-messages") wire.set("x-api-key", key);
       else if (model["api"] === "google-generative-ai") wire.set("x-goog-api-key", key);
@@ -329,18 +342,20 @@ class Session {
     const base = String(model["baseUrl"]);
     const cut = base.search(/[?#]/);
     const target = url !== undefined ? this.#origins.fill(url) : cut === -1 ? `${base}/chat/completions` : `${base.slice(0, cut)}/chat/completions${base.slice(cut)}`;
+    // A shape other than the default is named after the URL in what the transport logs.
+    const call = shape === "init" ? target : `${target} [${shape}]`;
     let response: Response;
     try {
-      response = await fetch(target, { method: "POST", headers: wire, body });
+      response = await fetch(...callArgs(shape, target, { method: "POST", headers: wire, body }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.#log(`POST ${target} ${message.startsWith("Blocked by the route policy plugin") ? "stopped" : "failed"}: ${message}`);
+      this.#log(`POST ${call} ${message.startsWith("Blocked by the route policy plugin") ? "stopped" : "failed"}: ${message}`);
       return;
     }
     const text = await response.text();
     // Every header the caller's Response has, hop-by-hop ones (connection, keep-alive) included, and its status text.
     const shown = [...response.headers].map(([name, value]) => `${name}: ${value}`);
-    this.#log(`POST ${target} -> ${response.status} ${JSON.stringify(response.statusText)} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
+    this.#log(`POST ${call} -> ${response.status} ${JSON.stringify(response.statusText)} | ${shown.join(" | ")} | body ${JSON.stringify(text)}`);
   }
 
   /** One provider request as the harness makes it: hooks, serialization, then the HTTP call. */
@@ -454,7 +469,17 @@ export async function run(scenario: Scenario, adapter: Adapter): Promise<string[
         break;
     }
   };
-  if (scenario.timers === true) mock.timers.enable({ apis: ["setTimeout"] });
+  // Mocked setTimeout moves the plugin's deadlines; a mocked Date moves the gate's release expiry. `tick` moves both.
+  const mocked = [...(scenario.timers === true ? (["setTimeout"] as const) : []), ...(scenario.clock === true ? (["Date"] as const) : [])];
+  if (mocked.length > 0) mock.timers.enable({ apis: mocked });
+  const inspector = {
+    check: (outgoing: Outgoing): null => {
+      log(`gate inspected ${JSON.stringify(outgoing)}`);
+      return null;
+    },
+    stopped: (): void => {},
+  };
+  const unwatch = scenario.inspect === true ? addWatcher(inspector) : null;
   try {
     await recording(out, scenario.origins?.includes("or") === true ? origins.url("or") : null, async () => {
       await deadline(
@@ -474,8 +499,10 @@ export async function run(scenario: Scenario, adapter: Adapter): Promise<string[
       );
     });
   } finally {
-    if (scenario.timers === true) mock.timers.reset();
+    if (mocked.length > 0) mock.timers.reset();
+    unwatch?.();
     for (const s of sessions.values()) await s.emit("session_shutdown", { type: "session_shutdown" });
+    forgetReleases();
     await origins.close();
     if (before === undefined) delete process.env["ROUTE_POLICY"];
     else process.env["ROUTE_POLICY"] = before;

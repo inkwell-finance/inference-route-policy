@@ -306,6 +306,9 @@ export async function runConformance(options: Options): Promise<Report> {
           missing ??= `inspectable /route-policy reply (${r.bodyUnavailable})`;
           continue;
         }
+        if (r.status === 200 && r.invalidEncoding !== undefined) {
+          throw mismatch(probe, r.received, `a complete valid detection reply: ${r.invalidEncoding}`);
+        }
         const parsed = parseDetection({ status: r.status, body: r.body, credentialed: current.credential !== undefined });
         if (!parsed.ok) throw mismatch(probe, r.received, `a complete valid detection reply: ${parsed.detail}`);
         current.detection = parsed.value;
@@ -352,17 +355,14 @@ export async function runConformance(options: Options): Promise<Report> {
       const probe = metadata("models", current);
       try {
         const reply = await expect(probe, "a successful model list", () => true);
-        if (isBareError(reply)) continue;
-        if (reply.status === 204 && !reply.hasBody) {
-          missing ??= "an inspectable model list; /models returned HTTP 204 No Content";
-          continue;
-        }
-        if (reply.status >= 200 && reply.status < 300 && reply.bodyUnavailable !== undefined) {
+        if (reply.status < 200 || reply.status >= 300) continue;
+        if (reply.invalidEncoding !== undefined) throw mismatch(probe, reply.received, `a valid model list: ${reply.invalidEncoding}`);
+        if (reply.bodyUnavailable !== undefined) {
           missing ??= `inspectable /models reply (${reply.bodyUnavailable})`;
           continue;
         }
         const problem = schemaProblem(reply.body);
-        if (problem !== undefined || reply.status < 200 || reply.status >= 300) throw mismatch(probe, reply.received, problem ?? "a successful model list");
+        if (problem !== undefined) throw mismatch(probe, reply.received, problem);
         current.models = discover(reply.body, current.detection?.support ?? BASELINE);
         current.catalogAvailable = true;
         count++;
@@ -390,6 +390,8 @@ export async function runConformance(options: Options): Promise<Report> {
     const policyBoundResult = policyDetection?.keyPolicy ? parsePolicy(policyDetection.keyPolicy, policyDetection.support) : undefined;
     const policyBound = policyBoundResult?.ok ? policyBoundResult.value : undefined;
     const needModel = "a published base model for this endpoint's credential";
+    const needCatalog = !primary.catalogAvailable && !policyScope.catalogAvailable
+      ? "a valid /models catalog in this endpoint's credential scopes" : undefined;
     const knowBound = boundText === null || boundParsed?.ok === true;
     const withKey = (policy?: Policy) => combinePolicies({ ...(bound === undefined ? {} : { key: bound }), ...(policy === undefined ? {} : { header: policy }) });
     const candidates = models.flatMap((model) => model.policies.map(({ text, policy }) => ({ model, text, policy, allowed: qualifying(model, withKey(policy)) })));
@@ -402,7 +404,8 @@ export async function runConformance(options: Options): Promise<Report> {
     const inference = on(endpoint, primary.credential);
     const policyInference = on(endpoint, policyScope.credential);
     const bodyProbe = (raw: string): Probe => ({ ...metadata(endpoint, primary), raw });
-    const run = (id: string, detail: string, fn: () => Promise<void | string>) => check(id, detail, fn, endpoint);
+    const run = (id: string, detail: string, fn: () => Promise<void | string>) =>
+      check(id, detail, needCatalog === undefined ? fn : async () => needCatalog, endpoint);
     const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
     const witnesses = new Map<Scope, Map<string, string | undefined>>();
     function acceptedWitness(current: Scope, probe: Probe): string | undefined {
@@ -938,7 +941,7 @@ export async function runConformance(options: Options): Promise<Report> {
     const audited = (id: AuditId, detail: string, observed: readonly Exchange[] = [], missing?: string) => {
       const failure = audit.failures.get(id);
       const existing = checks.find((entry) => entry.id === id && entry.endpoint === endpoint);
-      const absent = missing ?? (observed.length === 0 ? "an observed response for this check" : undefined);
+      const absent = needCatalog ?? missing ?? (observed.length === 0 ? "an observed response for this check" : undefined);
       const verdict: Check = failure !== undefined ? { id, endpoint, status: "FAIL", detail: failure }
         : absent !== undefined ? { id, endpoint, status: "SKIP", detail: `missing precondition: ${absent}` }
         : { id, endpoint, status: "PASS", detail: `${detail}; observed ${observations(observed)}` };

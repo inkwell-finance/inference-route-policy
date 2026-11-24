@@ -10,7 +10,7 @@ import { plain } from "./table.ts";
 import { RouteClient, type Located, type Prepared } from "../src/route-client.ts";
 import type { Outgoing } from "../src/request.ts";
 import { describe } from "./fake-harness.ts";
-import { deadline, Log, log, Origins, recording, settle, summarize, type Expected, type Rule } from "./wire.ts";
+import { deadline, forgetReleases, Log, log, Origins, recording, settle, summarize, type Expected, type Rule } from "./wire.ts";
 
 interface Place {
   base: string;
@@ -182,6 +182,7 @@ async function run(scenario: Scenario): Promise<string[]> {
       mock.timers.reset();
       AbortSignal.timeout = realTimeout;
     }
+    forgetReleases();
     await origins.close();
   }
   origins.assertEveryRuleAnswered();
@@ -225,7 +226,7 @@ const LIST: readonly Scenario[] = [
     // 257 releases of distinct bodies b0 to b256 by one client, each body then posted once: past the limit of 256
     // the oldest, b0, is withdrawn, and every other is let through exactly once.
     key: "r02",
-    ids: ["C1"],
+    ids: [],
     steps: [
       { do: "client", as: "A", held: "zdr" },
       { do: "decide", c: "A", id: "d1", place: GW, model: "demo-model" },
@@ -387,7 +388,8 @@ const EXPECTED: Expected = {
       "A decide -> {\"decision\":{\"action\":\"send\",\"model\":\"demo-model\",\"header\":\"zdr\",\"sent\":{\"zdr\":true,\"notrain\":false,\"bits\":null,\"region\":null,\"attest\":[],\"only\":null,\"ignore\":[],\"sort\":null,\"order\":null},\"routes\":[[\"aurora\",{\"facts\":{\"zdr\":true,\"notrain\":true,\"bits\":8,\"region\":[\"us\"],\"attest\":[]},\"evidence\":null}],[\"basalt\",{\"facts\":{\"zdr\":false,\"notrain\":false,\"bits\":16,\"region\":[\"us\",\"de\"],\"attest\":[\"weights\",\"prompt\"]},\"evidence\":\"https://basalt.example/attestation\"}],[\"cobalt\",{\"facts\":{\"zdr\":false,\"notrain\":false,\"bits\":null,\"region\":null,\"attest\":[]},\"evidence\":null}]]},\"target\":{\"base\":\"http://{gw}/v1\",\"query\":\"\",\"context\":[[\"authorization\",\"Bearer k\"]]},\"unexact\":null,\"generation\":0}",
       "== release c=A from=d1 header=zdr bodies=257",
       "== post-each bodies=257 headers={\"authorization\":\"Bearer k\",\"route-policy\":\"zdr\"}",
-      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1/chat/completions carries a Route-Policy header, and no session checked http://{gw}/v1/chat/completions for it",
+      "A report {\"kind\":\"blocked\",\"reason\":\"this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent\"} subject null",
+      "POST http://{gw}/v1/chat/completions threw Error: Blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent",
       "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | authorization: Bearer k | route-policy: zdr | content-type: text/plain;charset=UTF-8 | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 2 | body \"b1\"",
       "A report {\"kind\":\"honored\",\"provider\":\"aurora\",\"checked\":true,\"evidence\":null} subject \"request for demo-model to http://{gw}/v1\"",
       "POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",

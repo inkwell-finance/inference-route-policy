@@ -248,7 +248,7 @@ const LIST: readonly Scenario[] = [
   },
   {
     key: "s18",
-    ids: { omp: [], pi: ["C1"] },
+    ids: [],
     env: { ROUTE_POLICY: "zdr" },
     steps: [{ do: "prepare", id: "r1" }, { do: "emit", event: "session_shutdown" }, { do: "send", id: "r1" }],
   },
@@ -1524,8 +1524,9 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model+zdr\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "== emit event=session_shutdown",
       "== send id=r1",
-      "gw <- POST /v1/chat/completions | host: {gw} | connection: keep-alive | content-type: application/json | authorization: Bearer demo-key | accept: */* | accept-language: * | sec-fetch-mode: cors | user-agent: node | accept-encoding: gzip, deflate | content-length: 96 | body \"{\\\"model\\\":\\\"demo-model+zdr\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"secret prompt\\\"}],\\\"stream\\\":false}\"",
-      "[1] POST http://{gw}/v1/chat/completions -> 200 \"OK\" | connection: keep-alive | content-length: 14 | content-type: application/json | keep-alive: timeout=5 | route-applied: provider=aurora | body \"{\\\"choices\\\":[]}\"",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent\"",
+      "[1] POST http://{gw}/v1/chat/completions stopped: Blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent",
     ],
     pi: [
       "== open s=1",
@@ -1541,7 +1542,9 @@ const EXPECTED: Expected = {
       "[1] before_provider_request -> {\"model\":\"demo-model\",\"messages\":[{\"role\":\"user\",\"content\":\"secret prompt\"}],\"stream\":false}",
       "== emit event=session_shutdown",
       "== send id=r1",
-      "[1] POST http://{gw}/v1/chat/completions stopped: Blocked by the route policy plugin, nothing was sent: this request to http://{gw}/v1/chat/completions carries a Route-Policy header, and no session checked http://{gw}/v1/chat/completions for it",
+      "[1] setStatus route-policy \"request blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent\"",
+      "[1] notify error \"request blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent\"",
+      "[1] POST http://{gw}/v1/chat/completions stopped: Blocked by the route policy plugin, nothing was sent: this request was withdrawn before it left (its session ended, or its client let go of it), and a withdrawn release is never sent",
     ],
   },
   s19: {

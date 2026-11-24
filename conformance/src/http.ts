@@ -20,6 +20,7 @@ export interface Observation {
   body: unknown;
   hasBody: boolean;
   bodyUnavailable?: string;
+  invalidEncoding?: string;
   contentType: string | undefined;
   applied: string[];
   refused: string[];
@@ -29,7 +30,7 @@ export interface Observation {
 
 const policyHeader = (index: number, mixedFirst = false): string => (index % 2 === 0) !== mixedFirst ? "Route-Policy" : "rOuTe-PoLiCy";
 
-function decode(bytes: Buffer, encodings: readonly string[]): { bytes: Buffer } | { bodyUnavailable: string } {
+function decode(bytes: Buffer, encodings: readonly string[]): { bytes: Buffer } | { bodyUnavailable: string } | { invalidEncoding: string } {
   for (const encoding of encodings.join(",").split(",").reverse()) {
     const coding = encoding.trim().toLowerCase();
     try {
@@ -45,8 +46,18 @@ function decode(bytes: Buffer, encodings: readonly string[]): { bytes: Buffer } 
           return { bodyUnavailable: "unsupported Content-Encoding zstd" };
         default: return { bodyUnavailable: `unsupported Content-Encoding ${coding}` };
       }
-    } catch {
-      return { bodyUnavailable: `could not decode Content-Encoding ${coding}` };
+    } catch (error) {
+      const detail = `could not decode Content-Encoding ${coding}`;
+      // An unsupported decoder or a local resource limit does not prove the
+      // representation corrupt; data errors from supported decoders do.
+      const code = error instanceof Error && "code" in error ? error.code : undefined;
+      if (typeof code === "string" && (code === "Z_DATA_ERROR" || code === "Z_BUF_ERROR"
+        || code.startsWith("ERR__ERROR_FORMAT_")
+        || ["ZSTD_error_prefix_unknown", "ZSTD_error_corruption_detected", "ZSTD_error_checksum_wrong",
+          "ZSTD_error_literals_headerWrong", "ZSTD_error_srcSize_wrong"].includes(code))) {
+        return { invalidEncoding: detail };
+      }
+      return { bodyUnavailable: detail };
     }
   }
   return { bytes };
@@ -113,7 +124,7 @@ export async function request(base: ReturnType<typeof parseBase>, probe: Probe, 
       reply.on("end", () => {
         const bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
         const decoded = bytes.length === 0 ? { bytes } : decode(bytes, buckets.get("content-encoding") ?? []);
-        if ("bodyUnavailable" in decoded) {
+        if (!("bytes" in decoded)) {
           resolve({ ...result, ...decoded, body: undefined, hasBody: true, received: JSON.stringify({ ...result, ...decoded }) });
           return;
         }

@@ -167,28 +167,35 @@ export interface Outgoing {
   context: RequestContext;
   /** The `Route-Policy` value as it will be sent: repeated lines are joined, and so never equal one released value. */
   header: string | null;
-  /** The body as it will be sent, when it is text; null when it is bytes or a stream this reader cannot compare. */
+  /**
+   * The body the call sends, read the way `fetch` picks it: "" when it sends none (or empty text), the text when
+   * it is a string, and null when it is anything else, a `Request`'s own body included, which cannot be read here
+   * without consuming what the transport will send. Whether a request has a body is decided here and nowhere else.
+   */
   body: string | null;
 }
 
 /**
- * Reads a request as it leaves. `init` overrides a `Request` input's headers and body, as `fetch` does. Headers
- * are read through `Headers`, as `fetch` sends them: names case-insensitive, values trimmed, repeated lines joined
- * into one. Throws, as `fetch` would, for a URL it cannot send.
+ * Reads a request as it leaves, by the rules `fetch` applies to its two arguments: the URL is a `Request`'s url, a
+ * URL's href, or anything else as a string; `init`'s method and headers, when given, replace a `Request`'s own;
+ * `init`'s body replaces a `Request`'s own only when it is neither null nor undefined, so a `Request`'s body is
+ * sent otherwise. Headers are read through `Headers`, as `fetch` sends them: names case-insensitive, values
+ * trimmed, repeated lines joined into one. Throws, as `fetch` would, for a URL or headers it cannot send.
  */
 export function outgoingOf(input: Parameters<typeof fetch>[0], init: RequestInit | undefined): Outgoing {
   const request = input instanceof Request ? input : null;
-  const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  const url = new URL(request !== null ? request.url : input instanceof URL ? input.href : String(input));
   if (!sendable(url)) throw new TypeError("a URL with credentials in it is not sent");
   const headers = new Headers(init?.headers ?? request?.headers);
-  const body = init !== undefined && "body" in init ? init.body : request?.body;
+  const given = init?.body;
+  const body = given !== undefined && given !== null ? given : (request?.body ?? null);
   return {
     path: `${url.origin}${url.pathname}`,
     query: queryOf(url),
     method: (init?.method ?? request?.method ?? "GET").toUpperCase(),
     context: contextOf(headers),
     header: headers.get("route-policy"),
-    body: typeof body === "string" ? body : body === undefined || body === null ? "" : null,
+    body: body === null ? "" : typeof body === "string" ? body : null,
   };
 }
 
