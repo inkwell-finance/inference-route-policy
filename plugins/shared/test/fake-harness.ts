@@ -30,6 +30,10 @@ export class FakeHarness {
   /** What `modelRegistry.getApiKeyAndHeaders` does; tests replace it to make the plugin fail. */
   resolveAuth: () => Promise<unknown> = async () => ({ ok: true, apiKey: "demo-key" });
   uiThrows = false;
+  /** Which UI callbacks the context offers at all: a harness may give one without the other. */
+  /** The UI callbacks every fake made from now on offers from its first event: a harness does not change them. */
+  static uiOffersFromStart = { notify: true, setStatus: true };
+  uiOffers = { ...FakeHarness.uiOffersFromStart };
   /** Makes only one UI channel throw. */
   statusThrows = false;
   notifyThrows = false;
@@ -71,7 +75,10 @@ export class FakeHarness {
       this.shown.push({ method, text });
     };
     return {
-      ui: { notify: (message: string) => show("notify", message), setStatus: (_key: string, text: string) => show("setStatus", text) },
+      ui: {
+        ...(this.uiOffers.notify ? { notify: (message: string) => show("notify", message) } : {}),
+        ...(this.uiOffers.setStatus ? { setStatus: (_key: string, text: string) => show("setStatus", text) } : {}),
+      },
       model: this.contextModel ?? this.model,
       modelRegistry: { getApiKeyAndHeaders: () => this.resolveAuth() },
       sessionManager: { getBranch: () => this.entries },

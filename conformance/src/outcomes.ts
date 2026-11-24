@@ -16,6 +16,7 @@ import { sent, type Observation, type Probe } from "./http.ts";
 export interface Exchange {
   probe: Probe;
   reply: Observation;
+  unverifiedOrdinaryControl?: string;
   ordinaryControl?: string;
   missingRefusal?: boolean;
 }
@@ -176,6 +177,7 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
     failures: new Map(), catalogRelays: [], attestedRelays: [], results: [], refusals: [], shapeControlsNeeded: new Set(),
   };
   const ordinary = exchanges.filter(({ ordinaryControl, reply }) => ordinaryControl && reply.hasBody && noResult(reply));
+  const unverified = exchanges.filter(({ unverifiedOrdinaryControl, reply }) => unverifiedOrdinaryControl && reply.hasBody && noResult(reply));
   const shapeId = shapeIndex();
   for (const exchange of exchanges) {
     const { probe, reply, missingRefusal } = exchange;
@@ -237,7 +239,12 @@ export function auditResults(exchanges: readonly Exchange[], contextFor: (probe:
         fail("G34", `a refusal has a nonempty error body; the refusal was empty (compared with ${sampled()})`);
         continue;
       }
-      const shape = compareErrorShape(reply, references.map(({ reply }) => reply), shapeId);
+      let shape = compareErrorShape(reply, references.map(({ reply }) => reply), shapeId);
+      if ((shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined) && reply.body !== undefined) {
+        const possible = unverified.find((entry) => entry.probe.path === probe.path && sameCredential(entry.probe, probe)
+          && mediaType(entry.reply) === mediaType(reply) && entry.reply.body !== undefined && shapeId(entry.reply.body) === shapeId(reply.body));
+        if (possible !== undefined) shape = { unseen: `an ordinary error with this refusal shape; ${possible.unverifiedOrdinaryControl}` };
+      }
       if (shape.contradiction !== undefined) {
         audit.shapeControlsNeeded.add(probe.credential);
         fail("G34", `the refusal uses this endpoint's ordinary error format; ${shape.contradiction} (based on ${sampled()})`);

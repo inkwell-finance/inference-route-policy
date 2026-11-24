@@ -462,6 +462,74 @@ test("G25: an omitted model can use the gateway's default, while a nonstring mod
   assert.equal(report.failed, 0);
 });
 
+for (const mode of ["relay", "borrowed shape", "uncertain origin"] as const) {
+  const title = mode === "relay" ? "G25: an attributed default-model 422 does not witness own-error precedence"
+    : mode === "borrowed shape" ? "G34: a default-model relay cannot certify the refusal's error shape"
+      : "G25 G34: a default-model 422 with an inconclusive accepted-policy control cannot certify precedence or shape";
+  test(title, async (t) => {
+    const providerError = { error: "the provider rejected the input" };
+    const recipients: string[] = [];
+    const controls: { policy: string | null; status: number; provider: string | null; recipients: string[] }[] = [];
+    const target = createGateway({
+      models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+      fetch: async (...args: Parameters<typeof fetch>) => {
+        const request = new Request(...args);
+        const host = new URL(request.url).hostname;
+        if (await request.text() !== JSON.stringify({ model })) return Response.json({ text: `served by ${host}` });
+        recipients.push(host);
+        return Response.json(providerError, { status: 422 });
+      },
+    });
+    let altered = false;
+    const server = fixture(async ({ request, auth, body, header, suffix, next }) => {
+      if (auth !== `Bearer ${key}` || request.method !== "POST") return next();
+      if (Object.keys(body).length === 0 && await request.clone().text() === "{}") {
+        const before = recipients.length;
+        const reply = mode === "uncertain origin" && header === "zdr"
+          ? Response.json({ error: { message: "temporarily not available" } }, { status: 409 })
+          : await target(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ model }) }));
+        controls.push({ policy: header, status: reply.status, provider: reply.headers.get(applied), recipients: recipients.slice(before) });
+        return reply;
+      }
+      const reply = await next();
+      if (mode === "relay" || altered || header !== "bits=0" || suffix !== null || body.model !== model) return reply;
+      assert.equal(reply.headers.get(refusal), "reason=unsupported+key=bits");
+      altered = true;
+      return change(reply, { body: JSON.stringify(providerError) });
+    }, target);
+    const base = await baseAt(t, serve(server, 0));
+    const report = await runConformance({ base, key, policyKey, endpoints: ["chat/completions"] });
+    const plain = { policy: null, status: 422, provider: null, recipients: ["aurora.example"] };
+    const witness = mode === "uncertain origin" ? { policy: "zdr", status: 409, provider: null, recipients: [] }
+      : { policy: "zdr", status: 422, provider: "provider=aurora", recipients: ["aurora.example"] };
+    assert.deepEqual(controls.slice(0, 2), [plain, witness]);
+    assert.equal(controls.some(({ policy }) => policy === "bits=0"), false);
+    assert.equal(altered, mode !== "relay");
+    const precedence = report.checks.find(({ id }) => id === "G25");
+    assert.equal(precedence?.status, "SKIP");
+    assert.match(precedence.detail, mode === "uncertain origin"
+      ? /missing model field.*did not establish error origin \(no-policy HTTP 422; HTTP 409\)/
+      : /missing model field.*accepted-policy control reached routing \(HTTP 422\)/);
+    const shape = report.checks.find(({ id }) => id === "G34");
+    if (mode === "borrowed shape") {
+      assertFailure(report, "G34", /provider rejected the input.*; required: .*\$\.error has type string/);
+      assert.equal(report.failed, 1);
+    } else {
+      assert.equal(report.failed, 0, JSON.stringify(report.checks));
+      assert.equal(shape?.status, mode === "relay" ? "PASS" : "SKIP");
+      if (mode === "uncertain origin") assert.match(shape.detail, /ordinary error with this refusal shape; missing model field: .*did not establish error origin/);
+      if (mode === "relay") {
+        const reply = await wireRequest(parseBase(base), {
+          path: "chat/completions", credential: { key, header: "authorization" }, raw: "{}", policies: ["bits=0"],
+        }, 3_000);
+        assert.equal(reply.status, 400);
+        assert.deepEqual(reply.refused, ["reason=unsupported+key=bits"]);
+        assert.deepEqual(controls.at(-1), { policy: "bits=0", status: 400, provider: null, recipients: [] });
+      }
+    }
+  });
+}
+
 test("G1 G29: an unlisted preference cannot turn into unavailable on an advertisement probe", async (t) => {
   const report = await run(t, fixture(async ({ header, next }) => {
     const reply = await next();
@@ -589,7 +657,8 @@ test("G10 G13 G23: each credential's own catalog determines its model and matchi
     const carrier = apiKey === null ? "bearer" : "api";
     const role = apiKey === policyKey || bearer === `Bearer ${policyKey}` ? "bound" : "ordinary";
     const id = `${carrier}/${role}-model`;
-    if (new URL(request.url).pathname === "/v1/models") catalogReads.push(id);
+    if (new URL(request.url).pathname === "/v1/models"
+      && (apiKey === key || apiKey === policyKey || bearer === `Bearer ${key}` || bearer === `Bearer ${policyKey}`)) catalogReads.push(id);
     const handler = scopedGateways.get(id);
     assert.ok(handler);
     const body: unknown = request.method === "POST" ? await request.clone().json().catch(() => null) : null;
@@ -702,7 +771,7 @@ test("G25: a model not published in the catalog can still resolve", async (t) =>
   assert.equal(report.failed, 0);
   const verdict = report.checks.find(({ id }) => id === "G25");
   assert.equal(verdict?.status, "SKIP");
-  assert.match(verdict.detail, /unknown-model subcase: no-policy control did not establish an ordinary error \(HTTP 200\)/);
+  assert.match(verdict.detail, /unknown model subcase: no-policy control did not establish an ordinary error \(HTTP 200\)/);
 });
 
 test("G25: an unpublished model can relay a headerless 422 without causing a false own-error finding", async (t) => {
@@ -717,35 +786,41 @@ test("G25: an unpublished model can relay a headerless 422 without causing a fal
   assert.equal(report.failed, 0);
   const verdict = report.checks.find(({ id }) => id === "G25");
   assert.equal(verdict?.status, "SKIP");
-  assert.match(verdict.detail, /accepted-policy control reached routing for the unpublished model \(HTTP 422\)/);
+  assert.match(verdict.detail, /unknown model subcase: accepted-policy control reached routing \(HTTP 422\)/);
 });
 
-for (const status of [400, 422]) test(`G25: a reference gateway accepting any key may relay a headerless provider ${status}`, async (t) => {
+for (const status of [400, 422]) test(`G25: synthetic-key discovery supplies a qualifying accepted policy that attributes a headerless provider ${status}`, async (t) => {
   const credentialControls: { header: string | null; status: number; applied: string | null; providerCalls: number }[] = [];
+  const discovery: string[] = [];
   let providerCalls = 0;
-  const target = createGateway({
-    models: { [model]: routes },
-    fetch: () => {
-      providerCalls++;
-      return Response.json({ providerError: "rejected by the provider" }, { status });
-    },
+  const fetchProvider = () => {
+    providerCalls++;
+    return Response.json({ providerError: "rejected by the provider" }, { status });
+  };
+  const ordinary = createGateway({ models: { [model]: routes }, fetch: fetchProvider });
+  const syntheticKey = createGateway({
+    models: { [model]: [{ ...routes[1]!, facts: "bits=16+region=de" }] },
+    accept: { keys: ["zdr", "region"] }, fetch: fetchProvider,
   });
   const report = await run(t, async (request, transport) => {
+    const synthetic = request.headers.get("authorization")?.startsWith("Bearer route-conformance-invalid-") === true;
+    if (synthetic && request.method === "GET") discovery.push(new URL(request.url).pathname);
     const before = providerCalls;
-    const reply = await target(request, transport);
-    if (request.headers.get("authorization")?.startsWith("Bearer route-conformance-invalid-")) {
+    const reply = await (synthetic ? syntheticKey : ordinary)(request, transport);
+    if (request.method === "POST" && synthetic) {
       credentialControls.push({ header: request.headers.get("route-policy"), status: reply.status, applied: reply.headers.get(applied), providerCalls: providerCalls - before });
     }
     return reply;
   });
+  assert.deepEqual(discovery, ["/v1/route-policy", "/v1/models"]);
   assert.deepEqual(credentialControls, [
     { header: null, status, applied: null, providerCalls: 1 },
-    { header: null, status: 400, applied: null, providerCalls: 0 },
+    { header: "region=de", status, applied: "provider=basalt", providerCalls: 1 },
   ]);
   assert.equal(report.failed, 0);
   const verdict = report.checks.find(({ id }) => id === "G25");
   assert.equal(verdict?.status, "SKIP");
-  assert.match(verdict.detail, new RegExp(`headerless HTTP ${status} did not distinguish credential rejection from a provider relay`));
+  assert.match(verdict.detail, new RegExp(`bad-credentials subcase: accepted-policy control reached routing \\(HTTP ${status}\\)`));
 });
 
 for (const sample of [
@@ -754,17 +829,17 @@ for (const sample of [
 ] as const) {
   for (const defect of [false, true]) test(`G25: ${sample.label} HTTP ${sample.status} ${defect ? "cannot become a policy refusal" : "can remain an ordinary error"}`, async (t) => {
     const requests: (string | null)[] = [];
-    const report = await run(t, fixture(({ id, auth, header, next }) => {
+    const report = await run(t, fixture(({ request, id, auth, header, next }) => {
       const selected = sample.label === "unknown model" ? id.startsWith("route-conformance-unknown-") : auth?.startsWith("Bearer route-conformance-invalid-");
-      if (!selected) return next();
+      if (request.method !== "POST" || !selected) return next();
       requests.push(header);
-      const mutated = defect && header !== null;
+      const mutated = defect && header === "bits=0";
       const body = { error: { type: "invalid_request_error", message: mutated ? "bad policy" : sample.label } };
       return mutated
         ? Response.json(body, { status: 400, headers: { [refusal]: formatRefused("unsupported", "bits") } })
         : Response.json(body, { status: sample.status });
     }));
-    assert.deepEqual(requests, sample.label === "unknown model" ? [null, "zdr", "bits=0"] : [null, null, "bits=0"]);
+    assert.deepEqual(requests, sample.label === "unknown model" ? [null, "zdr", "bits=0"] : [null, "zdr", null, "bits=0"]);
     const verdict = report.checks.find(({ id }) => id === "G25");
     assert.equal(verdict?.status, defect ? "FAIL" : "PASS");
     if (defect) assert.match(verdict.detail, /reason=unsupported/);
@@ -776,7 +851,7 @@ test("G25: different ordinary statuses do not establish a violation if the no-po
   let plain = 0;
   const report = await run(t, fixture(({ id, header, next }) => {
     if (!id.startsWith("route-conformance-unknown-")) return next();
-    const status = header === null && plain++ === 0 ? 422 : 409;
+    const status = header === "zdr" || (header === null && plain++ === 0) ? 422 : 409;
     return Response.json({ error: { type: "invalid_request_error", message: "could not resolve model" } }, { status });
   }));
   assert.equal(plain, 2);
@@ -788,7 +863,7 @@ test("G25: different ordinary statuses do not establish a violation if the no-po
 
 test("G25: a stable nonstandard ordinary status is not interchangeable with another ordinary error", async (t) => {
   const report = await run(t, fixture(({ id, header, next }) => id.startsWith("route-conformance-unknown-")
-    ? Response.json({ error: { type: "invalid_request_error", message: "could not resolve model" } }, { status: header === null ? 422 : 409 })
+    ? Response.json({ error: { type: "invalid_request_error", message: "could not resolve model" } }, { status: header === "bits=0" ? 409 : 422 })
     : next()));
   const verdict = report.checks.find(({ id }) => id === "G25");
   assert.equal(verdict?.status, "FAIL");
@@ -1224,7 +1299,7 @@ for (const broken of [false, true]) test(`G25: a stable bound-key rate limit ${b
     if (header === "bits=0") {
       challengeSeen = true;
       if (broken) return protocolError("unsupported", "bits");
-    } else if (header !== null) return next();
+    } else if (header !== null && header !== "zdr") return next();
     return Response.json({ error: { message: "try later", type: "rate_limit" } }, { status: 429 });
   }));
   assert.ok(challengeSeen);
@@ -1241,7 +1316,7 @@ test("G25 G34: a corroborated Responses rate limit supplies the only matching re
   let ordinaryRefusals = 0;
   const report = await run(t, fixture(async ({ id, auth, header, suffix, body, next }) => {
     if (auth !== `Bearer ${policyKey}` || id !== model || suffix !== null) return next();
-    if ((header === null || header === "bits=0") && typeof body.input === "string" && body.max_output_tokens === 16
+    if ((header === null || header === "zdr" || header === "bits=0") && typeof body.input === "string" && body.max_output_tokens === 16
       && !Object.hasOwn(body, "route_conformance_unknown_field")) {
       throttled.add(header);
       return Response.json(problem, { status: 429, headers: media });
@@ -1252,7 +1327,7 @@ test("G25 G34: a corroborated Responses rate limit supplies the only matching re
     ordinaryRefusals++;
     return change(reply, { body: JSON.stringify(problem), replace: media });
   }), ["responses"]);
-  assert.deepEqual(throttled, new Set([null, "bits=0"]));
+  assert.deepEqual(throttled, new Set([null, "zdr", "bits=0"]));
   assert.equal(ordinaryRefusals, 1);
   assert.equal(report.failed, 0, JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
   assert.equal(report.checks.find(({ id }) => id === "G25")?.status, "PASS");

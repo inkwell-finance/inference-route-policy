@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { OPENROUTER_BASE } from "../src/openrouter.ts";
-import type { FakeHarness } from "./fake-harness.ts";
+import { FakeHarness } from "./fake-harness.ts";
 import { PATH_QUERY_CASES, WHOLE_URL_CASES } from "./url-cases.ts";
 import type { FakeGateway, Reply } from "./fixtures.ts";
 
@@ -232,14 +232,52 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     from = harness.shown.length;
     assert.equal((await harness.request()).status, 400);
     assert.deepEqual(harness.shown.slice(from), [{ method: "setStatus", text: text(modelSent()) }], "the status line is set");
+    // With both gone: the request is answered as before, and /route runs to its end, nothing escaping either.
     harness.statusThrows = true;
     from = harness.shown.length;
     const result = await harness.request();
     assert.deepEqual([result.sent, result.status, harness.shown.slice(from), harness.handlerErrors], [true, 400, [], []]);
+    await assert.doesNotReject(harness.command("route", ""), "/route with both callbacks throwing");
+    assert.deepEqual([harness.shown.slice(from), harness.handlerErrors], [[], []]);
+    // Back, /route shows the result it kept while it could show nothing.
     harness.statusThrows = false;
     harness.notifyThrows = false;
     await harness.command("route", "");
     assert.match(notices(harness).at(-1) ?? "", new RegExp(`^Last result \\(request for .*\\): route policy refused by the gateway: unsupported \\(key zdr\\)$`, "m"));
+  });
+
+  test(`C11: ${name}: each UI callback is used without the other: with both, notify only, setStatus only, or neither, a refusal, a block, and /route each show exactly what the callbacks offered can show`, async () => {
+    const refused = /^route policy refused by the gateway: unsupported \(key zdr\) \(request for /;
+    const blocked = /^request blocked by the route policy plugin, nothing was sent: the model id "demo-model\+zdr=1" carries a suffix that is not a valid policy/;
+    const route = /^Route policy: zdr \(set in this session\)\n/;
+    for (const offers of [{ notify: true, setStatus: true }, { notify: true, setStatus: false }, { notify: false, setStatus: true }, { notify: false, setStatus: false }]) {
+      const shape = JSON.stringify(offers);
+      // Offered so from the session's first event on, as a harness would.
+      FakeHarness.uiOffersFromStart = offers;
+      const harness = await make("zdr");
+      FakeHarness.uiOffersFromStart = { notify: true, setStatus: true };
+      // What each step shows: the methods called, in order, each with what it said.
+      const step = async (run: () => Promise<unknown>): Promise<{ method: string; text: string | undefined }[]> => {
+        const from = harness.shown.length;
+        await run();
+        return harness.shown.slice(from);
+      };
+      const check = (entries: { method: string; text: string | undefined }[], pattern: RegExp, methods: string[], what: string): void => {
+        assert.deepEqual(entries.map((e) => e.method), methods, `${shape}: ${what}`);
+        for (const entry of entries) assert.match(entry.text ?? "", pattern, `${shape}: ${what}`);
+      };
+      const both = (on: { notify: boolean; setStatus: boolean }): string[] => [...(on.setStatus ? ["setStatus"] : []), ...(on.notify ? ["notify"] : [])];
+      gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsupported+key=zdr" }, body: {} };
+      let response: { sent: boolean; status: number | null } = { sent: false, status: null };
+      check(await step(async () => (response = await harness.request())), refused, both(offers), "a refusal");
+      assert.deepEqual([response.sent, response.status], [true, 400], `${shape}: the refused request was answered`);
+      harness.model.id = "demo-model+zdr=1";
+      check(await step(async () => (response = await harness.request({ model: "demo-model+zdr=1", messages: [] }))), blocked, both(offers), "a block");
+      assert.equal(response.sent, false, `${shape}: the blocked request was not sent`);
+      harness.model.id = "demo-model";
+      check(await step(async () => harness.command("route", "")), route, offers.notify ? ["notify"] : [], "/route");
+      assert.deepEqual(harness.handlerErrors, [], shape);
+    }
   });
 
   test(`C2, C14: ${name}: a policy of preferences alone is not sent to a base URL that cannot be used as written either`, async () => {

@@ -407,13 +407,62 @@ export async function runConformance(options: Options): Promise<Report> {
     const policyInference = on(endpoint, policyScope.credential);
     const bodyProbe = (raw: string): Probe => ({ ...metadata(endpoint, primary), raw });
     const run = (id: string, detail: string, fn: () => Promise<void | string>) => check(id, detail, fn, endpoint);
-    // Only the ordinary side supplies an error shape. Matching status on
-    // the policy challenge corroborates origin, not the challenge's body.
-    function registerOwnError(kind: string, ...samples: Exchange[]): void {
-      for (const sample of samples) sample.ordinaryControl = kind;
+    const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
+    const witnesses = new Map<Scope, Map<string, string | undefined>>();
+    function acceptedWitness(current: Scope, probe: Probe): string | undefined {
+      let byModel = witnesses.get(current);
+      if (byModel === undefined) {
+        byModel = new Map();
+        witnesses.set(current, byModel);
+        const detected = current.detection;
+        if (detected !== undefined) {
+          const parsed = detected.keyPolicy === null ? undefined : parsePolicy(detected.keyPolicy, detected.support);
+          if (parsed === undefined || parsed.ok) for (const model of current.models) {
+            const accepted = model.policies.find(({ policy }) => someRouteMeets(model.routes,
+              combinePolicies({ header: policy, ...(parsed?.ok ? { key: parsed.value } : {}) })));
+            byModel.set(model.id, accepted?.text);
+          }
+        }
+      }
+      const id = member(jsonBody(probe), "model");
+      if (typeof id === "string" && byModel.has(id)) return byModel.get(id);
+      for (const text of byModel.values()) if (text !== undefined) return text;
     }
-    async function compareOwn(before: Exchange, probe: Probe, kind: string): Promise<void> {
-      registerOwnError(kind, before);
+    // A headerless error from unmodified input can be a provider relay. Sample
+    // only its body, after corroborating origin with an accepted policy on the
+    // same input, endpoint and credentials.
+    async function establishOwnError(plain: Probe, kind: string, options?: {
+      sample?: Exchange;
+      discoverScope?: () => Promise<Scope>;
+      corroborate?: (sample: Exchange) => Promise<string | undefined>;
+    }): Promise<{ sample: Exchange } | { missing: string }> {
+      const control = options?.sample ?? await observeControl(plain);
+      if (control === undefined || !isBareError(control.reply)) {
+        return { missing: `no-policy control did not establish an ordinary error (${control === undefined ? "no response" : `HTTP ${control.reply.status}`})` };
+      }
+      const witnessScope = options?.discoverScope === undefined ? scopeFor(plain) : await options.discoverScope();
+      const witness = witnessScope === undefined ? undefined : acceptedWitness(witnessScope, plain);
+      const checked = witness === undefined ? undefined : await observeControl({ ...plain, policies: [witness] });
+      if (checked !== undefined && (checked.reply.applied.length !== 0 || checked.reply.status < 400
+        || refusal(checked.reply, "unavailable") || unsatisfiable(checked.reply))) {
+        return { missing: `accepted-policy control reached routing (HTTP ${checked.reply.status})` };
+      }
+      let missing: string;
+      if (checked !== undefined && isBareError(checked.reply) && checked.reply.status === control.reply.status) {
+        const reason = await options?.corroborate?.(control);
+        if (reason === undefined) {
+          control.ordinaryControl = kind;
+          return { sample: control };
+        }
+        missing = reason;
+      } else {
+        missing = witness === undefined ? "no accepted policy with a qualifying published route to establish error origin"
+          : `accepted-policy control did not establish error origin (no-policy HTTP ${control.reply.status}; ${checked === undefined ? "no response" : `HTTP ${checked.reply.status}`})`;
+      }
+      control.unverifiedOrdinaryControl = `${kind}: ${missing}`;
+      return { missing };
+    }
+    async function compareOwn(before: Exchange, probe: Probe): Promise<void> {
       const requirement = `the same ordinary error status ${before.reply.status} as the no-policy control, with no result headers`;
       const { reply } = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), requirement); });
       if (!noResult(reply)) throw mismatch(probe, reply.received, requirement);
@@ -424,7 +473,6 @@ export async function runConformance(options: Options): Promise<Report> {
         precondition ??= `a stable ordinary error; the two no-policy controls returned HTTP ${before.reply.status} and ${last}`;
         return;
       }
-      registerOwnError(kind, repeated);
       throw mismatch(probe, reply.received, requirement);
     }
     await run("G1", "the malformed-policy probes returned unsupported", async () => {
@@ -807,15 +855,14 @@ export async function runConformance(options: Options): Promise<Report> {
     });
     await run("G25", "corroborated ordinary errors retained their status and no route headers when challenged with a policy", async () => {
       const missing: string[] = [];
-      const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
       async function compareIfRejected(plain: Probe, challenged: Probe, kind: string): Promise<Exchange | undefined> {
-        const control = await observeControl(plain);
-        if (control === undefined || !isBareError(control.reply)) {
-          missing.push(`${kind} subcase: the no-policy control did not establish an own error (${control === undefined ? "no response" : `HTTP ${control.reply.status}`})`);
+        const established = await establishOwnError(plain, kind);
+        if ("missing" in established) {
+          missing.push(`${kind} subcase: ${established.missing}`);
           return undefined;
         }
-        await compareOwn(control, challenged, kind);
-        return control;
+        await compareOwn(established.sample, challenged);
+        return established.sample;
       }
       const malformed = bodyProbe("{");
       const malformedControl = await compareIfRejected(malformed, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] }, "malformed JSON");
@@ -824,64 +871,53 @@ export async function runConformance(options: Options): Promise<Report> {
         await compareIfRejected(probe, { ...probe, policies: [INVALID_POLICY] }, kind);
       }
       await compareIfRejected(inference(""), inference("", INVALID_POLICY, INVALID_POLICY), "empty model ID");
-      const unknown = await observeControl(inference(unknownModel));
-      if (unknown === undefined || !isBareError(unknown.reply)) {
-        missing.push(`unknown-model subcase: no-policy control did not establish an ordinary error (${unknown === undefined ? "no response" : `HTTP ${unknown.reply.status}`})`);
-      } else if (!primary.catalogAvailable) {
-        missing.push("unknown-model subcase: no accessible published catalog to corroborate rejection of the model");
-      } else {
-        // A catalog can omit a model that is nevertheless routable. Check for
-        // a protocol routing result before treating the missing id as unknown.
-        const witness = positive?.text ?? candidates[0]?.text;
-        const resolution = witness === undefined ? undefined : (await observeControl(inference(unknownModel, witness)))?.reply;
-        if (resolution === undefined) missing.push("unknown-model subcase: no accepted-policy control to test whether the unpublished model resolves");
-        else if (applied(resolution) !== null || resolution.status < 400
-          || refusal(resolution, "unavailable") || unsatisfiable(resolution)) {
-          missing.push(`unknown-model subcase: accepted-policy control reached routing for the unpublished model (HTTP ${resolution.status})`);
-        } else {
-          await compareOwn(unknown, inference(unknownModel, INVALID_POLICY, INVALID_POLICY), "unknown model");
-        }
-      }
+      await compareIfRejected(inference(unknownModel), inference(unknownModel, INVALID_POLICY, INVALID_POLICY), "unknown model");
 
       if (first === undefined) missing.push("bad-credentials subcase: no published base model");
       else {
         const credential: Credential = { key: `route-conformance-invalid-${crypto.randomUUID()}`, header: authHeaderFor(endpoint) };
         const plain = { ...inference(first.id), credential };
-        const candidate = await observeControl(plain);
-        if (candidate === undefined || !isBareError(candidate.reply)) {
-          missing.push("bad-credentials subcase: no-policy control did not establish rejection of the credential");
-        } else {
-          // An unreadable body cannot produce a provider relay. Changing only
-          // the credential should reproduce the candidate's error there and
-          // distinguish it from the ordinary malformed-body error.
-          const challenge = await observeControl({ ...malformed, credential });
-          if (malformedControl !== undefined && challenge !== undefined && isBareError(challenge.reply)
-            && challenge.reply.status === candidate.reply.status && challenge.reply.status !== malformedControl.reply.status) {
-            registerOwnError("bad credential", challenge);
-            await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] }, "bad credential");
-          } else {
-            missing.push(`bad-credentials subcase: headerless HTTP ${candidate.reply.status} did not distinguish credential rejection from a provider relay`);
-          }
-        }
+        const established = await establishOwnError(plain, "bad credential", {
+          async discoverScope() {
+            const current: Scope = { credential, models: [] };
+            const detection = await observeControl(metadata("route-policy", current));
+            if (detection === undefined) return current;
+            const parsed = parseDetection({ status: detection.reply.status, body: detection.reply.body, credentialed: true });
+            if (!parsed.ok) return current;
+            current.detection = parsed.value;
+            const catalog = await observeControl(metadata("models", current));
+            if (catalog !== undefined && catalog.reply.status >= 200 && catalog.reply.status < 300
+              && schemaProblem(catalog.reply.body) === undefined) current.models = discover(catalog.reply.body, parsed.value.support);
+            return current;
+          },
+          async corroborate(candidate) {
+            const challenge = await observeControl({ ...malformed, credential });
+            if (malformedControl !== undefined && challenge !== undefined && isBareError(challenge.reply)
+              && challenge.reply.status === candidate.reply.status && challenge.reply.status !== malformedControl.reply.status) return;
+            return `headerless HTTP ${candidate.reply.status} did not distinguish credential rejection from a provider relay`;
+          },
+        });
+        if ("missing" in established) missing.push(`bad-credentials subcase: ${established.missing}`);
+        else await compareOwn(established.sample, { ...plain, policies: [INVALID_POLICY] });
       }
       const throttleModel = policyBound === undefined ? undefined : policyScope.models.find((model) => qualifying(model, policyBound).length > 0);
       if (throttleModel !== undefined) {
         const plain = policyInference(throttleModel.id);
         const before = await observeControl(plain);
         if (before !== undefined && before.reply.status === 429 && isBareError(before.reply)) {
-          // The bound policy means even a relayed 429 requires Route-Applied.
-          // Bracket the challenge; a throttle that has cleared proves nothing.
-          const probe = policyInference(throttleModel.id, INVALID_POLICY);
-          const challenged = await observeControl(probe);
-          if (challenged !== undefined && challenged.reply.status === 429 && isBareError(challenged.reply)) {
-            registerOwnError("rate limit", before);
-          } else {
-            const after = await observeControl(plain);
-            if (after?.reply.status === 429 && isBareError(after.reply)) {
-              registerOwnError("rate limit", before, after);
-              throw mismatch(probe, challenged?.reply.received ?? "no response", "ordinary HTTP 429 with no route headers while both bound-key controls are throttled");
+          const established = await establishOwnError(plain, "rate limit", { sample: before });
+          if ("missing" in established) missing.push(`rate-limit subcase: ${established.missing}`);
+          else {
+            // Bracket the challenge; a throttle that has cleared proves nothing.
+            const probe = policyInference(throttleModel.id, INVALID_POLICY);
+            const challenged = await observeControl(probe);
+            if (challenged?.reply.status !== 429 || !isBareError(challenged.reply)) {
+              const after = await observeControl(plain);
+              if (after?.reply.status === 429 && isBareError(after.reply)) {
+                throw mismatch(probe, challenged?.reply.received ?? "no response", "ordinary HTTP 429 with no route headers while both bound-key controls are throttled");
+              }
+              missing.push("rate-limit subcase: the bound-key control was no longer throttled after the probe");
             }
-            missing.push("rate-limit subcase: the bound-key control was no longer throttled after the probe");
           }
         }
       }
@@ -902,20 +938,18 @@ export async function runConformance(options: Options): Promise<Report> {
     if (audit.shapeControlsNeeded.size > 0) {
       const observed = exchanges.slice(firstExchange);
       for (const credential of audit.shapeControlsNeeded.keys()) {
-        const seen = new Set(observed.filter(({ probe, ordinaryControl }) => ordinaryControl && probe.credential === credential).map(({ probe }) => probe.raw));
+        const seen = new Set(observed.filter(({ probe, ordinaryControl, unverifiedOrdinaryControl }) =>
+          (ordinaryControl !== undefined || unverifiedOrdinaryControl !== undefined) && probe.credential === credential).map(({ probe }) => probe.raw));
         // Change the kind of input error, not the endpoint or credential.
         const scopedProbe = (raw: string): Probe => ({ path: endpoint, raw, ...(credential === undefined ? {} : { credential }) });
         for (const raw of ["{", '{"model":4}', "{}", "[]", '{"model":null}', "", '{"model":false}', '{"model":{}}']) {
           if (seen.has(raw)) continue;
-          const sample = await observe(scopedProbe(raw)).catch(() => undefined);
-          if (sample === undefined || !isBareError(sample.reply)) continue;
-          registerOwnError(raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field", sample);
+          await establishOwnError(scopedProbe(raw), raw === "{" || raw === "" ? "malformed or empty JSON" : "invalid model field");
         }
         const current = scopeFor(scopedProbe("{}"));
         const model = current?.models[0];
         if (current !== undefined && model !== undefined) {
-          // A provider can also reject an input field. Only use the ordinary
-          // sample if the same error precedes validation of a malformed policy.
+          // Field validation may be done by a provider rather than the gateway.
           const field = endpoint === "responses" ? "input" : "messages";
           const limit = endpoint === "responses" ? "max_output_tokens" : "max_tokens";
           const body = bodyFor(endpoint, model.id);
@@ -925,27 +959,10 @@ export async function runConformance(options: Options): Promise<Report> {
             ["negative token limit", { [limit]: -1 }],
             ["unknown input field", { route_conformance_unknown_field: true }],
           ] as const) {
-            const probe = scopedProbe(JSON.stringify({ ...body, ...edit }));
-            const control = await observe(probe).catch(() => undefined);
-            if (control === undefined || !isBareError(control.reply)) continue;
-            const challenged = await observe({ ...probe, policies: [INVALID_POLICY] }).catch(() => undefined);
-            if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-              registerOwnError(kind, control);
-            }
+            await establishOwnError(scopedProbe(JSON.stringify({ ...body, ...edit })), kind);
           }
-          const witness = model.policies[0]?.text;
-          if (witness !== undefined && !observed.some(({ probe, ordinaryControl }) => ordinaryControl
-            && probe.credential === credential && probe.raw === inference(unknownModel).raw)) {
-            const synthetic = unused(new Set(current.models.map(({ id }) => id)), "route-conformance-shape-");
-            const probe = on(endpoint, credential)(synthetic);
-            const control = await observe(probe).catch(() => undefined);
-            if (control !== undefined && isBareError(control.reply)) {
-              const challenged = await observe(on(endpoint, credential)(synthetic, witness)).catch(() => undefined);
-              if (challenged !== undefined && isBareError(challenged.reply) && challenged.reply.status === control.reply.status) {
-                registerOwnError("unknown model", control);
-              }
-            }
-          }
+          const synthetic = unused(new Set(current.models.map(({ id }) => id)), "route-conformance-shape-");
+          await establishOwnError(on(endpoint, credential)(synthetic), "unknown model");
         }
       }
       audit = auditResults(exchanges.slice(firstExchange), contextFor);

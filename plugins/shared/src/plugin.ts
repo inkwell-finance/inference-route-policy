@@ -35,9 +35,10 @@ export interface ExtensionAPI {
   appendEntry(customType: string, data: HeldEntry): void;
 }
 
+/** The harness's UI callbacks, each one null when the harness gives none: one is used without the other. */
 interface UI {
-  notify(message: string, type: "info" | "warning" | "error"): void;
-  setStatus(key: string, text: string | undefined): void;
+  notify: ((message: string, type: "info" | "warning" | "error") => void) | null;
+  setStatus: ((key: string, text: string | undefined) => void) | null;
 }
 
 /** The session entry type that records the held policy, so a resumed session keeps it. */
@@ -57,12 +58,16 @@ function reasonOf(error: unknown): string {
   }
 }
 
+/** The UI a context offers, each callback found on its own; null when it offers neither. */
 function uiOf(ctx: unknown): UI | null {
   const ui = member(ctx, "ui");
   if (!isObject(ui)) return null;
   const { notify, setStatus } = ui;
-  if (typeof notify !== "function" || typeof setStatus !== "function") return null;
-  return { notify: (message, type) => notify.call(ui, message, type), setStatus: (key, text) => setStatus.call(ui, key, text) };
+  const found: UI = {
+    notify: typeof notify === "function" ? (message, type) => notify.call(ui, message, type) : null,
+    setStatus: typeof setStatus === "function" ? (key, text) => setStatus.call(ui, key, text) : null,
+  };
+  return found.notify === null && found.setStatus === null ? null : found;
 }
 
 /** A header record as `Headers`, skipping values that are not strings (pi deletes a header set to null). */
@@ -167,8 +172,8 @@ function show(ui: UI | null, report: Report, subject: string | null): void {
   const text = subject === null ? describeReport(report) : `${describeReport(report)} (${subject})`;
   // Each channel on its own: one that throws silences neither the other nor the request guard it runs in, where
   // a UI that throws must not turn a block into a send.
-  attempt(() => ui.setStatus(STATUS_KEY, text));
-  if (!isQuiet(report)) attempt(() => ui.notify(text, report.kind === "refused" || report.kind === "blocked" ? "error" : "warning"));
+  attempt(() => ui.setStatus?.(STATUS_KEY, text));
+  if (!isQuiet(report)) attempt(() => ui.notify?.(text, report.kind === "refused" || report.kind === "blocked" ? "error" : "warning"));
 }
 
 /** Runs one UI call; what it throws is dropped, since nothing the plugin decides depends on being shown. */
@@ -325,7 +330,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     // belong to the session before.
     client.newSession();
     try {
-      ui?.setStatus(STATUS_KEY, undefined);
+      ui?.setStatus?.(STATUS_KEY, undefined);
     } catch {
       // The line stays if the UI will not clear it; /route still says no result is known in this session.
     }
@@ -342,7 +347,7 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
     handler: async (args, ctx) => {
       const tell = (message: string, type: "info" | "error"): void => {
         try {
-          ui?.notify(message, type);
+          ui?.notify?.(message, type);
         } catch {
           // The command's effect stands; only its message is lost.
         }
