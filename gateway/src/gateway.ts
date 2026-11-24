@@ -168,7 +168,8 @@ export function createGateway(config: unknown): RequestHandler {
   const models = new Map<string, LoadedRoute[]>();
   const data = [];
   for (const [id, rawRoutes] of Object.entries(record(source.models, "models"))) {
-    if (id === "" || splitModel(id).policy !== null || !Array.isArray(rawRoutes)) throw new TypeError("invalid model entry");
+    if (id === "" || splitModel(id).policy !== null) throw new TypeError("invalid model id");
+    if (!Array.isArray(rawRoutes)) throw new TypeError("model routes must be a list");
     const routes: LoadedRoute[] = [];
     const published = [];
     const providers = new Set<string>();
@@ -263,7 +264,7 @@ export function createGateway(config: unknown): RequestHandler {
       } catch {
         continue;
       }
-      if (upstream.status === 429 || upstream.status >= 500 || upstream.status < 200) {
+      if (upstream.status === 429 || upstream.status >= 500) {
         // Cancellation is best effort and must not delay trying the next route.
         void upstream.body?.cancel().catch(() => {});
         continue;

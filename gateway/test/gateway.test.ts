@@ -12,6 +12,13 @@ const routes: Route[] = [
 ];
 const keys = { open: {}, locked: { policy: "zdr" }, region: { policy: "region=us" }, precise: { policy: "bits=16" }, attest: { policy: "attest=weights" }, preferences: { policy: "sort=price+order=basalt" } };
 const resultNames = ["route-applied", "route-refused", "route-evidence"];
+const hopHeaders = {
+  connection: "x-hop-first, X-Hop-Second", "x-hop-first": "discard", "x-hop-second": "discard",
+  "keep-alive": "timeout=5", "proxy-connection": "keep-alive", "proxy-authenticate": "Basic realm=proxy",
+  "proxy-authorization": "Basic ZGVtbw==", te: "trailers", trailer: "x-end", "transfer-encoding": "chunked", upgrade: "websocket",
+};
+const catalog = (entries: readonly Route[]) => ({ object: "list", data: [{ id: model, routes: entries.map(({ provider, facts, evidence }) =>
+  ({ provider, facts, ...(evidence === undefined ? {} : { evidence }) })) }] });
 const formatBody = (id: string, stream: boolean) => JSON.stringify({ model: id, stream, input: "content" });
 
 interface Recorded {
@@ -49,7 +56,7 @@ async function assertRefusal(response: Response, status: number, reason: string)
   assert.equal(response.headers.get("route-refused"), reason);
   assert.equal(response.headers.get("route-applied"), null);
   assert.equal(response.headers.get("route-evidence"), null);
-  return response.json();
+  return response.json().catch((error: unknown) => assert.fail(`expected the gateway's JSON refusal body: ${String(error)}`));
 }
 
 for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
@@ -84,24 +91,31 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
   });
 
   test(`G3 G4 G10 G11 G12 G13 ${mode}: three carriers narrow, and unsatisfiable sends nothing`, async () => {
-    const { gateway, calls } = setup();
+    const germanRoute: Route = { ...routes[2]!, provider: "delta", url: "http://delta.example/v1", facts: "region=de" };
+    const { gateway, calls } = setup(undefined, { models: { [model]: [...routes, germanRoute] } });
     for (const [id, key, header] of [
-      [model, "open", "bits=64"], [model, "open", "ignore=aurora,basalt,cobalt"],
+      [model, "open", "bits=64"], [model, "open", "ignore=aurora,basalt,cobalt,delta"],
       [`${model}+region=de`, "open", "region=us"], [`${model}+only=aurora`, "open", "only=basalt"],
+      [`${model}+region=us`, "open", "region=de"], [`${model}+only=basalt`, "open", "only=aurora"],
       [`${model}+bits=16`, "open", "zdr"], [`${model}+only=aurora`, "open", "ignore=aurora"],
       [`${model}+only=basalt`, "locked", undefined], [model, "locked", "only=basalt"], [`${model}+bits=16`, "locked", "region=us,de"],
       [`${model}+bits=1`, "precise", "only=aurora"], [`${model}+region=us,de`, "region", "only=basalt"],
-      [`${model}+attest=prompt`, "attest", "only=aurora"],
+      [`${model}+attest=prompt`, "attest", "only=aurora"], [model, "attest", "only=aurora"],
     ] as const) await assertRefusal(await gateway(call(id, key, header)), 400, "reason=unsatisfiable");
     assert.equal(calls.length, 0);
-    const bound = await gateway(call(model, "locked"));
-    assert.equal(bound.headers.get("route-applied"), "provider=aurora");
+    for (const [id, key, header, provider] of [
+      [model, "locked", undefined, "aurora"], [model, "precise", undefined, "basalt"],
+      [model, "open", "region=us", "aurora"], [`${model}+region=de`, "open", undefined, "delta"],
+    ] as const) {
+      const relayed = await gateway(call(id, key, header));
+      assert.equal(relayed.headers.get("route-applied"), `provider=${provider}`);
+    }
     const narrowed = await gateway(call(`${model}+bits=1+only=aurora,basalt`, "locked", "region=us,de+ignore=cobalt"));
     assert.equal(narrowed.headers.get("route-applied"), "provider=aurora");
-    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "aurora"]);
+    assert.deepEqual(calls.map((row) => row.provider), ["aurora", "basalt", "aurora", "delta", "aurora"]);
   });
 
-  test(`G5 G6 G7 G14 G15 G17 G18 G19 G32 G33 G37 S19 ${mode}: relay only the matching route with owned headers and exactly one top-level model`, async () => {
+  test(`G6 G7 G14 G15 G17 G18 G19 G23 G32 G33 S19 ${mode}: relay only the matching route, strip hop-by-hop and provider result headers, and rewrite only the top-level model`, async () => {
     const payload = stream ? ["data: served by ", "basalt\n\n"] : ["{\"text\":", "\"served by basalt\"}"];
     const { gateway, calls } = setup(() => {
       let i = 0;
@@ -110,37 +124,51 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
         if (part === undefined) controller.close(); else controller.enqueue(new TextEncoder().encode(part));
       } }), { status: 422, headers: {
         "route-applied": "provider=aurora,provider=cobalt", "route-refused": "reason=unsatisfiable", "route-evidence": "https://other.example/",
-        "connection": "x-upstream-hop", "x-upstream-hop": "discard", "x-keep": "yes", "content-type": stream ? "text/event-stream" : "application/json",
+        ...hopHeaders, "x-keep": "yes", "content-type": stream ? "text/event-stream" : "application/json", "content-length": "999",
       } });
     });
     const raw = String.raw`{"mo\u0064el":false,"tools":[{"model":"caller","model":"nested"}],"large":123456789012345678901,"model":"demo-model+attest=prompt+order=cobalt","stream":${stream}}`;
-    const response = await gateway(inference(endpoint, raw, "attest", { "Route-Policy": "bits=16+sort=latency", "x-api-key": "attest", connection: "x-request-hop", "x-request-hop": "discard", "x-keep": "yes", host: "client.example", "content-length": "23" }));
+    const response = await gateway(inference(endpoint, raw, "attest", {
+      ...hopHeaders, "Route-Policy": "bits=16+sort=latency", "x-api-key": "attest", "x-keep": "yes",
+      host: "client.example", "content-length": "23", expect: "100-continue", "content-encoding": "gzip", "accept-encoding": "br",
+    }));
     assert.equal(response.status, 422);
     assert.equal(await response.text(), payload.join(""));
     assert.equal(response.headers.get("route-applied"), "provider=basalt");
     assert.equal(response.headers.get("route-evidence"), evidence);
     assert.equal(response.headers.get("route-refused"), null);
-    assert.equal(response.headers.get("x-upstream-hop"), null);
+    for (const name of [...Object.keys(hopHeaders), "content-length"]) assert.equal(response.headers.get(name), null, name);
     assert.equal(response.headers.get("x-keep"), "yes");
     assert.deepEqual(calls.map((row) => row.provider), ["basalt"]);
     const [upstream] = calls;
     assert.ok(upstream);
     assert.equal(upstream.path, `/v1/${endpoint}`);
     assert.equal(upstream.body, `{"model":"upstream-model","tools":[{"model":"caller","model":"nested"}],"large":123456789012345678901,"stream":${stream}}`);
-    for (const name of ["route-policy", "connection", "x-request-hop", "host", "content-length"]) assert.equal(upstream.headers.get(name), null, name);
+    for (const name of [...Object.keys(hopHeaders), "route-policy", "host", "content-length", "expect", "content-encoding"]) {
+      assert.equal(upstream.headers.get(name), null, name);
+    }
+    assert.equal(upstream.headers.get("accept-encoding"), "identity");
     assert.equal(upstream.headers.get("x-keep"), "yes");
     assert.equal(upstream.headers.get("authorization"), endpoint === "messages" ? null : "Bearer upstream-key");
     assert.equal(upstream.headers.get("x-api-key"), endpoint === "messages" ? "upstream-key" : null);
     assert.equal(upstream.redirect, "manual");
 
     const published = await gateway(new Request(`${root}/models`));
-    assert.deepEqual(await published.json(), { object: "list", data: [{ id: model, routes: routes.map(({ provider, facts, evidence }) => ({ provider, facts, ...(evidence === undefined ? {} : { evidence }) })) }] });
+    assert.deepEqual(await published.json(), catalog(routes));
     const noAttest = await gateway(call(model, "open", "only=basalt"));
     assert.equal(noAttest.headers.get("route-evidence"), null);
-    assert.deepEqual(calls.map((row) => row.provider), ["basalt", "basalt"]);
+    const keyOnly = await gateway(call(model, "attest"));
+    assert.equal(keyOnly.headers.get("route-applied"), "provider=basalt");
+    assert.equal(keyOnly.headers.get("route-evidence"), evidence);
+    const defaultModel = await gateway(call(`${model}+only=aurora`));
+    assert.equal(defaultModel.headers.get("route-applied"), "provider=aurora");
+    assert.equal(calls[3]!.body, JSON.stringify({ model, stream, input: "content" }));
+    const plain = await gateway(call());
+    noHeaders(plain);
+    assert.deepEqual(calls.map((row) => row.provider), ["basalt", "basalt", "basalt", "aurora", "aurora"]);
   });
 
-  test(`G5 G16 G26 G33 G34 G35 G37 G39 ${mode}: retry eligible failures; without policy keep the relayed status and omit refusal and evidence`, async () => {
+  test(`G5 G18 G26 G33 G34 G35 G37 G39 ${mode}: retry eligible failures; name the retried provider and strip its result headers without policy`, async () => {
     const { gateway, calls } = setup(({ provider }) => {
       if (provider === "aurora") return new Response("do not relay 429", { status: 429 });
       if (provider === "basalt") throw new TypeError("network error");
@@ -156,6 +184,7 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
     assert.equal(await relayed.text(), "upstream result");
     assert.deepEqual(calls.splice(0).map((row) => row.provider), ["basalt", "cobalt"]);
     const plain = await gateway(call());
+    assert.equal(plain.headers.get("route-applied"), null);
     assert.equal(plain.headers.get("route-refused"), null);
     assert.equal(plain.headers.get("route-evidence"), null);
     assert.equal(plain.status, 418);
@@ -210,20 +239,24 @@ for (const endpoint of ENDPOINTS) for (const stream of [false, true]) {
 }
 
 test("G20 G21 G22 G23 G38: advertise the actual subset, publish independent facts, reveal only the supplied key's policy", async () => {
-  const { gateway } = setup(undefined, { accept: { keys: ["zdr", "sort", "attest", "only", "bits", "region", "ignore", "order"], attest: ["weights"], sort: ["price"] }, keys: { open: {}, locked: { policy: "sort=price+zdr" } } });
+  const { gateway } = setup(undefined, {
+    accept: { keys: ["zdr", "sort", "attest", "only", "bits", "region", "ignore", "order"], attest: ["weights"], sort: ["price"] },
+    keys: { open: {}, locked: { policy: "sort=price+zdr" }, precise: { policy: "bits=16" } },
+  });
   const detection = { route_policy: "1", keys: ["zdr", "sort", "attest", "only", "bits", "region", "ignore", "order"], attest: ["weights"], sort: ["price"] };
   for (const [headers, expected] of [
     [{}, detection], [{ authorization: "Bearer unknown" }, detection], [{ authorization: "Bearer open" }, detection],
     [{ "x-api-key": "locked" }, { ...detection, key_policy: "sort=price+zdr" }],
     [{ authorization: "Bearer locked" }, { ...detection, key_policy: "sort=price+zdr" }],
+    [{ "x-api-key": "precise" }, { ...detection, key_policy: "bits=16" }],
+    [{ authorization: "Bearer precise" }, { ...detection, key_policy: "bits=16" }],
   ] as const) {
     const response = await gateway(new Request(`${root}/route-policy`, { headers }));
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), expected);
   }
   const models: unknown = await (await gateway(new Request(`${root}/models`))).json();
-  assert.match(JSON.stringify(models), /zdr\+notrain\+bits=8\+region=us/);
-  assert.match(JSON.stringify(models), /attest=weights,prompt/);
+  assert.deepEqual(models, catalog(routes));
   for (const [policy, key] of [["notrain", "notrain"], ["attest=prompt", "attest"], ["attest=weights,prompt", "attest"], ["sort=latency", "sort"]]) {
     await assertRefusal(await gateway(inference("chat/completions", formatBody(model, false), "open", { "Route-Policy": policy! })), 400, `reason=unsupported+key=${key}`);
   }
@@ -235,20 +268,36 @@ test("G20 G21 G22 G23 G38: advertise the actual subset, publish independent fact
 
 test("G36 G32: reject invalid configuration at startup and keep the validated route facts independent of caller mutation", async () => {
   const route = routes[0]!;
-  for (const invalid of [
-    null, [], {}, { models: null }, { models: { "": [route] } }, { models: { "x+zdr": [route] } }, { models: { x: {} } },
-    { models: { x: [route, route] } }, { models: { x: [{ ...route, provider: "Aurora" }] } },
-    { models: { x: [{ ...route, facts: "zdr+unknown" }] } }, { models: { x: [{ ...route, facts: [] }] } },
-    { models: { x: [{ ...route, facts: "attest=weights" }] } }, { models: { x: [{ ...route, evidence: "http://a.example/" }] } },
-    { models: { x: [{ ...route, url: "ftp://aurora.example/v1" }] } }, { models: { x: [{ ...route, url: "https://aurora.example/v1?" }] } },
-    { models: { x: [{ ...route, url: "https://username@aurora.example/v1" }] } }, { models: { x: [{ ...route, url: "https://aurora.example/v2" }] } },
-    { models: { x: [{ ...route, price: NaN }] } }, { models: { x: [{ ...route, latencyMs: -1 }] } }, { models: { x: [{ ...route, throughput: "4" }] } },
-    { models: { x: [{ ...route, apiKey: "key\r\nOther: bad" }] } }, { models: { x: [{ ...route, model: "" }] } },
-    ...[null, "", "bits=01", "zdr+zdr", "later", `ignore=${"a".repeat(512)}`].map((policy) => ({ models: {}, keys: { k: { policy } } })),
-    { models: {}, keys: { k: { policy: "attest=prompt" } }, accept: { attest: ["weights"] } },
-    { models: {}, keys: { k: { policy: "zdr" } }, accept: { keys: ["only"] } },
-    { models: {}, accept: { keys: ["later"] } }, { models: {}, accept: { sort: "price" } }, { models: {}, fetch: "fetch" },
-  ]) assert.throws(() => createGateway(invalid), Error, JSON.stringify(invalid));
+  const withRoute = (patch: object) => ({ models: { x: [{ ...route, ...patch }] } });
+  const withPolicy = (policy: unknown) => ({ models: {}, keys: { k: { policy } } });
+  for (const [invalid, message] of [
+    [null, /^config must be an object$/], [[], /^config must be an object$/],
+    [{}, /^models must be an object$/], [{ models: null }, /^models must be an object$/],
+    [{ models: { "": [route] } }, /^invalid model id$/], [{ models: { "x+zdr": [route] } }, /^invalid model id$/],
+    [{ models: { x: {} } }, /^model routes must be a list$/],
+    [{ models: { x: [route, route] } }, /^invalid or repeated provider for model x$/],
+    [withRoute({ provider: "Aurora" }), /^invalid or repeated provider for model x$/],
+    [withRoute({ facts: "zdr+unknown" }), /^invalid route facts:/], [withRoute({ facts: [] }), /^route facts must be a string$/],
+    [withRoute({ facts: "attest=weights" }), /^invalid or missing evidence URI$/],
+    [withRoute({ evidence: "http://a.example/" }), /^invalid or missing evidence URI$/],
+    ...["ftp://aurora.example/v1", "https://aurora.example/v1?", "https://aurora.example/v1?x=/v1", "https://aurora.example/v2"]
+      .map((url) => [withRoute({ url }), /^provider url must be an HTTP\(S\) base URL ending in \/v1$/] as const),
+    [withRoute({ url: "https://username@aurora.example/v1" }), /^invalid provider base URL$/],
+    [withRoute({ price: NaN }), /^price must be a finite nonnegative number$/],
+    [withRoute({ latencyMs: -1 }), /^latencyMs must be a finite nonnegative number$/],
+    [withRoute({ throughput: "4" }), /^throughput must be a finite nonnegative number$/],
+    [withRoute({ apiKey: "key\r\nOther: bad" }), /^invalid provider apiKey$/],
+    [withRoute({ model: "" }), /^invalid provider model id$/],
+    [{ models: {}, keys: { "bad key": {} } }, /^invalid gateway key$/],
+    [withPolicy(null), /^key policy must be a string$/],
+    ...["", "bits=01", "zdr+zdr", "later", `ignore=${"a".repeat(512)}`].map((policy) => [withPolicy(policy), /^invalid key policy:/] as const),
+    [{ ...withPolicy("attest=prompt"), accept: { attest: ["weights"] } }, /^invalid key policy:/],
+    [{ ...withPolicy("zdr"), accept: { keys: ["only"] } }, /^invalid key policy:/],
+    [{ models: {}, accept: { keys: ["later"] } }, /^invalid accept.keys entry$/],
+    [{ models: {}, accept: { keys: ["zdr", "zdr"] } }, /^invalid accept.keys entry$/],
+    [{ models: {}, accept: { sort: "price" } }, /^accept.sort must be a list$/],
+    [{ models: {}, fetch: "fetch" }, /^fetch must be a function$/],
+  ] as const) assert.throws(() => createGateway(invalid), { name: "TypeError", message }, JSON.stringify(invalid));
 
   const mutable = { ...route, facts: "zdr" };
   const { gateway, calls } = setup(undefined, { models: { [model]: [mutable] } });
@@ -263,6 +312,9 @@ test("G36 G32: reject invalid configuration at startup and keep the validated ro
 test("G11 G35: sort keys and explicit order rank every retry, with suffix over header over key per preference", async () => {
   const { gateway, calls } = setup(() => new Response("retry", { status: 500 }));
   for (const [suffix, key, header, expected] of [
+    [undefined, "preferences", undefined, ["basalt", "cobalt", "aurora"]],
+    [undefined, "preferences", "sort=throughput", ["basalt", "aurora", "cobalt"]],
+    [undefined, "preferences", "order=cobalt", ["cobalt", "basalt", "aurora"]],
     ["sort=price", "open", undefined, ["basalt", "cobalt", "aurora"]],
     ["sort=latency", "open", undefined, ["cobalt", "aurora", "basalt"]],
     ["sort=throughput", "open", undefined, ["aurora", "basalt", "cobalt"]],
@@ -271,7 +323,8 @@ test("G11 G35: sort keys and explicit order rank every retry, with suffix over h
     ["order=cobalt", "preferences", "order=aurora+sort=throughput", ["cobalt", "aurora", "basalt"]],
     ["order=cobalt,basalt", "open", "sort=throughput", ["cobalt", "basalt", "aurora"]],
   ] as const) {
-    const response = await gateway(inference("chat/completions", formatBody(`${model}+${suffix}`, false), key, header === undefined ? undefined : { "Route-Policy": header }));
+    const id = suffix === undefined ? model : `${model}+${suffix}`;
+    const response = await gateway(inference("chat/completions", formatBody(id, false), key, header === undefined ? undefined : { "Route-Policy": header }));
     await assertRefusal(response, 503, "reason=unavailable");
     assert.deepEqual(calls.splice(0).map(({ provider }) => provider), expected);
   }

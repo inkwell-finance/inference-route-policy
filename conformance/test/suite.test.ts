@@ -3,12 +3,14 @@ import { once } from "node:events";
 import { createServer, request as relayRequest } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
+import { brotliCompressSync, deflateSync, gzipSync, zstdCompressSync } from "node:zlib";
 import { combinePolicies, formatApplied, formatRefused, parsePolicy, REFUSAL_STATUS, splitModel, type RefusalReason } from "../../core/src/index.ts";
 import { startDemo } from "../../gateway/src/demo.ts";
 import { createGateway, type RequestHandler, type Route } from "../../gateway/src/gateway.ts";
 import { serve } from "../../gateway/src/serve.ts";
+import { parseBase, request as wireRequest } from "../src/http.ts";
 import { auditResults } from "../src/outcomes.ts";
-import { INFERENCE_ENDPOINTS, runConformance, type Endpoint } from "../src/suite.ts";
+import { INFERENCE_ENDPOINTS, runConformance, type Endpoint, type Report } from "../src/suite.ts";
 
 const key = "probe-key";
 const policyKey = "probe-policy-key";
@@ -100,7 +102,8 @@ const faults: Record<Id, Mutation> = {
   G7: ({ header, next, rewrite }) => header === "zdr+order=basalt" ? rewrite({ header: "only=routeprobe0" }) : next(),
   G8: ({ suffix, header, next, rewrite }) => suffix === "bits=64" && header === null ? rewrite({ suffix: null }) : next(),
   G9: ({ request, transport, next }) => transport?.repeatedRoutePolicy ? good(request) : next(),
-  G10: ({ request, auth, header, suffix, next, rewrite }) => request.method === "POST" && auth?.endsWith(policyKey) && header === null && suffix === null ? rewrite({ neutralKey: true }) : next(),
+  G10: ({ request, auth, header, suffix, next, rewrite }) => request.method === "POST" && auth?.endsWith(policyKey) && header === null && suffix === null
+    ? rewrite({ neutralKey: true, header: "only=basalt" }) : next(),
   G11: ({ header, suffix, next, rewrite }) => header === "only=x,x" && suffix === "bits=0" ? rewrite({ header: suffix, suffix: header }) : next(),
   G12: ({ header, suffix, next, rewrite }) => header === "region=us" && suffix === "region=de" ? rewrite({ header: "region=us,de", suffix: null }) : next(),
   G13: ({ auth, header, suffix, next, rewrite }) => auth?.endsWith(policyKey) && header !== null && suffix !== null ? rewrite({ neutralKey: true }) : next(),
@@ -114,7 +117,7 @@ const faults: Record<Id, Mutation> = {
   },
   G19: async ({ header, next }) => {
     const reply = await next();
-    return header === "zdr" ? change(reply, { replace: { [refusal]: formatRefused("unsatisfiable") } }) : reply;
+    return header === "bits=64" ? change(reply, { replace: { [applied]: formatApplied("aurora") } }) : reply;
   },
   G20: async ({ path, auth, next }) => path === "/v1/route-policy" && auth === null ? Response.json({ route_policy: 1 }) : next(),
   G21: async ({ path, next }) => {
@@ -127,7 +130,7 @@ const faults: Record<Id, Mutation> = {
   G22: async ({ path, auth, next }) => path === "/v1/route-policy" && auth === null ? Response.json({ route_policy: "1", key_policy: "zdr" }) : next(),
   G23: async ({ path, next }) => path === "/v1/models" ? Response.json({ data: [{ id: model, routes: [...published, published[0]] }] }) : next(),
   G24: ({ header, next, rewrite }) => header === "order=routeprobe0" ? rewrite({ header: "only=routeprobe0" }) : next(),
-  G25: async ({ id, header, next }) => id.startsWith("route-conformance-unknown-") && header !== null ? Response.json({ error: { message: "checked policy before own error" } }, { status: 400, headers: { [refusal]: formatRefused("unsupported", "routeprobeinvalid") } }) : next(),
+  G25: ({ body, header, next }) => typeof body.model === "number" && header === "bits=0" ? protocolError("unsupported", "bits") : next(),
   G26: async ({ request, auth, header, suffix, next }) => {
     const reply = await next();
     return request.method === "POST" && reply.ok && auth?.endsWith(key) && header === null && suffix === null ? change(reply, { replace: { [evidence]: "https://aurora.example/" } }) : reply;
@@ -151,13 +154,58 @@ async function run(t: TestContext, handler: RequestHandler, endpoints: readonly 
   return runConformance({ base: await baseAt(t, serve(handler, 0), path), key, policyKey, endpoints });
 }
 
+function assertFailure(report: Report, id: string, detail: RegExp) {
+  const verdict = report.checks.find((check) => check.id === id);
+  assert.equal(verdict?.status, "FAIL", JSON.stringify(report.checks.filter((check) => check.status !== "PASS")));
+  assert.match(verdict.detail, detail);
+}
+
 test(`${idList.join(" ")}: the reference implementation passes every black-box check without model or provider assumptions`, async (t) => {
-  const report = await run(t, good);
+  const otherRoutes = routes.map((route, i) => ({ ...route, provider: ["first-x", "second_y", "third.z"][i]! }));
+  const renamed = createGateway({
+    models: { [model]: otherRoutes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
+    fetch: (url: string) => Response.json({ text: `served by ${new URL(url).hostname}` }),
+  });
+  const intersections = new Set<string>();
+  const report = await run(t, fixture(({ id, header, suffix, next }) => {
+    if (id === model && header?.startsWith("only=") && suffix?.startsWith("only=")) {
+      intersections.add(`${header}|${suffix}`);
+    }
+    return next();
+  }, renamed));
   assert.deepEqual(new Set(report.checks.map(({ id }) => id)), new Set(idList));
   assert.deepEqual(report.checks.filter((c) => c.status !== "PASS"), []);
   assert.equal(report.passed, idList.length);
   for (const { detail } of report.checks) assert.match(detail, /; observed \d+ × HTTP \d{3}/);
+  assert.ok(intersections.has("only=first-x|only=second_y"));
+  assert.ok(intersections.has("only=second_y|only=first-x"));
 });
+
+const faultDetails: Record<Id, RegExp> = {
+  G1: /required: the policy must be refused as unsupported$/,
+  G2: /"refused":\["reason=unsupported\+key=only"\].*; required: the first failure names bits$/,
+  G3: /"refused":\["reason=unavailable"\].*; required: HTTP 400 with only a valid unsatisfiable refusal$/,
+  G6: /"applied":\["provider=cobalt"\].*; required: the named published route must meet/,
+  G7: /required: an accepted preference cannot disqualify the matching published routes$/,
+  G8: /required: no published route meets even the known suffix requirements$/,
+  G9: /"refused":\["reason=unsupported\+key=only"\].*; required: two raw Route-Policy lines return 400 unsupported without a key$/,
+  G10: /"applied":\["provider=basalt"\].*; required: the relayed route must meet the detected key default/,
+  G11: /required: swapping malformed carriers reports only, the header's first failure$/,
+  G12: /required: 400 unsatisfiable for an empty intersection in either carrier order$/,
+  G13: /required: neither explicit carrier can weaken the detected key default$/,
+  G15: /"applied":\[\].*; required: one valid Route-Applied naming a published provider for this model$/,
+  G17: /required: Route-Evidence exactly matches the applied route's published URI$/,
+  G19: /"refused":\["reason=unsatisfiable"\].*; required: a refusal has neither Route-Applied nor Route-Evidence$/,
+  G20: /required: a complete valid detection reply: is not the string "1"$/,
+  G21: /required: unlisted sort refuses sort=throughput$/,
+  G22: /required: key_policy absent for anonymous detection$/,
+  G23: /required: invalid or repeated provider on .*"provider":"aurora"/,
+  G24: /required: an unknown provider id does not remove the remaining matching routes$/,
+  G25: /"status":400,.*"refused":\["reason=unsupported\+key=bits"\].*; required: the same ordinary error status 400 as the no-policy control, with no result headers$/,
+  G26: /required: no Route-Refused or Route-Evidence without a policy$/,
+  G29: /required: unsupported takes precedence over unsatisfiable$/,
+  G34: /required: the refusal uses this endpoint's ordinary error format; \$\.error has type string/,
+};
 
 for (const id of idList) test(`${id}: conformance rejects the gateway that breaks this requirement`, async (t) => {
   const report = await run(t, fixture(faults[id]));
@@ -165,19 +213,22 @@ for (const id of idList) test(`${id}: conformance rejects the gateway that break
   assert.ok(failure);
   assert.equal(failure.status, "FAIL", JSON.stringify(report.checks.filter((check) => check.status !== "PASS")));
   assert.match(failure.detail, /sent \{.*; received .*; required:/);
+  assert.match(failure.detail, faultDetails[id]);
   assert.ok(report.failed > 0);
 });
 
 test("G20 G22: an anonymous key_policy makes the full detection reply invalid", async (t) => {
   const report = await run(t, fixture(faults.G22));
-  for (const id of ["G20", "G22"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+  assertFailure(report, "G20", /required: .*is present in a reply to a request without credentials$/);
+  assertFailure(report, "G22", faultDetails.G22);
 });
 
 test("G20 G22: a credentialed key_policy must use its own complete advertised support", async (t) => {
   const report = await run(t, fixture(({ path, auth, next }) => path === "/v1/route-policy" && auth === `Bearer ${policyKey}`
     ? Response.json({ route_policy: "1", keys: ["sort"], sort: ["price"], key_policy: "sort=latency" })
     : next()));
-  for (const id of ["G20", "G22"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+  assertFailure(report, "G20", /required: a complete valid detection reply: .*value not accepted$/);
+  assertFailure(report, "G22", /required: key_policy valid under the advertised lists: .*value not accepted$/);
 });
 
 test("G23: a catalog cannot substitute a display alias for its base entry", async (t) => {
@@ -197,12 +248,227 @@ test("G23: a display alias may appear before its base entry", async (t) => {
   assert.equal(report.failed, 0);
 });
 
+for (const variation of ["content-length", "chunked", "mixed-case headers", "extra headers", "informational replies", "stacked field lines"] as const) {
+  test(`G9 G19 G20 G23 G34: inspect final responses with ${variation}`, async (t) => {
+    const upstream = await baseAt(t, serve(good, 0), "");
+    const exercised = new Set<string>();
+    const proxy = createServer((incoming, outgoing) => {
+      const target = new URL(incoming.url ?? "/", upstream);
+      const relay = relayRequest(target, { method: incoming.method, headers: incoming.rawHeaders }, async (reply) => {
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of reply) chunks.push(chunk);
+          const bytes = Buffer.concat(chunks);
+          const headers: string[] = [];
+          const payload = variation === "stacked field lines" ? brotliCompressSync(gzipSync(bytes)) : bytes;
+          let result = false;
+          for (let i = 0; i < reply.rawHeaders.length; i += 2) {
+            const name = reply.rawHeaders[i]!.toLowerCase();
+            if (["connection", "keep-alive", "content-length", "transfer-encoding"].includes(name)) continue;
+            result ||= name.startsWith("route-");
+            headers.push(variation === "mixed-case headers" ? name.replace(/(^|-)[a-z]/g, (s) => s.toUpperCase()) : name, reply.rawHeaders[i + 1]!);
+          }
+          if (variation === "stacked field lines") headers.push("Content-Encoding", "gzip", "content-encoding", "br");
+          if (variation === "extra headers") headers.push("x-opaque-peer", "ignored", "trailer", "x-final-tag");
+          if (variation === "informational replies") {
+            outgoing.writeContinue();
+            outgoing.writeEarlyHints({ link: "</hint>; rel=preload", [refusal]: "not-a-final-result" });
+          }
+          const split = variation === "chunked" && payload.length > 1;
+          if (!split && variation !== "extra headers") headers.push("content-length", String(payload.length));
+          outgoing.writeHead(reply.statusCode!, headers);
+          if (split) {
+            outgoing.write(payload.subarray(0, 1));
+            // Leave the first chunk readable before sending the second.
+            await delay(5);
+          }
+          if (variation === "extra headers") outgoing.addTrailers({ "x-final-tag": "also ignored" });
+          if (result || incoming.method === "GET") exercised.add(incoming.method === "GET" ? target.pathname : reply.statusCode === 400 ? "refusal" : "relay");
+          outgoing.end(split ? payload.subarray(1) : payload);
+        } catch {
+          outgoing.destroy();
+        }
+      });
+      relay.on("error", () => outgoing.destroy());
+      incoming.pipe(relay);
+    }).listen(0, "127.0.0.1");
+    const base = await baseAt(t, proxy);
+    const interim: number[] = [];
+    const chunkSizes: number[] = [];
+    const final = await new Promise<{ headers: string[]; trailers: string[] }>((resolve, reject) => {
+      const probe = relayRequest(`${base}/route-policy`, (reply) => {
+        reply.on("error", reject);
+        reply.on("end", () => resolve({ headers: reply.rawHeaders, trailers: reply.rawTrailers }));
+        reply.on("data", (chunk: Buffer) => chunkSizes.push(chunk.length));
+      });
+      probe.on("information", ({ statusCode }) => interim.push(statusCode));
+      probe.on("error", reject);
+      probe.end();
+    });
+    if (variation === "content-length") assert.ok(final.headers.includes("content-length"));
+    if (variation === "chunked") {
+      assert.ok(final.headers.includes("chunked"));
+      assert.equal(chunkSizes[0], 1);
+      assert.ok(chunkSizes.length > 1);
+    }
+    if (variation === "mixed-case headers") assert.ok(final.headers.includes("Content-Type"));
+    if (variation === "extra headers") {
+      assert.ok(final.headers.includes("x-opaque-peer"));
+      assert.deepEqual(final.trailers, ["x-final-tag", "also ignored"]);
+    }
+    if (variation === "informational replies") assert.deepEqual(interim, [100, 103]);
+    if (variation === "stacked field lines") assert.deepEqual(final.headers.filter((value) => value.toLowerCase() === "content-encoding"), ["Content-Encoding", "content-encoding"]);
+    exercised.clear();
+    const report = await runConformance({ base, key, policyKey, endpoints: ["chat/completions"] });
+    assert.deepEqual(exercised, new Set(["/v1/route-policy", "/v1/models", "refusal", "relay"]));
+    assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+  });
+}
+
+test("G20 G23: HEAD may be rejected and OPTIONS may return 204; discovery uses GET", async (t) => {
+  const methods = new Set<string>();
+  const base = await baseAt(t, serve(async (request, transport) => {
+    methods.add(`${request.method} ${new URL(request.url).pathname}`);
+    if (request.method === "HEAD") return new Response(null, { status: 405 });
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { allow: "GET, OPTIONS" } });
+    return good(request, transport);
+  }, 0));
+  const metadata = ["route-policy", "models"];
+  for (const path of metadata) {
+    assert.equal((await fetch(`${base}/${path}`, { method: "HEAD" })).status, 405);
+    assert.equal((await fetch(`${base}/${path}`, { method: "OPTIONS" })).status, 204);
+  }
+  assert.deepEqual(methods, new Set(metadata.flatMap((name) => [`HEAD /v1/${name}`, `OPTIONS /v1/${name}`])));
+  methods.clear();
+  const report = await runConformance({ base, key, policyKey, endpoints: ["chat/completions"] });
+  assert.deepEqual(methods, new Set(["GET /v1/route-policy", "GET /v1/models", "POST /v1/chat/completions"]));
+  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+});
+
+test("G23: a 204 empty catalog leaves route publication unverified", async (t) => {
+  let catalogs = 0;
+  const report = await run(t, fixture(({ path, next }) => {
+    if (path !== "/v1/models") return next();
+    catalogs++;
+    return new Response(null, { status: 204 });
+  }));
+  assert.equal(catalogs, 2);
+  const verdict = report.checks.find(({ id }) => id === "G23");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, /model list.*HTTP 204/);
+  assert.equal(report.failed, 0);
+});
+
+const contentCodings = [
+  ["gzip", gzipSync],
+  ["X-GZip", gzipSync],
+  ["deflate", deflateSync],
+  ["br", brotliCompressSync],
+  ["zstd", zstdCompressSync],
+  ["gzip, identity, br", (body: Uint8Array) => brotliCompressSync(gzipSync(body))],
+] as const;
+
+for (const [coding, encode] of contentCodings) test(`G20 G23 G34: decode ${coding} on metadata, errors and relays`, async (t) => {
+  const used = new Set<string>();
+  const handler = fixture(async ({ request, path, next }) => {
+    const reply = await next();
+    if (reply.body === null) return reply;
+    assert.equal(request.headers.get("accept-encoding"), "identity");
+    used.add(request.method === "GET" ? path : reply.headers.has(refusal) ? "refusal" : reply.ok ? "relay" : "ordinary");
+    const headers = new Headers(reply.headers);
+    headers.delete("content-length");
+    headers.set("content-encoding", coding);
+    return new Response(new Uint8Array(encode(new Uint8Array(await reply.arrayBuffer()))), { status: reply.status, headers });
+  });
+  const base = await baseAt(t, serve(handler, 0));
+  const report = await runConformance({ base, key, policyKey, endpoints: ["chat/completions"] });
+  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+  const relay = await wireRequest(parseBase(base), {
+    path: "chat/completions", credential: { header: "authorization", key }, raw: JSON.stringify({ model }), policies: ["zdr"],
+  }, 1_000);
+  assert.deepEqual(relay.body, { text: "served by aurora.example" });
+  assert.deepEqual(used, new Set(["/v1/route-policy", "/v1/models", "ordinary", "refusal", "relay"]));
+});
+
+const uninspectableCases = [
+  ["route-policy", ["G20", "G22"]], ["models", ["G23"]], ["refusal", ["G34"]], ["ordinary", ["G34"]],
+] as const;
+for (const [surface, affected] of uninspectableCases) test(`${affected.join(" ")}: uninspectable content coding on ${surface} names the missing body precondition`, async (t) => {
+  const coding = "x-reversed-octets";
+  let encoded = 0;
+  const report = await run(t, fixture(async ({ request, path, next }) => {
+    const reply = await next();
+    const kind = request.method === "GET" ? path.split("/").at(-1)
+      : reply.headers.has(refusal) ? "refusal" : reply.ok || reply.headers.has(applied) ? "relay" : "ordinary";
+    if (kind !== surface || reply.body === null) return reply;
+    const headers = new Headers(reply.headers);
+    headers.delete("content-length");
+    headers.set("content-encoding", coding);
+    encoded++;
+    return new Response(new Uint8Array(await reply.arrayBuffer()).reverse(), { status: reply.status, headers });
+  }));
+  assert.ok(encoded > 0);
+  assert.deepEqual(report.checks.filter(({ status }) => status === "FAIL"), []);
+  for (const id of affected) {
+    const verdict = report.checks.find((check) => check.id === id);
+    assert.equal(verdict?.status, "SKIP");
+    assert.match(verdict.detail, new RegExp(coding));
+  }
+  if (surface === "refusal" || surface === "ordinary") assert.equal(report.checks.find(({ id }) => id === "G19")?.status, "PASS");
+});
+
+for (const variation of ["charset", "BOM", "trailing whitespace"] as const) test(`G20 G23 G34: ${variation} does not change a JSON envelope`, async (t) => {
+  const varied = new Set<string>();
+  const report = await run(t, fixture(async ({ request, path, next }) => {
+    const reply = await next();
+    if (reply.body === null || !reply.headers.get("content-type")?.startsWith("application/json")
+      || (request.method === "POST" && !reply.headers.has(refusal))) return reply;
+    varied.add(request.method === "GET" ? path : "refusal");
+    const text = await reply.text();
+    return variation === "charset" ? change(reply, { body: text, replace: { "content-type": "Application/JSON; Charset=UTF-8" } })
+      : change(reply, { body: variation === "BOM" ? `\uFEFF${text}` : `${text} \r\n\t` });
+  }));
+  assert.deepEqual(varied, new Set(["/v1/route-policy", "/v1/models", "refusal"]));
+  assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS"), []);
+});
+
+test("G25: an omitted model can use the gateway's default, while a nonstring model still witnesses precedence", async (t) => {
+  const defaults = new Set<string | null>();
+  let defaultChallenges = 0;
+  let rejectedWrongTypes = 0;
+  const report = await run(t, fixture(async ({ path, request, id, body, header, auth, next }) => {
+    if (id === "" && Object.keys(body).length === 0 && await request.clone().text() === "{}") {
+      if (header !== null) {
+        defaultChallenges++;
+        return protocolError("unsupported", "bits");
+      }
+      defaults.add(auth);
+      return good(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify({ model }) }));
+    }
+    const reply = await next();
+    if (path === "/v1/chat/completions" && typeof body.model === "number" && header === "bits=0") {
+      assert.equal(reply.status, 400);
+      assert.equal(reply.headers.has(refusal), false);
+      rejectedWrongTypes++;
+    }
+    return reply;
+  }));
+  assert.ok(defaults.has(`Bearer ${key}`));
+  assert.equal(defaultChallenges, 0);
+  assert.equal(rejectedWrongTypes, 1);
+  const verdict = report.checks.find(({ id }) => id === "G25");
+  assert.equal(verdict?.status, "SKIP");
+  assert.match(verdict.detail, /missing model field.*HTTP 200/);
+  assert.equal(report.failed, 0);
+});
+
 test("G1 G29: an unlisted preference cannot turn into unavailable on an advertisement probe", async (t) => {
   const report = await run(t, fixture(async ({ header, next }) => {
     const reply = await next();
     return header === "sort=probe0" ? change(reply, { status: 503, replace: { [refusal]: formatRefused("unavailable") } }) : reply;
   }));
-  for (const id of ["G1", "G29"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+  assertFailure(report, "G1", /sort=probe0.*reason=unavailable.*; required: HTTP 400 with only a valid unsupported refusal$/);
+  assertFailure(report, "G29", /sort=probe0.*reason=unavailable.*; required: unsupported takes precedence over unavailable$/);
 });
 
 test("G2: unsupported key attribution is also checked on advertisement probes", async (t) => {
@@ -210,7 +476,7 @@ test("G2: unsupported key attribution is also checked on advertisement probes", 
     const reply = await next();
     return header === "sort=probe0" ? change(reply, { replace: { [refusal]: formatRefused("unsupported") } }) : reply;
   }));
-  assert.equal(report.checks.find(({ id }) => id === "G2")?.status, "FAIL");
+  assertFailure(report, "G2", /sort=probe0.*"refused":\["reason=unsupported"\].*; required: the first failure names sort$/);
 });
 
 test("G3: an unsatisfiable reply with a forbidden applied header is not a passing refusal", async (t) => {
@@ -218,7 +484,7 @@ test("G3: an unsatisfiable reply with a forbidden applied header is not a passin
     const reply = await next();
     return header === "bits=64" ? change(reply, { replace: { [applied]: formatApplied("aurora") } }) : reply;
   }));
-  assert.equal(report.checks.find(({ id }) => id === "G3")?.status, "FAIL");
+  assertFailure(report, "G3", /"applied":\["provider=aurora"\],"refused":\["reason=unsatisfiable"\].*; required: HTTP 400 with only a valid unsatisfiable refusal$/);
 });
 
 test("G6: a suffix relay without a provider cannot prove the combined policy was met", async (t) => {
@@ -226,7 +492,7 @@ test("G6: a suffix relay without a provider cannot prove the combined policy was
     const reply = await next();
     return suffix === "zdr" && header === null ? change(reply, { replace: { [applied]: null } }) : reply;
   }));
-  assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
+  assertFailure(report, "G6", /\+zdr.*"applied":\[\].*; required: the named published route must meet/);
 });
 
 test("G10: dropping the key default only on a second model with no qualifying route is detected", async (t) => {
@@ -238,36 +504,36 @@ test("G10: dropping the key default only on a second model with no qualifying ro
   const relays = new Map<string, unknown>();
   const report = await run(t, fixture(async ({ auth, id, suffix, header, next, rewrite }) => {
     if (auth !== `Bearer ${policyKey}` || suffix !== null || header !== null || (id !== model && id !== second)) return next();
-    const reply = id === second ? await rewrite({ neutralKey: true }) : await next();
+    const reply = id === second ? await rewrite({ neutralKey: true, header: "only=cobalt" }) : await next();
     relays.set(id, await reply.clone().json());
     return reply;
   }, target));
   assert.deepEqual(relays, new Map([[model, { provider: "aurora.example" }], [second, { provider: "cobalt.example" }]]));
-  assert.equal(report.checks.find(({ id }) => id === "G10")?.status, "FAIL");
+  assertFailure(report, "G10", /-second.*"applied":\["provider=cobalt"\].*; required: the relayed route must meet the detected key default/);
 });
 
 test("G11: a valid pair repeated across carriers must not be rejected as a duplicate", async (t) => {
   const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "zdr" && suffix === header
     ? rewrite({ header: "zdr+zdr", suffix: null }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G11")?.status, "FAIL");
+  assertFailure(report, "G11", /"refused":\["reason=unsupported\+key=zdr"\].*; required: a valid policy repeated across carriers is not a duplicate within one carrier$/);
 });
 
 test("G12: conformance catches a widened region intersection in the reverse carrier orientation", async (t) => {
   const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "region=de" && suffix === "region=us"
     ? rewrite({ header: "region=us,de", suffix: null }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G12")?.status, "FAIL");
+  assertFailure(report, "G12", faultDetails.G12);
 });
 
 test("G21: a bound credential cannot ignore a disallowed item beside an accepted attest item", async (t) => {
   const report = await run(t, fixture(({ auth, header, next, rewrite }) => auth === `Bearer ${policyKey}` && header === "attest=weights,probe0"
     ? rewrite({ header: "attest=weights" }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G21")?.status, "FAIL");
+  assertFailure(report, "G21", /required: unlisted attest refuses attest=weights,probe0$/);
 });
 
 test("G7: a preference in the suffix cannot exclude a route that meets the header requirement", async (t) => {
   const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "zdr" && suffix === "order=basalt"
     ? rewrite({ header: "only=routeprobe0", suffix: null }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G7")?.status, "FAIL");
+  assertFailure(report, "G7", /order=basalt.*"refused":\["reason=unsatisfiable"\].*; required: an accepted preference cannot disqualify/);
 });
 
 test("G13: correct bound-key filtering on one model does not hide widening on a different model", async (t) => {
@@ -293,13 +559,13 @@ test("G13: correct bound-key filtering on one model does not hide widening on a 
     return next();
   }, target));
   assert.deepEqual(observed, new Map([[model, "reason=unsatisfiable"], [second, "provider=second-basalt"]]));
-  assert.equal(report.checks.find(({ id }) => id === "G13")?.status, "FAIL");
+  assertFailure(report, "G13", /"applied":\["provider=second-basalt"\].*; required: neither explicit carrier can weaken the detected key default$/);
 });
 
 test("G24: an unknown provider does not invalidate a list that also names a qualifying provider", async (t) => {
   const report = await run(t, fixture(({ header, next, rewrite }) => header === "only=routeprobe0,aurora"
     ? rewrite({ header: "only=routeprobe0" }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G24")?.status, "FAIL");
+  assertFailure(report, "G24", faultDetails.G24);
 });
 
 test("G10 G13 G23: each credential's own catalog determines its model and matching routes", async (t) => {
@@ -400,10 +666,19 @@ test("G34: equal nested shapes allow different scalar values, array order, and r
   assert.equal(report.checks.find(({ id }) => id === "G34")?.status, "PASS");
 });
 
+const enrichedErrorDetails = {
+  "problem-type": /\$\.problem has type string/,
+  "request-id-type": /\$\.request_id has type number/,
+  "nested-type": /\$\.error\.details\.retryable has type string/,
+  "array-member-type": /\$\.problem\.issues\[\]\.severity has type string/,
+  "empty-body": /required: a refusal has a nonempty error body/,
+};
+
 for (const defect of ["problem-type", "request-id-type", "nested-type", "array-member-type", "empty-body"] as const) {
   test(`G34: conformance rejects ${defect} in a refusal against an endpoint with enriched errors`, async (t) => {
     const report = await run(t, gatewayWithEnrichedErrors(defect));
     assert.deepEqual(report.checks.filter(({ status }) => status !== "PASS").map(({ id, status }) => [id, status]), [["G34", "FAIL"]]);
+    assertFailure(report, "G34", enrichedErrorDetails[defect]);
   });
 }
 
@@ -522,12 +797,12 @@ test("G25: a stable nonstandard ordinary status is not interchangeable with anot
 
 test("G6: conformance catches a relay from the first provider when only pins the second", async (t) => {
   const report = await run(t, fixture(({ header, next, rewrite }) => header === "only=basalt" ? rewrite({ header: "only=aurora" }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G6")?.status, "FAIL");
+  assertFailure(report, "G6", /only=basalt.*"applied":\["provider=aurora"\].*; required: the named published route must meet/);
 });
 
 test("G9: rejecting raw duplicates does not excuse ignoring an unsatisfiable single header", async (t) => {
   const report = await run(t, fixture(({ header, suffix, next, rewrite }) => header === "bits=64" && suffix === null ? rewrite({ header: null }) : next()));
-  assert.equal(report.checks.find(({ id }) => id === "G9")?.status, "FAIL");
+  assertFailure(report, "G9", /bits=64.*; required: no published route meets even the known mixed-case header requirements$/);
 });
 
 test("G17: attest in the bound policy requires evidence even with no explicit carrier", async (t) => {
@@ -540,7 +815,7 @@ test("G17: attest in the bound policy requires evidence even with no explicit ca
     if (request.method !== "POST" || request.headers.get("authorization") !== `Bearer ${policyKey}` || request.headers.has("route-policy")) return reply;
     return change(reply, { replace: { [evidence]: null } });
   });
-  assert.equal(report.checks.find(({ id }) => id === "G17")?.status, "FAIL");
+  assertFailure(report, "G17", /"applied":\["provider=basalt"\],"refused":\[\],"evidence":\[\].*; required: one Route-Evidence is required by the known attest requirement$/);
 });
 
 test("G21: an applied header does not mask rejection of a valid listed value", async (t) => {
@@ -548,7 +823,7 @@ test("G21: an applied header does not mask rejection of a valid listed value", a
     const reply = await next();
     return header === "bits=32" ? change(reply, { replace: { [applied]: formatApplied("aurora"), [refusal]: formatRefused("unsupported", "bits") } }) : reply;
   }));
-  assert.equal(report.checks.find(({ id }) => id === "G21")?.status, "FAIL");
+  assertFailure(report, "G21", /bits=32.*"refused":\["reason=unsupported\+key=bits"\].*; required: advertised support accepts every key and value sent/);
 });
 
 test("G25 G1 G6 G10 G13: ordinary HTTP 429 blocks policy probes without any conformance failures", async (t) => {
@@ -576,14 +851,16 @@ test("G25 G1 G6 G10 G13: ordinary HTTP 429 blocks policy probes without any conf
   assert.deepEqual(control, { ...probe, header: null, suffix: null, body: { ...probe.body, model: probe.id } });
 });
 
-test("G2 G19: a matching ordinary status does not excuse a forbidden policy result header", async (t) => {
+test("G19: a matching ordinary status does not excuse a refusal header with the wrong HTTP status", async (t) => {
   const report = await run(t, fixture(({ request, header, next }) => {
     if (request.method !== "POST") return next();
     return Response.json({ error: { type: "rate_limit", message: "try later" } }, { status: 429,
       ...(header === "bits=0+only=a,a" ? { headers: { [refusal]: formatRefused("unsupported", "bits") } } : {}),
     });
   }));
-  for (const id of ["G2", "G19"]) assert.equal(report.checks.find((c) => c.id === id)?.status, "FAIL");
+  const verdict = report.checks.find((c) => c.id === "G19");
+  assert.equal(verdict?.status, "FAIL");
+  assert.match(verdict.detail, /"status":429,.*"refused":\["reason=unsupported\+key=bits"\].*; required: S15: one valid Route-Refused value with its corresponding HTTP status$/);
 });
 
 test("G15 G17 G34: all qualifying routes may be unavailable, with a correctly shaped refusal", async (t) => {
@@ -606,7 +883,7 @@ test("G34: an isolated malformed unavailable refusal is caught outside the dedic
   });
   assert.ok(changed, "the satisfiable probe actually observed the broken 503");
   assert.deepEqual(report.checks.filter(({ status }) => status === "FAIL").map(({ id }) => id), ["G34"]);
-  assert.match(report.checks.find(({ id }) => id === "G34")!.detail, /service unavailable/);
+  assertFailure(report, "G34", /service unavailable.*; required: .*media type text\/plain was not used by any ordinary error control/);
 });
 
 for (const { condition, config, skipped } of [
@@ -617,7 +894,7 @@ for (const { condition, config, skipped } of [
   { condition: "no credential carries a default policy", config: { keys: { [key]: {}, [policyKey]: {} } }, skipped: ["G10", "G13"] },
   { condition: "the accessible model catalog is empty", config: { models: {} }, skipped: ["G1", "G15", "G17"] },
 ] as const) {
-  test(`G10 G12 G13 G15 G17 G21 G23 G24: no false failures when ${condition}`, async (t) => {
+  test(`${skipped.join(" ")}: no false failures and dependent checks skip when ${condition}`, async (t) => {
     const target = createGateway({
       models: { [model]: routes }, keys: { [key]: {}, [policyKey]: { policy: "zdr" } },
       fetch: () => Response.json({ output: "served" }), ...config,
@@ -639,7 +916,7 @@ test("G8 G15 G19: a published model may be unavailable on one API surface despit
   }
 });
 
-test("G25 G15: transient throttling of a single streaming probe is not a missing relay header", async (t) => {
+test("G15: transient throttling of a single streaming probe is not a missing relay header", async (t) => {
   let ordinaryOwnErrors = 0;
   const report = await run(t, fixture(({ body, header, next }) => {
     if (body.stream === true && header !== null && ordinaryOwnErrors++ === 0) {
@@ -702,7 +979,7 @@ test("G9 G15 G17 G25 G34: the real demo passes on all requested endpoints with z
   for (const endpoint of INFERENCE_ENDPOINTS) for (const id of ["G9", "G15", "G17", "G25", "G34"]) assert.ok(report.checks.some((c) => c.endpoint === endpoint && c.id === id && c.status === "PASS"));
 });
 
-test("G7 G24: two unpublished order ids cannot make qualifying routes unsatisfiable", async (t) => {
+test("G3 G7 G24: two unpublished order ids cannot make qualifying routes unsatisfiable", async (t) => {
   const credentials = new Set<string | null>();
   const report = await run(t, fixture(async ({ auth, header, next }) => {
     const reply = await next();
@@ -713,11 +990,9 @@ test("G7 G24: two unpublished order ids cannot make qualifying routes unsatisfia
       { status: 400, headers: { [refusal]: formatRefused("unsatisfiable") } });
   }));
   assert.deepEqual(credentials, new Set([`Bearer ${key}`, `Bearer ${policyKey}`]));
-  for (const id of ["G3", "G7", "G24"]) {
-    const verdict = report.checks.find((check) => check.id === id);
-    assert.equal(verdict?.status, "FAIL");
-    assert.match(verdict.detail, /order=0,a-b_c\.d/);
-  }
+  assertFailure(report, "G3", /order=0,a-b_c\.d.*; required: unsatisfiable requires that no published route meet/);
+  assertFailure(report, "G7", /order=0,a-b_c\.d.*; required: an accepted preference cannot disqualify/);
+  assertFailure(report, "G24", /order=0,a-b_c\.d.*; required: an unknown provider id does not remove/);
 });
 
 const refusalEnvelope = { error: { message: "fixture refusal", type: "invalid_request_error" } };
@@ -758,38 +1033,39 @@ const bitsKeyTarget = createGateway({
 interface Clause {
   id: Id;
   clause: string;
+  required: string;
   mutate: Mutation;
   target?: RequestHandler;
 }
 
 const clauses: Clause[] = [
-  { id: "G1", clause: "unsupported must use HTTP 400", mutate: responseFor("bits=0", { status: 422 }) },
-  { id: "G1", clause: "failing syntax cannot be classified as unsatisfiable", mutate: responseFor("bits=0", { replace: { [refusal]: formatRefused("unsatisfiable") } }) },
-  { id: "G2", clause: "the first bad pair cannot omit its key", mutate: responseFor("bits=0+only=a,a", { replace: { [refusal]: formatRefused("unsupported") } }) },
-  { id: "G2", clause: "a malformed key cannot name a later key", mutate: responseFor("Bad+bits=0", { replace: { [refusal]: formatRefused("unsupported", "bits") } }) },
-  { id: "G3", clause: "unsatisfiable must use HTTP 400", mutate: responseFor("bits=64", { status: 422 }) },
-  { id: "G3", clause: "unsatisfiable cannot attribute a key", mutate: responseFor("bits=64", { replace: { [refusal]: "reason=unsatisfiable+key=bits" } }) },
-  { id: "G3", clause: "no qualifying provider cannot be relayed", mutate: ({ header, suffix, rewrite, next }) => header === "bits=64" && suffix === null ? rewrite({ header: "bits=1" }) : next() },
+  { id: "G1", clause: "unsupported must use HTTP 400", required: "HTTP 400 with only a valid unsupported refusal", mutate: responseFor("bits=0", { status: 422 }) },
+  { id: "G1", clause: "failing syntax cannot be classified as unsatisfiable", required: "HTTP 400 with only a valid unsupported refusal", mutate: responseFor("bits=0", { replace: { [refusal]: formatRefused("unsatisfiable") } }) },
+  { id: "G2", clause: "the first bad pair cannot omit its key", required: "the first failure names bits", mutate: responseFor("bits=0+only=a,a", { replace: { [refusal]: formatRefused("unsupported") } }) },
+  { id: "G2", clause: "a malformed key cannot name a later key", required: "the first failure names no key", mutate: responseFor("Bad+bits=0", { replace: { [refusal]: formatRefused("unsupported", "bits") } }) },
+  { id: "G3", clause: "unsatisfiable must use HTTP 400", required: "HTTP 400 with only a valid unsatisfiable refusal", mutate: responseFor("bits=64", { status: 422 }) },
+  { id: "G3", clause: "unsatisfiable cannot attribute a key", required: "HTTP 400 with only a valid unsatisfiable refusal", mutate: responseFor("bits=64", { replace: { [refusal]: "reason=unsatisfiable+key=bits" } }) },
+  { id: "G3", clause: "no qualifying provider cannot be relayed", required: "the policy must be refused as unsatisfiable", mutate: ({ header, suffix, rewrite, next }) => header === "bits=64" && suffix === null ? rewrite({ header: "bits=1" }) : next() },
   ...([
     ["zdr", "cobalt", "missing retention fact"], ["notrain", "cobalt", "missing training fact"],
     ["bits=9", "aurora", "bit precision below the floor"], ["region=us", "basalt", "route countries exceed allowed region"],
     ["attest=weights", "aurora", "missing attestation item"], ["only=basalt", "aurora", "provider absent from only"],
     ["ignore=aurora", "aurora", "provider named in ignore"],
   ] as const).map(([policy, provider, clause]): Clause =>
-    ({ id: "G6", clause, mutate: responseFor(policy, { replace: { [applied]: formatApplied(provider) } }) })),
-  { id: "G7", clause: "a preference cannot admit an excluded provider", mutate: responseFor("zdr+order=basalt", { replace: { [applied]: formatApplied("basalt") } }) },
-  { id: "G7", clause: "a sort alone cannot make matching routes unsatisfiable", mutate: responseFor("sort=throughput", { status: 400, body: JSON.stringify(refusalEnvelope),
+    ({ id: "G6", clause, required: "the named published route must meet at least the known requirements; an unknown key default cannot admit an excluded route", mutate: responseFor(policy, { replace: { [applied]: formatApplied(provider) } }) })),
+  { id: "G7", clause: "a preference cannot admit an excluded provider", required: "preference must leave the same candidates (aurora), even if it points elsewhere", mutate: responseFor("zdr+order=basalt", { replace: { [applied]: formatApplied("basalt") } }) },
+  { id: "G7", clause: "a sort alone cannot make matching routes unsatisfiable", required: "an accepted preference cannot disqualify the matching published routes", mutate: responseFor("sort=throughput", { status: 400, body: JSON.stringify(refusalEnvelope),
     replace: { [applied]: null, [refusal]: formatRefused("unsatisfiable") } }) },
-  { id: "G8", clause: "a valid suffix must resolve through the base id", mutate: ({ suffix, header, next }) => header === null && suffix === "zdr"
+  { id: "G8", clause: "a valid suffix must resolve through the base id", required: "suffixed request resolves to a qualifying route or unavailable", mutate: ({ suffix, header, next }) => header === null && suffix === "zdr"
     ? Response.json(refusalEnvelope, { status: 404 }) : next() },
-  { id: "G9", clause: "duplicates cannot select the first field line", mutate: ({ transport, rewrite, next }) => transport?.repeatedRoutePolicy ? rewrite({ header: "zdr" }) : next() },
-  { id: "G9", clause: "duplicate lines must not name a key", mutate: async ({ transport, next }) => {
+  { id: "G9", clause: "duplicates cannot select the first field line", required: "two raw Route-Policy lines return 400 unsupported without a key", mutate: ({ transport, rewrite, next }) => transport?.repeatedRoutePolicy ? rewrite({ header: "zdr" }) : next() },
+  { id: "G9", clause: "duplicate lines must not name a key", required: "two raw Route-Policy lines return 400 unsupported without a key", mutate: async ({ transport, next }) => {
     const reply = await next();
     return transport?.repeatedRoutePolicy ? change(reply, { replace: { [refusal]: formatRefused("unsupported", "only") } }) : reply;
   } },
-  { id: "G10", clause: "the key default also applies with an explicit filter", mutate: ({ auth, header, rewrite, next }) =>
+  { id: "G10", clause: "the key default also applies with an explicit filter", required: "the relayed route must meet the detected key default even in the presence of explicit carriers", mutate: ({ auth, header, rewrite, next }) =>
     auth === `Bearer ${policyKey}` && header === "only=basalt" ? rewrite({ neutralKey: true }) : next() },
-  { id: "G11", clause: "a valid header cannot bypass independent suffix validation", mutate: ({ header, suffix, rewrite, next }) =>
+  { id: "G11", clause: "a valid header cannot bypass independent suffix validation", required: "a valid header does not bypass validation of the suffix", mutate: ({ header, suffix, rewrite, next }) =>
     header === "zdr" && suffix === "bits=0" ? rewrite({ suffix: null }) : next() },
   ...([
     ["zdr", "notrain", "retain both boolean requirements", combinationTarget],
@@ -799,7 +1075,7 @@ const clauses: Clause[] = [
     ["attest=weights", "attest=prompt", "union distinct attestation items", combinationTarget],
     ["ignore=aurora", "ignore=basalt", "union exclusions", good],
   ] as const).map(([head, tail, clause, target]): Clause => ({
-    id: "G11", clause, target, mutate: ({ header, suffix, rewrite, next }) => {
+    id: "G11", clause, target, required: "both valid carriers constrain the request", mutate: ({ header, suffix, rewrite, next }) => {
       if (header !== head || suffix !== tail) return next();
       const bad = head.startsWith("region=") ? "only=aurora+region=us,de" :
         head.startsWith("attest=") ? "only=aurora+attest=weights" :
@@ -807,95 +1083,110 @@ const clauses: Clause[] = [
       return rewrite({ header: bad, suffix: null });
     },
   })),
-  { id: "G12", clause: "an empty only intersection must refuse independently of region", mutate: ({ header, suffix, rewrite, next }) =>
+  { id: "G12", clause: "an empty only intersection must refuse independently of region", required: "400 unsatisfiable for an empty intersection in either carrier order", mutate: ({ header, suffix, rewrite, next }) =>
     header === "only=aurora" && suffix === "only=basalt" ? rewrite({ suffix: null }) : next() },
-  { id: "G13", clause: "an explicit header cannot remove the bound requirement", mutate: ({ auth, header, suffix, rewrite, next }) =>
+  { id: "G13", clause: "an explicit header cannot remove the bound requirement", required: "neither explicit carrier can weaken the detected key default", mutate: ({ auth, header, suffix, rewrite, next }) =>
     auth === `Bearer ${policyKey}` && header === "only=basalt" && suffix === null ? rewrite({ neutralKey: true }) : next() },
-  { id: "G13", clause: "an explicit suffix cannot remove the bound requirement", mutate: ({ auth, header, suffix, rewrite, next }) =>
+  { id: "G13", clause: "an explicit suffix cannot remove the bound requirement", required: "neither explicit carrier can weaken the detected key default", mutate: ({ auth, header, suffix, rewrite, next }) =>
     auth === `Bearer ${policyKey}` && header === null && suffix === "only=basalt" ? rewrite({ neutralKey: true }) : next() },
-  { id: "G13", clause: "an explicit weaker precision cannot lower the bound minimum", target: bitsKeyTarget,
+  { id: "G13", clause: "an explicit weaker precision cannot lower the bound minimum", required: "neither explicit carrier can weaken the detected key default", target: bitsKeyTarget,
     mutate: ({ auth, header, rewrite, next }) => auth === `Bearer ${policyKey}` && header === "bits=8" ? rewrite({ neutralKey: true }) : next() },
-  { id: "G15", clause: "a well-formed provider id must be published for the model", mutate: responseFor("zdr", { replace: { [applied]: formatApplied("unpublished") } }) },
-  { id: "G17", clause: "attested relays must supply evidence", mutate: responseFor("attest=weights", { replace: { [evidence]: null } }) },
-  { id: "G17", clause: "unattested relays cannot supply evidence", mutate: responseFor("zdr", { replace: { [evidence]: "https://aurora.example/evidence" } }) },
-  { id: "G19", clause: "a refusal cannot carry Route-Applied", mutate: responseFor("bits=64", { replace: { [applied]: formatApplied("aurora") } }) },
-  { id: "G19", clause: "a refusal cannot carry Route-Evidence", mutate: responseFor("bits=64", { replace: { [evidence]: "https://aurora.example/evidence" } }) },
-  { id: "G20", clause: "anonymous detection must return 200", mutate: detectionResponse({ route_policy: "1" }, { status: 401 }) },
-  { id: "G20", clause: "credentialed detection must return 200", mutate: detectionResponse({ route_policy: "1" }, { status: 201, credentialed: true }) },
-  { id: "G20", clause: "detection must be a JSON object", mutate: detectionResponse([]) },
-  { id: "G20", clause: "keys must be a list with valid key tokens", mutate: detectionResponse({ route_policy: "1", keys: ["Not-A-Key"] }) },
-  { id: "G20", clause: "attest must be a list with valid item tokens", mutate: detectionResponse({ route_policy: "1", attest: ["a,b"] }) },
-  { id: "G20", clause: "sort must be a list with valid item tokens", mutate: detectionResponse({ route_policy: "1", sort: "price" }) },
-  { id: "G21", clause: "unknown unlisted keys must be refused, not silently dropped", mutate: ({ header, rewrite, next }) =>
+  { id: "G15", clause: "a well-formed provider id must be published for the model", required: "one valid Route-Applied naming a published provider for this model", mutate: responseFor("zdr", { replace: { [applied]: formatApplied("unpublished") } }) },
+  { id: "G17", clause: "attested relays must supply evidence", required: "one Route-Evidence is required by the known attest requirement", mutate: responseFor("attest=weights", { replace: { [evidence]: null } }) },
+  { id: "G17", clause: "unattested relays cannot supply evidence", required: "no Route-Evidence when the combined policy does not require attest", mutate: responseFor("only=basalt", { replace: { [evidence]: "https://basalt.example/attestation" } }) },
+  { id: "G19", clause: "a refusal cannot carry Route-Applied", required: "a refusal has neither Route-Applied nor Route-Evidence", mutate: responseFor("bits=64", { replace: { [applied]: formatApplied("aurora") } }) },
+  { id: "G19", clause: "a refusal cannot carry Route-Evidence", required: "a refusal has neither Route-Applied nor Route-Evidence", mutate: responseFor("bits=64", { replace: { [evidence]: "https://aurora.example/evidence" } }) },
+  { id: "G20", clause: "anonymous detection must return 200", required: "a complete valid detection reply: status is 401, not 200", mutate: detectionResponse({ route_policy: "1" }, { status: 401 }) },
+  { id: "G20", clause: "credentialed detection must return 200", required: "a complete valid detection reply: status is 201, not 200", mutate: detectionResponse({ route_policy: "1" }, { status: 201, credentialed: true }) },
+  { id: "G20", clause: "detection must be a JSON object", required: "a complete valid detection reply: not a JSON object", mutate: detectionResponse([]) },
+  { id: "G20", clause: "keys must be a list with valid key tokens", required: "a complete valid detection reply: is not a list of keys", mutate: detectionResponse({ route_policy: "1", keys: ["Not-A-Key"] }) },
+  { id: "G20", clause: "attest must be a list with valid item tokens", required: "a complete valid detection reply: is not a list of items", mutate: detectionResponse({ route_policy: "1", attest: ["a,b"] }) },
+  { id: "G20", clause: "sort must be a list with valid item tokens", required: "a complete valid detection reply: is not a list of items", mutate: detectionResponse({ route_policy: "1", sort: "price" }) },
+  { id: "G21", clause: "unknown unlisted keys must be refused, not silently dropped", required: "unlisted key probe0 is unsupported", mutate: ({ header, rewrite, next }) =>
     header === "probe0" ? rewrite({ header: "zdr" }) : next() },
-  { id: "G21", clause: "unlisted attest values must be refused", mutate: ({ header, rewrite, next }) =>
+  { id: "G21", clause: "unlisted attest values must be refused", required: "unlisted attest refuses attest=probe0", mutate: ({ header, rewrite, next }) =>
     header === "attest=probe0" ? rewrite({ header: "attest=weights" }) : next() },
   ...(["bits=32", "region=jp,de", "only=0,a-b_c.d", "ignore=0,a-b_c.d", "order=0,a-b_c.d"] as const)
     .map((policy): Clause => ({
-      id: "G21", clause: `listed fixed domain must accept ${policy}`, mutate: ({ header, suffix, next }) => header === policy && suffix === null
+      id: "G21", clause: `listed fixed domain must accept ${policy}`, required: "advertised support accepts every key and value sent; unsupported is not justified",
+      mutate: ({ header, suffix, next }) => header === policy && suffix === null
         ? protocolError("unsupported", policy.split("=")[0]) : next(),
     })),
-  { id: "G22", clause: "a bound key policy must be a string", mutate: detectionResponse({ route_policy: "1", key_policy: 1 }, { credentialed: true }) },
-  { id: "G22", clause: "a bound policy cannot repeat a key", mutate: detectionResponse({ route_policy: "1", key_policy: "zdr+zdr" }, { credentialed: true }) },
-  { id: "G22", clause: "a bound policy cannot name an unlisted key", mutate: detectionResponse({ route_policy: "1", keys: ["zdr"], key_policy: "notrain" }, { credentialed: true }) },
+  { id: "G22", clause: "a bound key policy must be a string", required: "key_policy is a string", mutate: detectionResponse({ route_policy: "1", key_policy: 1 }, { credentialed: true }) },
+  { id: "G22", clause: "a bound policy cannot repeat a key", required: "key_policy fits the policy grammar: repeated key", mutate: detectionResponse({ route_policy: "1", key_policy: "zdr+zdr" }, { credentialed: true }) },
+  { id: "G22", clause: "a bound policy cannot name an unlisted key", required: "key_policy valid under the advertised lists: fails the order of checks under the reply's lists: key not listed", mutate: detectionResponse({ route_policy: "1", keys: ["zdr"], key_policy: "notrain" }, { credentialed: true }) },
   ...([
-    ["top-level model list is an object", []],
-    ["data is an array", { data: { id: model, routes: published } }],
-    ["model entry is an object with an id", { data: [null] }],
-    ["model ids are unique", { data: [{ id: model, routes: [] }, { id: model, routes: [] }] }],
-    ["model has a routes array", { data: [{ id: model }] }],
-    ["provider id obeys the grammar", { data: [{ id: model, routes: [{ provider: "Aurora", facts: "" }] }] }],
-    ["route must publish facts", { data: [{ id: model, routes: [{ provider: "aurora" }] }] }],
-    ["published facts obey the grammar", { data: [{ id: model, routes: [{ provider: "aurora", facts: "zdr+zdr" }] }] }],
-    ["a route with attest publishes evidence", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights" }] }] }],
-    ["published evidence has an evidence URI", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights", evidence: "http://basalt.example/" }] }] }],
-  ] as const).map(([clause, value]): Clause => ({ id: "G23", clause, mutate: catalogResponse(value) })),
-  { id: "G24", clause: "unknown only must match nothing", mutate: ({ header, rewrite, next }) =>
+    ["top-level model list is an object", "models response must be an object with a data array", []],
+    ["data is an array", "models response must be an object with a data array", { data: { id: model, routes: published } }],
+    ["model entry is an object with an id", "invalid or repeated model entry: null", { data: [null] }],
+    ["model ids are unique", "invalid or repeated model entry: {\"id\":\"other/example-model.v2\",\"routes\":[]}", { data: [{ id: model, routes: [] }, { id: model, routes: [] }] }],
+    ["model has a routes array", "invalid or repeated model entry: {\"id\":\"other/example-model.v2\"}", { data: [{ id: model }] }],
+    ["provider id obeys the grammar", "invalid or repeated provider on other/example-model.v2: {\"provider\":\"Aurora\",\"facts\":\"\"}", { data: [{ id: model, routes: [{ provider: "Aurora", facts: "" }] }] }],
+    ["route must publish facts", "facts must be a string for other/example-model.v2/aurora", { data: [{ id: model, routes: [{ provider: "aurora" }] }] }],
+    ["published facts obey the grammar", "invalid facts for other/example-model.v2/aurora: repeated key", { data: [{ id: model, routes: [{ provider: "aurora", facts: "zdr+zdr" }] }] }],
+    ["a route with attest publishes evidence", "invalid or missing evidence URI for other/example-model.v2/basalt", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights" }] }] }],
+    ["published evidence has an evidence URI", "invalid or missing evidence URI for other/example-model.v2/basalt", { data: [{ id: model, routes: [{ provider: "basalt", facts: "attest=weights", evidence: "http://basalt.example/" }] }] }],
+  ] as const).map(([clause, required, value]): Clause => ({ id: "G23", clause, required, mutate: catalogResponse(value) })),
+  { id: "G24", clause: "unknown only must match nothing", required: "an unknown provider id does not make an excluded route qualify", mutate: ({ header, rewrite, next }) =>
     header === "only=routeprobe0" ? rewrite({ header: "zdr" }) : next() },
-  { id: "G24", clause: "an unknown only entry cannot erase a known match", mutate: ({ header, rewrite, next }) =>
+  { id: "G24", clause: "an unknown only entry cannot erase a known match", required: "an unknown provider id does not remove the remaining matching routes", mutate: ({ header, rewrite, next }) =>
     header === "only=routeprobe0,aurora" ? rewrite({ header: "only=routeprobe0" }) : next() },
-  { id: "G24", clause: "unknown ignore cannot remove other providers", mutate: ({ header, rewrite, next }) =>
+  { id: "G24", clause: "unknown ignore cannot remove other providers", required: "an unknown provider id does not remove the remaining matching routes", mutate: ({ header, rewrite, next }) =>
     header === "ignore=routeprobe0" ? rewrite({ header: "only=routeprobe0" }) : next() },
-  { id: "G24", clause: "unknown ignore cannot erase a known exclusion", mutate: ({ header, rewrite, next }) =>
+  { id: "G24", clause: "unknown ignore cannot erase a known exclusion", required: "an unknown provider beside a known provider does not change ignore", mutate: ({ header, rewrite, next }) =>
     header === "ignore=routeprobe0,aurora" ? rewrite({ header: "only=aurora" }) : next() },
-  { id: "G24", clause: "mixed order cannot reject an unknown id as invalid", mutate: ({ header, next }) =>
+  { id: "G24", clause: "mixed order cannot reject an unknown id as invalid", required: "a syntactically valid unknown provider id is not an unsupported value", mutate: ({ header, next }) =>
     header === "order=routeprobe0,aurora" ? protocolError("unsupported", "order") : next() },
-  { id: "G25", clause: "nonstring model errors must precede policy validation", mutate: ({ header, body, next }) =>
+  { id: "G25", clause: "nonstring model errors must precede policy validation", required: "the same ordinary error status 400 as the no-policy control, with no result headers", mutate: ({ header, body, next }) =>
     header === "bits=0" && typeof body.model === "number" ? protocolError("unsupported", "bits") : next() },
   ...([applied, refusal, evidence] as const).map((name): Clause => ({
-    id: "G25", clause: `an unreadable body must not return ${name}`, mutate: async ({ request, transport, header, body, next }) => {
+    id: "G25", clause: `an unreadable body must not return ${name}`,
+    required: "the same ordinary error status 400 as the no-policy control, with no result headers", mutate: async ({ request, transport, header, body, next }) => {
       const reply = await next();
       if (request.method !== "POST" || !transport?.repeatedRoutePolicy || header === null || Object.keys(body).length > 0) return reply;
       return change(reply, { replace: { [name]: name === applied ? formatApplied("aurora")
         : name === refusal ? formatRefused("unsupported", "bits") : "https://aurora.example/evidence" } });
     },
   })),
-  { id: "G26", clause: "policy-free inference cannot carry a refusal", mutate: async ({ request, auth, header, suffix, next }) => {
+  { id: "G26", clause: "policy-free inference cannot carry a refusal", required: "no Route-Refused or Route-Evidence without a policy", mutate: async ({ request, auth, header, suffix, next }) => {
     const reply = await next();
     return request.method === "POST" && auth === `Bearer ${key}` && header === null && suffix === null && reply.ok
       ? protocolError("unavailable") : reply;
   } },
-  { id: "G29", clause: "unsatisfiable takes precedence over unavailable", mutate: ({ header, suffix, next }) =>
+  { id: "G29", clause: "unsatisfiable takes precedence over unavailable", required: "unsatisfiable takes precedence over unavailable", mutate: ({ header, suffix, next }) =>
     header === "bits=64" && suffix === null ? protocolError("unavailable") : next() },
-  { id: "G29", clause: "an unsupported policy cannot be masked by unavailable", mutate: ({ header, suffix, next }) =>
+  { id: "G29", clause: "an unsupported policy cannot be masked by unavailable", required: "unsupported takes precedence over unavailable", mutate: ({ header, suffix, next }) =>
     header === "zdr" && suffix === "bits=0" ? protocolError("unavailable") : next() },
 ];
 
-for (const { id, clause, mutate, target } of clauses) test(`${id}: clause matrix — ${clause}`, async (t) => {
-  let altered = 0;
+function receivedHead(reply: Response): string {
+  const value = (name: string) => {
+    const text = reply.headers.get(name);
+    return text === null ? [] : [text];
+  };
+  return JSON.stringify({
+    status: reply.status, contentType: reply.headers.get("content-type") ?? undefined,
+    applied: value(applied), refused: value(refusal), evidence: value(evidence),
+  }).slice(0, -1);
+}
+
+for (const { id, clause, required, mutate, target } of clauses) test(`${id}: clause matrix — ${clause}`, async (t) => {
+  const altered = new Set<string>();
   const report = await run(t, fixture(async (exchange) => {
     let original: Response | undefined;
     const reply = await mutate({ ...exchange, next: async () => {
       original = await exchange.next();
       return original;
     } });
-    if (reply !== original) altered++;
+    if (reply !== original) altered.add(receivedHead(reply));
     return reply;
   }, target));
-  assert.ok(altered > 0, "the suite reached the deliberately broken branch");
+  assert.ok(altered.size > 0, "the suite reached the deliberately broken branch");
   const verdict = report.checks.find((entry) => entry.id === id);
   assert.equal(verdict?.status, "FAIL", JSON.stringify(report.checks.filter((entry) => entry.status !== "PASS")));
   assert.match(verdict.detail, /sent \{.*; received .*; required:/);
+  assert.ok([...altered].some((head) => verdict.detail.includes(`; received ${head}`)), verdict.detail);
+  assert.equal(verdict.detail.split("; required: ").at(-1), required);
 });
 
 for (const name of [applied, refusal, evidence]) test(`G19: two raw ${name} field lines are not one result`, async (t) => {
@@ -976,11 +1267,8 @@ test("G2 G21: the audit catches unsupported and invented attribution on a separa
     return protocolError("unsupported", "zdr");
   }));
   assert.equal(broken, 1);
-  for (const id of ["G2", "G21"]) {
-    const verdict = report.checks.find((entry) => entry.id === id);
-    assert.equal(verdict?.status, "FAIL");
-    assert.match(verdict.detail, /stream\\":true/);
-  }
+  assertFailure(report, "G2", /stream\\":true.*; required: no accepted key can be named as a failing key$/);
+  assertFailure(report, "G21", /stream\\":true.*; required: advertised support accepts every key and value sent/);
 });
 
 test("G20 G22: bad credentialed detection status does not itself invalidate an otherwise valid key policy", async (t) => {
@@ -989,7 +1277,7 @@ test("G20 G22: bad credentialed detection status does not itself invalidate an o
     if (path !== "/v1/route-policy" || auth !== `Bearer ${policyKey}`) return reply;
     return change(reply, { status: 201 });
   }));
-  assert.equal(report.checks.find(({ id }) => id === "G20")?.status, "FAIL");
+  assertFailure(report, "G20", /required: a complete valid detection reply: status is 201, not 200$/);
   assert.equal(report.checks.find(({ id }) => id === "G22")?.status, "PASS");
 });
 
@@ -1026,7 +1314,7 @@ test("G20: reject fragments and URL userinfo before making metadata requests", a
   assert.equal(requests, 0);
 });
 
-test("G15 G20: a single selected endpoint may commit a valid response slowly", async (t) => {
+test("G15: a single selected endpoint may commit a valid response slowly", async (t) => {
   const inferred = new Set<string>();
   let waited = false;
   const report = await run(t, async (request, transport) => {
@@ -1096,7 +1384,7 @@ for (const { title, policy, lists, verdict, detail } of [
 
 test("G22: a non-object detection reply cannot establish absence of a key policy", async (t) => {
   const report = await run(t, fixture(detectionResponse(null)));
-  assert.equal(report.checks.find(({ id }) => id === "G20")?.status, "FAIL");
+  assertFailure(report, "G20", /required: a complete valid detection reply: not a JSON object$/);
   const check = report.checks.find(({ id }) => id === "G22");
   assert.equal(check?.status, "SKIP");
   assert.match(check.detail, /an inspectable detection object/);
@@ -1185,7 +1473,17 @@ for (const order of [[0, 1], [1, 0]] as const) test(`G11: provider-only narrowin
     }) }, accept: { keys: ["bits"] },
     fetch: () => Response.json({ output: "served" }),
   });
-  const report = await run(t, open);
+  const relays = new Map<string, string | null>();
+  const report = await run(t, fixture(async ({ id, header, suffix, next }) => {
+    const reply = await next();
+    if (id === model && (header === "bits=1" || suffix === "bits=1")) relays.set(`${header}|${suffix}`, reply.headers.get(applied));
+    return reply;
+  }, open));
+  const weakerAlone = order[0] === 0 ? "provider=aurora" : "provider=basalt";
+  assert.equal(relays.get("bits=1|null"), weakerAlone);
+  assert.equal(relays.get("null|bits=1"), weakerAlone);
+  assert.equal(relays.get("bits=1|bits=64"), "provider=basalt");
+  assert.equal(relays.get("bits=64|bits=1"), "provider=basalt");
   const check = report.checks.find(({ id }) => id === "G11");
   assert.equal(check?.status, order[0] === 0 ? "PASS" : "SKIP");
 });
@@ -1225,7 +1523,7 @@ test("G12: a non-default published region exposes dropped intersections", async 
     return rewrite({ suffix: null });
   }, target));
   assert.equal(altered, 1);
-  assert.equal(report.checks.find(({ id }) => id === "G12")?.status, "FAIL");
+  assertFailure(report, "G12", /region=jp.*region=de.*; required: 400 unsatisfiable for an empty intersection in either carrier order$/);
 });
 
 test("G12: no route with a region fact cannot distinguish empty intersection from either input alone", async (t) => {
@@ -1325,6 +1623,7 @@ for (const broken of [false, true]) test(`G3 G6: opaque future defaults ${broken
   assert.equal(opaqueRefusals, 2, "compatible explicit policies are not proof of qualification under an opaque default");
   for (const reply of replies) assert.deepEqual(reply, broken ? { status: 200, applied: "provider=local" } : { status: 400, applied: null });
   assert.equal(report.checks.find(({ id }) => id === "G3")?.status, broken ? "FAIL" : "PASS");
+  if (broken) assertFailure(report, "G3", /only=0,a-b_c\.d.*; required: the policy must be refused as unsatisfiable$/);
   const qualification = report.checks.find(({ id }) => id === "G6");
   if (!broken) assert.equal(report.checks.find(({ id }) => id === "G15")?.status, "PASS");
   assert.equal(qualification?.status, broken ? "FAIL" : "SKIP", JSON.stringify(report.checks.filter(({ status }) => status === "FAIL")));
@@ -1343,6 +1642,25 @@ test("G3 G29: an unavailable reply cannot claim qualification after a known empt
   }], () => ({ carriesPolicy: true, known, impossible: true }));
   assert.match(audit.failures.get("G3") ?? "", /unavailable presupposes a qualifying route/);
   assert.match(audit.failures.get("G29") ?? "", /unavailable must not mask a refusal before routing/);
+});
+
+test("G3: a relay cannot claim qualification after a known empty intersection without detection", () => {
+  const header = parsePolicy("only=aurora");
+  const suffix = parsePolicy("only=basalt");
+  assert.ok(header.ok && suffix.ok);
+  const known = combinePolicies({ header: header.value, suffix: suffix.value });
+  const audit = auditResults([{
+    probe: { path: "responses", raw: JSON.stringify({ model: `${model}+only=basalt` }), policies: ["only=aurora"] },
+    reply: { status: 200, body: { text: "served" }, hasBody: true, contentType: "application/json",
+      applied: ["provider=aurora"], refused: [], evidence: [], received: "200 provider=aurora" },
+  }], () => ({ carriesPolicy: true, known, impossible: true }));
+  assert.match(audit.failures.get("G3") ?? "", /no route can meet even the known requirements/);
+});
+
+test("G24: a selector naming only unpublished providers cannot return unavailable", async (t) => {
+  const report = await run(t, fixture(({ header, next }) =>
+    header === "only=0,a-b_c.d" ? protocolError("unavailable") : next()));
+  assertFailure(report, "G24", /only=0,a-b_c\.d.*"refused":\["reason=unavailable"\].*; required: a valid selector containing an unknown provider is not unsupported and cannot make a nonexistent route available$/);
 });
 
 for (const { title, media, ordinary, refused, note } of [

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer, request, type Server } from "node:http";
 import { test, type TestContext } from "node:test";
+import { gzipSync } from "node:zlib";
 import { createGateway, ENDPOINTS, type Route } from "../src/gateway.ts";
 import { serve } from "../src/serve.ts";
 import { startDemo } from "../src/demo.ts";
@@ -34,9 +35,13 @@ for (const endpoint of ENDPOINTS) {
         outgoing.on("error", reject);
         outgoing.end(data);
       });
-      const policy = result.raw.flatMap((name, i) => i % 2 === 0 && name.toLowerCase() === "route-refused" ? [result.raw[i + 1]] : []);
+      const policy = result.raw.flatMap((name, i) => {
+        const header = name.toLowerCase();
+        return i % 2 === 0 && ["route-applied", "route-refused", "route-evidence"].includes(header)
+          ? [[header, result.raw[i + 1]]] : [];
+      });
       assert.equal(result.status, id === model ? 400 : 404);
-      assert.deepEqual(policy, id === model ? ["reason=unsupported"] : []);
+      assert.deepEqual(policy, id === model ? [["route-refused", "reason=unsupported"]] : []);
     }
     assert.equal(calls, 0);
   });
@@ -52,7 +57,7 @@ for (const endpoint of ENDPOINTS) {
     const base = await listening(t, serve(handler, 0));
     const pending = fetch(`${base}/v1/${endpoint}`, target(`${model}+zdr`, true));
     const controller = await controllerReady;
-    const response = await pending;
+    const response = await pending.catch((error: unknown) => assert.fail(`expected final headers before producing body bytes: ${String(error)}`));
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("route-applied"), "provider=aurora");
     const reader = response.body!.getReader();
@@ -65,12 +70,11 @@ for (const endpoint of ENDPOINTS) {
   });
 }
 
-test("G16 G33 G35: upstream informational headers do not commit routing, but upstream redirects are relayed without a replay", async (t) => {
+test("G33 G35 G37: after a failed route, relay the next provider's redirect without replaying content", async (t) => {
   const reached: string[] = [];
   const upstream = createServer((req, res) => {
     reached.push(req.url ?? "");
     if (req.url?.startsWith("/aurora/")) {
-      res.writeEarlyHints({ link: "</resource>; rel=preload; as=fetch" });
       res.writeHead(502).end("could not serve");
     } else if (req.url?.startsWith("/basalt/")) {
       res.writeHead(307, { location: "/unconfigured", "Route-Applied": "provider=aurora" }).end("provider redirect");
@@ -87,6 +91,29 @@ test("G16 G33 G35: upstream informational headers do not commit routing, but ups
   assert.deepEqual(reached, ["/aurora/v1/chat/completions", "/basalt/v1/chat/completions"]);
 });
 
+test("G14 G33: relay decoded gzip without the provider's content-encoding or length", async (t) => {
+  const forwarded: { encoding: string | undefined; policy: string | string[] | undefined; body: string }[] = [];
+  const payload = "served by basalt";
+  const gzip = gzipSync(payload);
+  const provider = createServer(async (incoming, outgoing) => {
+    let body = "";
+    incoming.setEncoding("utf8");
+    for await (const chunk of incoming) body += chunk;
+    forwarded.push({ encoding: incoming.headers["accept-encoding"], policy: incoming.headers["route-policy"], body });
+    outgoing.writeHead(200, { "content-type": "text/plain", "content-encoding": "gzip", "content-length": gzip.length }).end(gzip);
+  }).listen(0, "127.0.0.1");
+  const base = await listening(t, provider);
+  const handler = createGateway({ models: { [model]: [route("basalt", `${base}/v1`)] } });
+  const url = await listening(t, serve(handler, 0));
+  const init = target(`${model}+zdr`);
+  const reply = await fetch(`${url}/v1/chat/completions`, { ...init, headers: { ...init.headers, "Route-Policy": "zdr", "accept-encoding": "br" } });
+  assert.equal(reply.status, 200);
+  assert.equal(reply.headers.get("content-encoding"), null);
+  assert.equal(reply.headers.get("content-length"), null);
+  assert.equal(await reply.text(), payload);
+  assert.deepEqual(forwarded, [{ encoding: "identity", policy: undefined, body: JSON.stringify({ model, stream: false }) }]);
+});
+
 test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, and plain has no detection", async (t) => {
   const { server, base } = await startDemo(0);
   t.after(() => { server.closeAllConnections(); server.close(); });
@@ -96,6 +123,9 @@ test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, a
   assert.ok(detectionBody && typeof detectionBody === "object" && "route_policy" in detectionBody && "key_policy" in detectionBody);
   assert.equal(detectionBody.route_policy, "1");
   assert.equal(detectionBody.key_policy, "zdr");
+  const anonymous = await fetch(`${base}/v1/route-policy`);
+  assert.equal(anonymous.status, 200);
+  assert.deepEqual(await anonymous.json(), Object.fromEntries(Object.entries(detectionBody).filter(([name]) => name !== "key_policy")));
   const listed = await fetch(`${base}/v1/models`);
   assert.deepEqual(await listed.json(), { object: "list", data: [{ id: model, routes: [
     { provider: "aurora", facts: "zdr+notrain+bits=8+region=us" }, { provider: "basalt", facts: "bits=16+region=us,de+attest=weights,prompt", evidence: "https://basalt.example/attestation" }, { provider: "cobalt", facts: "" },
@@ -114,11 +144,19 @@ test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, a
       if (stream && endpoint === "messages") assert.match(text, /event: message_stop/);
     }
   }
+  const unattested = await fetch(`${base}/v1/chat/completions`, {
+    ...target(`${model}+only=basalt`),
+    headers: { authorization: "Bearer demo-key", "content-type": "application/json" },
+  });
+  assert.equal(unattested.status, 200);
+  assert.equal(unattested.headers.get("route-applied"), "provider=basalt");
+  assert.equal(unattested.headers.get("route-evidence"), null);
+  assert.match(await unattested.text(), /served by basalt/);
   assert.equal((await fetch(`${base}/plain/v1/route-policy`)).status, 404);
   assert.match(await (await fetch(`${base}/plain/v1/chat/completions`, target(model))).text(), /served by plain/);
   const log: unknown = await (await fetch(`${base}/__demo/requests`)).json();
   assert.ok(Array.isArray(log));
-  assert.equal(log.length, 7);
+  assert.equal(log.length, 8);
   const reported: unknown[] = log;
   const actual = reported.map((row) => {
     assert.ok(typeof row === "object" && row !== null && "provider" in row && "path" in row && "body" in row && "headers" in row);
@@ -127,7 +165,8 @@ test("G14 G17 G20 G23: demo advertises routes, forwards to real mock surfaces, a
     for (const name of ["route-policy", "authorization", "x-api-key"]) assert.equal(Object.hasOwn(row.headers, name), false);
     return [row.provider, row.path, row.body.model];
   });
-  assert.deepEqual(actual, [...ENDPOINTS.flatMap((ep) => [["basalt", `/v1/${ep}`, model], ["basalt", `/v1/${ep}`, model]]), ["plain", "/v1/chat/completions", model]]);
+  assert.deepEqual(actual, [...ENDPOINTS.flatMap((ep) => [["basalt", `/v1/${ep}`, model], ["basalt", `/v1/${ep}`, model]]),
+    ["basalt", "/v1/chat/completions", model], ["plain", "/v1/chat/completions", model]]);
   assert.equal((await fetch(`${base}/__demo/requests`, { method: "DELETE" })).status, 204);
   assert.deepEqual(await (await fetch(`${base}/__demo/requests`)).json(), []);
 });

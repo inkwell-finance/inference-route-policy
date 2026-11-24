@@ -184,7 +184,8 @@ export class RouteClient {
       if (!result.ok) noDetection = result.why;
       const bound = detection?.keyPolicy == null ? null : parsePolicy(detection.keyPolicy, detection.support);
       const requirement = anyRequirement(layers.value) || (bound?.ok === true && hasRequirements(bound.value));
-      if (detection !== null && requirement && !isOpenRouter(base)) {
+      // OpenRouter is only its documented base URL; with a query it is another base URL, whose list is read.
+      if (detection !== null && requirement && !isOpenRouter(`${base}${target.query}`)) {
         modelList = await this.#modelList(located);
       }
     }
@@ -289,7 +290,7 @@ export class RouteClient {
       const as = credentials.length === 0 ? "without a credential" : `with the credential in ${credentials.join(", ")}`;
       const result = await this.#detection(located);
       if (!result.ok) {
-        lines.push(`Gateway ${base}, read ${as}: no detection (${result.why})${isOpenRouter(target.base) ? "; policies are translated into OpenRouter's own fields where it has a filter for them" : ""}`);
+        lines.push(`Gateway ${base}, read ${as}: no detection (${result.why})${isOpenRouter(base) ? "; policies are translated into OpenRouter's own fields where it has a filter for them" : ""}`);
       } else {
         const { support, keyPolicy } = result.detection;
         lines.push(`Gateway ${base}, read ${as}: detection valid; accepts ${[...support.keys].join(", ")}`);

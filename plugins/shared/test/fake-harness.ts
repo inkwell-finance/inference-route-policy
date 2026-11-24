@@ -30,12 +30,17 @@ export class FakeHarness {
   /** What `modelRegistry.getApiKeyAndHeaders` does; tests replace it to make the plugin fail. */
   resolveAuth: () => Promise<unknown> = async () => ({ ok: true, apiKey: "demo-key" });
   uiThrows = false;
+  /** Makes only one UI channel throw. */
+  statusThrows = false;
+  notifyThrows = false;
   /** The key the transport puts on the wire, none when null; a harness can send another than the registry reported. */
   wireKey: string | null = "demo-key";
   /** Headers the transport adds on its own, after the configured ones would be: a transport the plugin cannot see into. */
   extraWireHeaders: Record<string, string> = {};
   /** The URL the transport sends to; by default the model's base URL with the endpoint path appended. */
   wireUrl: string | null = null;
+  /** Changes the headers last, as a transport the plugin cannot see into might: to change, remove, or add one. */
+  rewriteWire: (wire: Headers) => void = () => {};
   /** Replaces `ctx.model`, to hand the plugin a model the harness would never describe that way. */
   contextModel: unknown = undefined;
   readonly headerHook: boolean;
@@ -62,7 +67,7 @@ export class FakeHarness {
 
   ctx(): unknown {
     const show = (method: Shown["method"], text: string): void => {
-      if (this.uiThrows) throw new Error("UI is gone");
+      if (this.uiThrows || (method === "setStatus" ? this.statusThrows : this.notifyThrows)) throw new Error(`${method} is gone`);
       this.shown.push({ method, text });
     };
     return {
@@ -113,6 +118,7 @@ export class FakeHarness {
     else wire.set("authorization", `Bearer ${this.wireKey}`);
     for (const [name, value] of Object.entries(this.extraWireHeaders)) wire.set(name, value);
     for (const [name, value] of Object.entries(headers)) if (value !== null) wire.set(name, value);
+    this.rewriteWire(wire);
     let response: Response;
     try {
       response = await fetch(this.wireUrl ?? `${this.model.baseUrl}/chat/completions`, { method: "POST", headers: wire, body });

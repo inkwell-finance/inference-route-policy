@@ -1450,5 +1450,74 @@ test("S9: providerAllowed decides only and ignore from the provider id alone, as
     assert.equal(providerAllowed(provider, sent), expected, `${text} ${provider}`);
     assert.equal(meets({ provider, facts: facts("zdr+notrain+bits=16") }, sent), expected, `meets ${text} ${provider}`);
   }
-  assert.throws(() => providerAllowed("aurora", {} as never), TypeError);
+});
+
+test("a look-alike policy or facts is refused in every argument position, by the library's own error", () => {
+  const made = policy("zdr+only=a");
+  const read = facts("zdr");
+  const notAPolicy = { name: "TypeError", message: /^policy was not made by/ };
+  const notFacts = { name: "TypeError", message: /^facts were not made by/ };
+  const forged: Policy = { ...made };
+  const forgedFacts: Facts = { ...read };
+
+  // Each layer of a combination, with real policies in the other two.
+  for (const layer of ["key", "header", "suffix"] as const) {
+    assert.throws(() => combinePolicies({ key: made, header: made, suffix: made, [layer]: forged }), notAPolicy, layer);
+  }
+  // Each position of a list.
+  assert.throws(() => clearedToSend(baselineSupport(), [forged, made]), notAPolicy);
+  assert.throws(() => clearedToSend(baselineSupport(), [made, forged]), notAPolicy);
+  // A look-alike has every field the real one has, so only the library's own check can refuse it.
+  assert.throws(() => providerAllowed("a", forged), notAPolicy);
+  assert.throws(() => providerAllowed("a", {} as never), notAPolicy);
+  assert.equal(providerAllowed("a", made), true);
+
+  const routes = parseRoutes([{ provider: "a", facts: "zdr" }]);
+  assert.equal(someRouteMeets(routes, made), true);
+  assert.throws(() => someRouteMeets(routes, forged), notAPolicy);
+  routes.set("a", { facts: forgedFacts, evidence: null });
+  assert.throws(() => someRouteMeets(routes, made), notFacts);
+  assert.throws(() => readOutcome({ applied: ["provider=a"], refused: [], evidence: [] }, made, routes), notFacts);
+});
+
+test("G11, G13: each requirement survives combining from each carrier alone", () => {
+  const requirements: [text: string, field: keyof Policy, expected: unknown][] = [
+    ["zdr", "zdr", true],
+    ["notrain", "notrain", true],
+    ["bits=16", "bits", 16],
+    ["region=us", "region", ["us"]],
+    ["only=a", "only", ["a"]],
+    ["ignore=a", "ignore", ["a"]],
+    ["attest=prompt", "attest", ["prompt"]],
+  ];
+  for (const carrier of ["key", "header", "suffix"] as const) {
+    for (const [text, field, expected] of requirements) {
+      // The other two carriers state only preferences, so the requirement comes from this carrier alone.
+      const others = { key: policy("sort=price"), header: policy("order=x"), suffix: policy("sort=latency") };
+      const combined = combinePolicies({ ...others, [carrier]: policy(text) });
+      assert.deepEqual(combined[field], expected, `${carrier}: ${text}`);
+    }
+  }
+});
+
+test("G13: no carrier removes or weakens a requirement another carrier states, whichever two they are", () => {
+  const strong = "zdr+notrain+bits=16+region=us+attest=weights+only=a+ignore=b";
+  const weaker = ["sort=price", "bits=1", "region=us,de,fr", "only=a,b,c", "attest=prompt", "ignore=c"];
+  const carriers = ["key", "header", "suffix"] as const;
+  for (const owner of carriers) {
+    for (const other of carriers) {
+      if (other === owner) continue;
+      for (const text of weaker) {
+        const value = combinePolicies({ [owner]: policy(strong), [other]: policy(text) });
+        const label = `${owner} holds it, ${other} states ${text}`;
+        assert.equal(value.zdr, true, label);
+        assert.equal(value.notrain, true, label);
+        assert.equal(value.bits, 16, label);
+        assert.deepEqual(value.region, ["us"], label);
+        assert.deepEqual(value.only, ["a"], label);
+        assert.ok(value.attest.includes("weights"), label);
+        assert.ok(value.ignore.includes("b"), label);
+      }
+    }
+  }
 });

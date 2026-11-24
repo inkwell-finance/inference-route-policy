@@ -1,6 +1,6 @@
 import { request as http } from "node:http";
 import { request as https } from "node:https";
-import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
+import * as zlib from "node:zlib";
 
 export interface Credential {
   key: string;
@@ -19,6 +19,7 @@ export interface Observation {
   status: number;
   body: unknown;
   hasBody: boolean;
+  bodyUnavailable?: string;
   contentType: string | undefined;
   applied: string[];
   refused: string[];
@@ -27,6 +28,29 @@ export interface Observation {
 }
 
 const policyHeader = (index: number, mixedFirst = false): string => (index % 2 === 0) !== mixedFirst ? "Route-Policy" : "rOuTe-PoLiCy";
+
+function decode(bytes: Buffer, encodings: readonly string[]): { bytes: Buffer } | { bodyUnavailable: string } {
+  for (const encoding of encodings.join(",").split(",").reverse()) {
+    const coding = encoding.trim().toLowerCase();
+    try {
+      switch (coding) {
+        case "":
+        case "identity": break;
+        case "gzip":
+        case "x-gzip": bytes = zlib.gunzipSync(bytes); break;
+        case "deflate": bytes = zlib.inflateSync(bytes); break;
+        case "br": bytes = zlib.brotliDecompressSync(bytes); break;
+        case "zstd":
+          if (typeof zlib.zstdDecompressSync === "function") { bytes = zlib.zstdDecompressSync(bytes); break; }
+          return { bodyUnavailable: "unsupported Content-Encoding zstd" };
+        default: return { bodyUnavailable: `unsupported Content-Encoding ${coding}` };
+      }
+    } catch {
+      return { bodyUnavailable: `could not decode Content-Encoding ${coding}` };
+    }
+  }
+  return { bytes };
+}
 
 export function parseBase(raw: string) {
   const url = new URL(raw);
@@ -87,20 +111,17 @@ export async function request(base: ReturnType<typeof parseBase>, probe: Probe, 
         else resolve({ ...result, body: undefined, hasBody: false, received: JSON.stringify({ ...result, body: `<incomplete relay: ${error.message}>` }) });
       });
       reply.on("end", () => {
-        try {
-          let bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
-          for (const encoding of (buckets.get("content-encoding") ?? []).join(",").split(",").reverse()) {
-            switch (encoding.trim().toLowerCase()) {
-              case "br": bytes = brotliDecompressSync(bytes); break;
-              case "gzip": bytes = gunzipSync(bytes); break;
-              case "deflate": bytes = inflateSync(bytes); break;
-            }
-          }
-          const text = bytes.toString("utf8");
-          let body: unknown;
-          try { body = JSON.parse(text); } catch { body = undefined; }
-          resolve({ ...result, body, hasBody: text.trim().length !== 0, received: JSON.stringify({ ...result, body: text.length <= 512 ? text : `${text.slice(0, 512)}…` }) });
-        } catch (error) { reject(error); }
+        const bytes = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks);
+        const decoded = bytes.length === 0 ? { bytes } : decode(bytes, buckets.get("content-encoding") ?? []);
+        if ("bodyUnavailable" in decoded) {
+          resolve({ ...result, ...decoded, body: undefined, hasBody: true, received: JSON.stringify({ ...result, ...decoded }) });
+          return;
+        }
+        // JSON readers may ignore a leading UTF-8 BOM; it is not part of the envelope.
+        const text = decoded.bytes.toString("utf8").replace(/^\uFEFF/, "");
+        let body: unknown;
+        try { body = JSON.parse(text); } catch { body = undefined; }
+        resolve({ ...result, body, hasBody: text.trim().length !== 0, received: JSON.stringify({ ...result, body: text.length <= 512 ? text : `${text.slice(0, 512)}…` }) });
       });
     });
     req.on("error", reject);

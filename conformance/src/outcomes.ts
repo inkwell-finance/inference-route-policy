@@ -7,6 +7,7 @@ import { sent, type Observation, type Probe } from "./http.ts";
 // Empty refusal, media mismatch, invalid declared JSON | FAIL: a positive contradiction.
 // A JSON member has no observed type at its known path | FAIL: a positive contradiction.
 // Non-JSON refusal without a media contradiction      | SKIP: structure not compared.
+// Body with an uninspectable content coding             | SKIP if its shape is needed.
 // JSON shape equals one complete own-error sample     | PASS: that shape was observed.
 // JSON shape differs only by fields or their grouping  | SKIP: name the unverified difference.
 // Array shapes ignore order and repetitions, not element structure. Only a
@@ -145,6 +146,7 @@ function mediaType(reply: Observation): string | undefined {
 }
 
 function compareErrorShape(reply: Observation, controls: readonly Observation[], shapeId: (value: unknown) => number): Shape {
+  if (reply.bodyUnavailable !== undefined) return { unparsed: `inspectable refusal body (${reply.bodyUnavailable})` };
   const media = mediaType(reply);
   const sameMedia = controls.filter((sample) => mediaType(sample) === media);
   if (controls.length > 0 && sameMedia.length === 0) {
@@ -155,9 +157,11 @@ function compareErrorShape(reply: Observation, controls: readonly Observation[],
   }
   if (reply.body === undefined) return { contradiction: "expected a JSON error body" };
   const json = sameMedia.flatMap((sample) => sample.body === undefined ? [] : [sample.body]);
-  if (json.length === 0) return { unseen: "an ordinary JSON error body under the same credential" };
   const refusalId = shapeId(reply.body);
   if (json.some((sample) => shapeId(sample) === refusalId)) return {};
+  const unreadable = sameMedia.find((sample) => sample.bodyUnavailable !== undefined)?.bodyUnavailable;
+  if (unreadable !== undefined) return { unseen: `inspectable ordinary error control (${unreadable})` };
+  if (json.length === 0) return { unseen: "an ordinary JSON error body under the same credential" };
   const shape = compareJsonShape(reply.body, json, "$");
   return shape.contradiction !== undefined || shape.unseen !== undefined || shape.missing !== undefined
     ? shape : { unseen: `one ordinary error control with the same whole refusal shape (difference at ${shapeDifference(reply.body, json[0], shapeId, "$")})` };

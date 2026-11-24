@@ -300,22 +300,32 @@ export async function runConformance(options: Options): Promise<Report> {
   const firstDetection = exchanges.length;
   await check("G20", `valid detection objects returned for all ${detectionScopes.size} requested credential scopes, including anonymous`, async () => {
     let firstFailure: unknown;
+    let missing: string | undefined;
     for (const current of detectionScopes) {
       const probe = metadata("route-policy", current);
       try {
         const r = await expect(probe, "a response to detection", () => true);
         current.detectionReply = r;
+        if (r.status === 200 && r.bodyUnavailable !== undefined) {
+          missing ??= `inspectable /route-policy reply (${r.bodyUnavailable})`;
+          continue;
+        }
         const parsed = parseDetection({ status: r.status, body: r.body, credentialed: current.credential !== undefined });
         if (!parsed.ok) throw mismatch(probe, r.received, `a complete valid detection reply: ${parsed.detail}`);
         current.detection = parsed.value;
       } catch (error) { firstFailure ??= error; }
     }
     if (firstFailure !== undefined) throw firstFailure;
+    return missing;
   });
   await check("G22", "the anonymous reply omitted key_policy; every observed credentialed key_policy was valid under its own lists", async () => {
     let missing: string | undefined;
     for (const current of detectionScopes) {
       const reply = current.detectionReply;
+      if (reply?.bodyUnavailable !== undefined) {
+        missing ??= `inspectable detection object (${reply.bodyUnavailable})`;
+        continue;
+      }
       if (reply === undefined || reply.body === null || typeof reply.body !== "object" || Array.isArray(reply.body)) {
         missing ??= "an inspectable detection object under each supplied credential and anonymously";
         continue;
@@ -341,11 +351,20 @@ export async function runConformance(options: Options): Promise<Report> {
   await check("G23", `validated model and route entries in all ${modelScopes.size} requested catalog scopes`, async () => {
     let firstFailure: unknown;
     let count = 0;
+    let missing: string | undefined;
     for (const current of modelScopes) {
       const probe = metadata("models", current);
       try {
         const reply = await expect(probe, "a successful model list", () => true);
         if (isBareError(reply)) continue;
+        if (reply.status === 204 && !reply.hasBody) {
+          missing ??= "an inspectable model list; /models returned HTTP 204 No Content";
+          continue;
+        }
+        if (reply.status >= 200 && reply.status < 300 && reply.bodyUnavailable !== undefined) {
+          missing ??= `inspectable /models reply (${reply.bodyUnavailable})`;
+          continue;
+        }
         const problem = schemaProblem(reply.body);
         if (problem !== undefined || reply.status < 200 || reply.status >= 300) throw mismatch(probe, reply.received, problem ?? "a successful model list");
         current.models = discover(reply.body, current.detection?.support ?? BASELINE);
@@ -354,7 +373,7 @@ export async function runConformance(options: Options): Promise<Report> {
       } catch (error) { firstFailure ??= error; }
     }
     if (firstFailure !== undefined) throw firstFailure;
-    if (count !== modelScopes.size) return "an accessible /models response for each supplied credential";
+    if (count !== modelScopes.size) return missing ?? "an accessible /models response for each supplied credential";
   });
 
   const on = (ep: Endpoint, credential?: Credential) => (id: string, header?: string, suffix?: string, stream?: boolean): Probe => ({
@@ -388,12 +407,6 @@ export async function runConformance(options: Options): Promise<Report> {
     const policyInference = on(endpoint, policyScope.credential);
     const bodyProbe = (raw: string): Probe => ({ ...metadata(endpoint, primary), raw });
     const run = (id: string, detail: string, fn: () => Promise<void | string>) => check(id, detail, fn, endpoint);
-    // Ordinary-error samples serve both G25 and the final error-shape audit.
-    async function ordinaryError(probe: Probe): Promise<Exchange> {
-      const sample = await observe(probe).catch((error: unknown) => { throw mismatch(probe, String(error), "an ordinary error response"); });
-      if (!isBareError(sample.reply)) throw mismatch(probe, sample.reply.received, "an ordinary error with no route headers");
-      return sample;
-    }
     // Only the ordinary side supplies an error shape. Matching status on
     // the policy challenge corroborates origin, not the challenge's body.
     function registerOwnError(kind: string, ...samples: Exchange[]): void {
@@ -793,18 +806,24 @@ export async function runConformance(options: Options): Promise<Report> {
       if (!ran) return "an accepted provider-selection key and a suitable published model";
     });
     await run("G25", "corroborated ordinary errors retained their status and no route headers when challenged with a policy", async () => {
-      const malformed = bodyProbe("{");
-      const malformedControl = await ordinaryError(malformed);
-      await compareOwn(malformedControl, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] }, "malformed JSON");
-      for (const raw of ['{"model":4}', "{}"]) {
-        const probe = bodyProbe(raw);
-        const control = await ordinaryError(probe);
-        await compareOwn(control, { ...probe, policies: [INVALID_POLICY] }, raw === "{}" ? "missing model field" : "wrong model type");
-      }
-      const emptyModel = await ordinaryError(inference(""));
-      await compareOwn(emptyModel, inference("", INVALID_POLICY, INVALID_POLICY), "empty model ID");
       const missing: string[] = [];
       const observeControl = (probe: Probe) => observe(probe).catch(() => undefined);
+      async function compareIfRejected(plain: Probe, challenged: Probe, kind: string): Promise<Exchange | undefined> {
+        const control = await observeControl(plain);
+        if (control === undefined || !isBareError(control.reply)) {
+          missing.push(`${kind} subcase: the no-policy control did not establish an own error (${control === undefined ? "no response" : `HTTP ${control.reply.status}`})`);
+          return undefined;
+        }
+        await compareOwn(control, challenged, kind);
+        return control;
+      }
+      const malformed = bodyProbe("{");
+      const malformedControl = await compareIfRejected(malformed, { ...malformed, policies: [INVALID_POLICY, INVALID_POLICY] }, "malformed JSON");
+      for (const [raw, kind] of [['{"model":4}', "wrong model type"], ["{}", "missing model field"]] as const) {
+        const probe = bodyProbe(raw);
+        await compareIfRejected(probe, { ...probe, policies: [INVALID_POLICY] }, kind);
+      }
+      await compareIfRejected(inference(""), inference("", INVALID_POLICY, INVALID_POLICY), "empty model ID");
       const unknown = await observeControl(inference(unknownModel));
       if (unknown === undefined || !isBareError(unknown.reply)) {
         missing.push(`unknown-model subcase: no-policy control did not establish an ordinary error (${unknown === undefined ? "no response" : `HTTP ${unknown.reply.status}`})`);
@@ -836,8 +855,8 @@ export async function runConformance(options: Options): Promise<Report> {
           // the credential should reproduce the candidate's error there and
           // distinguish it from the ordinary malformed-body error.
           const challenge = await observeControl({ ...malformed, credential });
-          if (challenge !== undefined && isBareError(challenge.reply) && challenge.reply.status === candidate.reply.status
-            && challenge.reply.status !== malformedControl.reply.status) {
+          if (malformedControl !== undefined && challenge !== undefined && isBareError(challenge.reply)
+            && challenge.reply.status === candidate.reply.status && challenge.reply.status !== malformedControl.reply.status) {
             registerOwnError("bad credential", challenge);
             await compareOwn(candidate, { ...plain, policies: [INVALID_POLICY] }, "bad credential");
           } else {

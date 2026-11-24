@@ -33,5 +33,6 @@ test("C14: scheme and host case, a default or empty port are the same base URL (
 test("C14: a base URL with credentials in it is not a place fetch can send to", () => {
   assert.equal(placeOf("http://user:secret@gateway.test/v1"), null);
   assert.equal(placeOf("http://user@gateway.test/v1"), null);
+  assert.equal(placeOf("http://:secret@gateway.test/v1"), null, "a password without a user name too");
   assert.equal(placeOf("not a url"), null);
 });

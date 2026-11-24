@@ -63,8 +63,12 @@ const post = (init: { headers?: RequestInit["headers"]; body?: string; url?: str
 test("C1: a POST no release matches fails in fetch, before anything reaches the gateway, when a watcher says a policy is at stake", async () => {
   const stops = watchAll();
   await assert.rejects(post(), /^Error: Blocked by the route policy plugin, nothing was sent: not released$/);
+  // With a release pending for other bytes, the same POST is still the watcher's to stop.
+  const other = release({ body: JSON.stringify({ model: "other-model", messages: [] }) });
+  await assert.rejects(post(), /^Error: Blocked by the route policy plugin, nothing was sent: not released$/);
   assert.equal(gateway.requests.length, 0);
-  assert.deepEqual(stops, ["not released"], "the watching session is told");
+  assert.deepEqual(stops, ["not released", "not released"], "the watching session is told, each time");
+  assert.deepEqual([other.completions, other.stops], [[], []], "the other release is not touched");
 });
 
 test("C1: a watcher that throws stops the request rather than letting it pass", async () => {
@@ -90,7 +94,7 @@ test("C1, C14: a release whose decision is no longer current is stopped and its 
   const owner = release({ current: () => false });
   await assert.rejects(post(), /the detection reply this request was checked against was discarded before it left/);
   assert.equal(gateway.requests.length, 0);
-  assert.equal(owner.stops.length, 1);
+  assert.deepEqual(owner, { completions: [], stops: ["the detection reply this request was checked against was discarded before it left; send it again"] });
 });
 
 test("C1, C9, C14: only the released bytes go: another key, an added credential header, another policy header, or another body is not the release", async () => {
@@ -101,6 +105,7 @@ test("C1, C9, C14: only the released bytes go: another key, an added credential 
     { headers: { authorization: "Bearer k", "x-api-key": "k2", "route-policy": "zdr" } },
     { headers: { authorization: "Bearer k", cookie: "session=1", "route-policy": "zdr" } },
     { headers: { authorization: "Bearer k", "x-tenant-token": "t", "route-policy": "zdr" } },
+    { headers: { authorization: "Bearer k", "proxy-authorization": "Basic eA==", "route-policy": "zdr" } },
     { url: `${gateway.base}/chat/completions?key=1` },
     { url: `${new URL(gateway.base).origin}/other/chat/completions` },
     { headers: { authorization: "Bearer k", "route-policy": "zdr+notrain" } },
@@ -110,6 +115,9 @@ test("C1, C9, C14: only the released bytes go: another key, an added credential 
     { body: `${BODY} ` },
   ];
   for (const variant of variants) await assert.rejects(post(variant), /not released/, JSON.stringify(variant));
+  // A release with no policy header is not one with any: an added Route-Policy is another request.
+  release({ header: null });
+  await assert.rejects(post({ headers: { authorization: "Bearer k", "route-policy": "zdr+notrain" } }), /not released/);
   assert.equal(gateway.requests.length, 0);
 });
 
@@ -154,13 +162,16 @@ test("C1, C5: when two sessions released the same bytes, whose call it is cannot
   const second = release({ owner: { session: 2 } });
   await assert.rejects(post(), /two sessions released this same request/);
   assert.equal(gateway.requests.length, 0);
-  assert.deepEqual([first.stops.length, second.stops.length], [1, 1]);
+  const told = { completions: [], stops: ["two sessions released this same request, so whose it is cannot be told"] };
+  assert.deepEqual([first, second], [told, told]);
 });
 
 test("C5: of two sessions with requests in flight together, each hears only its own response, the first to leave finishing last", async () => {
   const OTHER = JSON.stringify({ model: "other-model", messages: [] });
-  const mine = release({ owner: { session: 1 } });
-  const theirs = release({ owner: { session: 2 }, body: OTHER });
+  // One stream for both sessions, in the order the callbacks come.
+  const heard: string[] = [];
+  const mine = release({ owner: { session: 1 }, complete: (c) => heard.push(`mine ${c.status}`) });
+  const theirs = release({ owner: { session: 2 }, body: OTHER, complete: (c) => heard.push(`theirs ${c.status}`) });
   gateway.replies.inference = (request) =>
     request.body === BODY
       ? { status: 200, headers: { "route-applied": "provider=aurora" }, body: {}, delayMs: 200 }
@@ -168,24 +179,27 @@ test("C5: of two sessions with requests in flight together, each hears only its 
   const first = post();
   await until(() => gateway.inference().length === 1);
   await Promise.all([first.then((r) => r.text()), post({ body: OTHER }).then((r) => r.text())]);
-  assert.deepEqual(mine.completions.map((c) => [c.status, c.result.applied]), [[200, ["provider=aurora"]]]);
-  assert.deepEqual(theirs.completions.map((c) => [c.status, c.result.refused]), [[400, ["reason=unsatisfiable"]]]);
+  assert.deepEqual(heard, ["theirs 400", "mine 200"], "the second to leave is heard first, each by its own session");
+  assert.deepEqual([mine.stops, theirs.stops], [[], []]);
 });
 
 test("C1: a released request does not follow a redirect: its body goes nowhere else", async () => {
-  const owner = release();
-  gateway.replies.inference = { status: 307, headers: { location: `${elsewhere.base}/chat/completions` } };
-  const response = await post();
-  assert.equal(response.status, 307);
-  assert.equal(elsewhere.requests.length, 0);
-  assert.equal(owner.completions[0]?.status, 307);
+  // Each redirect that would resend the body: 307 and 308.
+  for (const status of [307, 308]) {
+    const owner = release();
+    gateway.replies.inference = { status, headers: { location: `${elsewhere.base}/chat/completions` } };
+    const response = await post();
+    assert.equal(response.status, status);
+    assert.equal(elsewhere.requests.length, 0, String(status));
+    assert.deepEqual(owner.completions.map((c) => c.status), [status]);
+  }
 });
 
 test("C3: repeated Route-Applied lines reach the reader as one joined value", async () => {
   const owner = release();
   gateway.replies.inference = { status: 200, headers: { "route-applied": ["provider=aurora", "provider=basalt"] }, body: {} };
   await (await post()).text();
-  assert.deepEqual(owner.completions[0]?.result.applied, ["provider=aurora, provider=basalt"]);
+  assert.deepEqual(owner.completions, [{ status: 200, result: { applied: ["provider=aurora, provider=basalt"], refused: [], evidence: [] } }]);
 });
 
 test("C1, C14: a request goes only where fetch puts it on the wire for the released base URL, and each form that differs there is stopped", async () => {
@@ -209,16 +223,18 @@ test("C1, C14: a request goes only where fetch puts it on the wire for the relea
     { name: "an empty query before a fragment", base: `${G}/v1?`, url: `${G}/v1/chat/completions?#part`, target: "/v1/chat/completions?" },
     { name: "an empty query dropped", base: `${G}/v1?`, url: `${G}/v1/chat/completions`, target: /not released/ },
     { name: "credentials in the URL", base: `${G}/v1`, url: `http://user:secret@127.0.0.1:${port}/v1/chat/completions`, target: /credentials/ },
+    { name: "another origin's port, the same path", base: `${G}/v1`, url: `${elsewhere.base}/chat/completions`, target: /not released/ },
   ];
   for (const row of rows) {
     gateway.requests.length = 0;
+    elsewhere.requests.length = 0;
     const read = placeOf(row.base);
     assert.ok(read !== null && read.unexact === null, row.name);
     const owner = release({ ...read.place });
     const sending = fetch(row.url, { method: "POST", headers: { authorization: "Bearer k", "route-policy": "zdr" }, body: BODY });
     if (row.target instanceof RegExp) {
       await assert.rejects(sending, row.target, row.name);
-      assert.equal(gateway.requests.length, 0, row.name);
+      assert.deepEqual([gateway.requests.length, elsewhere.requests.length], [0, 0], row.name);
     } else {
       await (await sending).text();
       assert.deepEqual([gateway.requests.map((r) => r.path), owner.completions.length], [[row.target], 1], row.name);
@@ -236,11 +252,21 @@ test("C1, C14: header lines as fetch sends them: repeated lines go as one joined
   const raw = gateway.inference()[0]?.rawHeaders ?? [];
   const lines = (name: string): string[] => raw.flatMap((value, i) => (i % 2 === 1 && raw[i - 1]?.toLowerCase() === name ? [value] : []));
   assert.deepEqual([lines("x-tenant"), lines("authorization")], [["a, b"], ["Bearer k"]], "one line each, as the metadata reads sent them");
+  // The joined value is what is compared: missing, in another order, or joined otherwise, it is another request.
+  for (const tenant of [[], [["x-tenant", "b"], ["x-tenant", "a"]], [["x-tenant", "a,b"]], [["x-tenant", "a"]]]) {
+    release({ context: [["authorization", "Bearer k"], ["x-tenant", "a, b"]] });
+    await assert.rejects(post({ headers: [["authorization", "Bearer k"], ...tenant, ["route-policy", "zdr"]] as [string, string][] }), /not released/, JSON.stringify(tenant));
+  }
+  assert.equal(gateway.inference().length, 1);
 });
 
 test("C1: a GET is never stopped, and a POST no watcher claims goes", async () => {
   watchAll();
   await (await fetch(`${gateway.base}/models`)).text();
+  // Nor while a release is pending.
+  release();
+  await (await fetch(`${gateway.base}/models`)).text();
+  assert.equal(gateway.requests.filter((r) => r.method === "GET").length, 2);
   await (await post({ url: `${elsewhere.base}/chat/completions` })).text();
   assert.equal(elsewhere.inference().length, 1);
 });

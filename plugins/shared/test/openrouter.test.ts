@@ -19,6 +19,7 @@ function refused(text: string, why: RegExp): void {
 test("C9: only and ignore map to the documented provider filters, and sort and order to the documented preferences", () => {
   assert.deepEqual(provider("only=aurora,basalt"), { only: ["aurora", "basalt"] });
   assert.deepEqual(provider("ignore=cobalt"), { ignore: ["cobalt"] });
+  assert.deepEqual(provider("ignore=cobalt,basalt"), { ignore: ["cobalt", "basalt"] });
   assert.deepEqual(provider("sort=throughput+order=basalt,aurora"), { sort: "throughput", order: ["basalt", "aurora"] });
   assert.deepEqual(provider("only=aurora+ignore=cobalt+sort=price"), { only: ["aurora"], ignore: ["cobalt"], sort: "price" });
   assert.deepEqual(provider("sort=latency"), { sort: "latency" });
@@ -30,8 +31,12 @@ test("C9: each requirement with no documented hard filter refuses the whole poli
   refused("bits=8", /bits has no hard filter there \(quantizations names levels, not a floor on every weight\)/);
   refused("region=us", /region has no request field there/);
   refused("attest=weights", /attest has no counterpart there/);
-  // One unmappable requirement refuses a policy whose other parts map.
+  // Each one refuses a policy whose other parts map, for its own reason.
+  refused("only=aurora+zdr", /zdr has no hard filter/);
   refused("only=aurora+notrain", /notrain has no hard filter/);
+  refused("only=aurora+bits=8", /bits has no hard filter/);
+  refused("only=aurora+region=us", /region has no request field/);
+  refused("only=aurora+attest=weights", /attest has no counterpart/);
 });
 
 test("C9: an only list that combined to empty is refused rather than sent as an empty filter", () => {
@@ -46,4 +51,9 @@ test("C9: translation applies only to OpenRouter's documented base URL", () => {
   assert.ok(isOpenRouter("https://openrouter.ai/api/v1/"));
   assert.ok(!isOpenRouter("https://openrouter.ai/api/v2"));
   assert.ok(!isOpenRouter("https://eu.openrouter.ai/api/v1"));
+  // Another scheme, another port, or a query is another base URL.
+  assert.ok(!isOpenRouter("http://openrouter.ai/api/v1"));
+  assert.ok(!isOpenRouter("https://openrouter.ai:8443/api/v1"));
+  assert.ok(!isOpenRouter("https://openrouter.ai/api/v1?tenant=east"));
+  assert.ok(!isOpenRouter("https://openrouter.ai/api/v1?"));
 });

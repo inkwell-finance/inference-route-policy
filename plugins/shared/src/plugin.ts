@@ -165,11 +165,18 @@ function show(ui: UI | null, report: Report, subject: string | null): void {
   if (ui === null) return;
   // The status line outlives the request: it says which request it is about.
   const text = subject === null ? describeReport(report) : `${describeReport(report)} (${subject})`;
+  // Each channel on its own: one that throws silences neither the other nor the request guard it runs in, where
+  // a UI that throws must not turn a block into a send.
+  attempt(() => ui.setStatus(STATUS_KEY, text));
+  if (!isQuiet(report)) attempt(() => ui.notify(text, report.kind === "refused" || report.kind === "blocked" ? "error" : "warning"));
+}
+
+/** Runs one UI call; what it throws is dropped, since nothing the plugin decides depends on being shown. */
+function attempt(call: () => void): void {
   try {
-    ui.setStatus(STATUS_KEY, text);
-    if (!isQuiet(report)) ui.notify(text, report.kind === "refused" || report.kind === "blocked" ? "error" : "warning");
+    call();
   } catch {
-    // Reporting runs inside the request guard; a UI that throws must not turn a block into a send.
+    // The user is told through whichever channel still works.
   }
 }
 
@@ -325,12 +332,9 @@ export function registerRoutePlugin(api: ExtensionAPI, options: PluginOptions): 
   };
   for (const event of options.restoreEvents) api.on(event, restore);
   api.on("session_shutdown", () => {
-    try {
-      stopWatching();
-      withdrawReleases(client);
-    } catch {
-      // Nothing to send here; a session that ended sends nothing more.
-    }
+    // Each on its own: a failure to stop watching must not leave this session's releases usable, nor the reverse.
+    attempt(() => withdrawReleases(client));
+    attempt(stopWatching);
   });
 
   api.registerCommand("route", {

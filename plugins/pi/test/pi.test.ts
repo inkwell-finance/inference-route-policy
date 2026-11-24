@@ -37,11 +37,12 @@ const sentBody = (): unknown => JSON.parse(gateway.inference()[0]?.body ?? "{}")
 
 test("C10: pi: the held policy goes by the Route-Policy header and a typed suffix stays as typed", async () => {
   const harness = await pi("zdr+sort=price");
-  harness.model.id = "demo-model+bits=8";
+  // As typed, byte for byte: keys not in the order a writer would put them stay as they are.
+  harness.model.id = "demo-model+sort=latency+bits=8";
   assert.ok((await harness.request({ model: harness.model.id, messages: [] })).sent);
   const [request] = gateway.inference();
   assert.equal(request?.headers["route-policy"], "zdr+sort=price");
-  assert.deepEqual(sentBody(), { model: "demo-model+bits=8", messages: [] });
+  assert.deepEqual(sentBody(), { model: "demo-model+sort=latency+bits=8", messages: [] });
   assert.match(harness.shown.at(-1)?.text ?? "", /^route policy honored: served by aurora/);
 });
 
@@ -50,21 +51,35 @@ test("C10: pi: a Route-Policy header from the provider configuration is replaced
   harness.model.headers = { "route-policy": "bits=8" };
   await harness.request();
   assert.equal(gateway.inference()[0]?.headers["route-policy"], "zdr+bits=8");
+  // Whatever its case, and however many lines: each configured line goes, and only the combination remains.
+  for (const configured of [{ "ROUTE-POLICY": "bits=8" }, { "Route-Policy": "bits=8", "route-policy": "bits=8" }]) {
+    const headers: Record<string, string | null> = { ...configured };
+    harness.model.headers = configured;
+    await harness.emit("before_provider_headers", { type: "before_provider_headers", headers });
+    assert.deepEqual(Object.entries(headers).filter(([, value]) => value !== null), [["Route-Policy", "zdr+bits=8"]], JSON.stringify(configured));
+  }
 });
 
 test("C1: pi: a requirement with no valid detection reply is blocked and nothing reaches the gateway", async () => {
   gateway.replies.detection = { status: 200, body: { route_policy: 1 } };
-  const harness = await pi("zdr");
-  const result = await harness.request();
-  assert.equal(result.sent, false);
+  // Held, and typed into the model with nothing held.
+  for (const [held, model] of [["zdr", "demo-model"], [undefined, "demo-model+zdr"]] as const) {
+    const harness = await pi(held);
+    harness.model.id = model;
+    const result = await harness.request({ model, messages: [] });
+    assert.equal(result.sent, false, model);
+    assert.match(notices(harness).at(-1) ?? "", /no valid detection reply/);
+  }
   assert.equal(gateway.inference().length, 0);
-  assert.match(notices(harness).at(-1) ?? "", /no valid detection reply/);
 });
 
 test("C1: pi: a payload whose headers the plugin never prepared is blocked", async () => {
-  const harness = await pi("zdr");
-  const payload = await harness.emit("before_provider_request", { type: "before_provider_request", payload: { model: "demo-model", messages: [] } }, "payload");
-  assert.throws(() => JSON.stringify(payload), /did not see this request's headers/);
+  // With a policy held, with one typed into the model and none held, and with none at all.
+  for (const [held, model] of [["zdr", "demo-model"], [undefined, "demo-model+zdr"], [undefined, "demo-model"]] as const) {
+    const harness = await pi(held);
+    const payload = await harness.emit("before_provider_request", { type: "before_provider_request", payload: { model, messages: [] } }, "payload");
+    assert.throws(() => JSON.stringify(payload), /did not see this request's headers/, `${held ?? "none held"}, ${model}`);
+  }
 });
 
 test("C1: pi: requests prepared with different policies at once block the next payload, since its header is unknowable", async () => {
@@ -150,7 +165,11 @@ test("C14: pi: preparations are taken in the order they were made: a stale one a
   await headers();
   const stale = await payload();
   assert.throws(() => JSON.stringify(stale), /discarded since; it is not sent/);
-  assert.deepEqual(JSON.parse(JSON.stringify(await payload())), { model: "demo-model", messages: [] }, "the fresh preparation is released");
+  // The next request, headers and payload as pi sends them, is served by the fresh preparation and goes.
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} };
+  const posts = gateway.inference().length;
+  assert.ok((await harness.request({ model: "demo-model", messages: [] })).sent);
+  assert.equal(gateway.inference().length, posts + 1, "exactly one POST");
 });
 
 test("C14: pi: requests for one model prepared with different keys at once block the next payload", async () => {
@@ -175,7 +194,14 @@ test("C1, C14: pi: a Google API request carries its key in x-goog-api-key, which
   const harness = await pi("zdr");
   harness.model.api = "google-generative-ai";
   assert.ok((await harness.request({ contents: [] })).sent);
-  assert.ok(gateway.requests.filter((r) => r.method === "GET").every((r) => r.headers["x-goog-api-key"] === "demo-key" && r.headers.authorization === undefined));
+  // Every request, the POST included, carries the key there and only there.
+  assert.deepEqual(gateway.requests.map((r) => [r.method, r.headers["x-goog-api-key"], r.headers.authorization]), [["GET", "demo-key", undefined], ["GET", "demo-key", undefined], ["POST", "demo-key", undefined]]);
+  // Another key on the wire, or none: stopped.
+  for (const wireKey of ["other-key", null]) {
+    harness.wireKey = wireKey;
+    assert.match((await harness.request({ contents: [] })).error ?? "", /is not one the plugin released/, String(wireKey));
+  }
+  assert.equal(gateway.inference().length, 1);
 });
 
 test("C10: pi: each API that names its model in the URL may send a body without a model, its policy on the header alone", async () => {
@@ -184,23 +210,30 @@ test("C10: pi: each API that names its model in the URL may send a body without 
     const harness = await pi("zdr");
     harness.model.api = api;
     assert.ok((await harness.request({ contents: [] })).sent, api);
-    assert.equal(gateway.inference()[0]?.headers["route-policy"], "zdr", api);
+    assert.deepEqual(gateway.inference().map((r) => [r.headers["route-policy"], JSON.parse(r.body)]), [["zdr", { contents: [] }]], api);
   }
 });
 
 test("C10: pi: a request to an API that names its model in the body is blocked when its payload has none, even with the policy on the header", async () => {
-  const harness = await pi("zdr");
-  harness.model.api = "openai-responses";
-  assert.match((await harness.request({ input: "fixture" })).error ?? "", /has no model in its body, which the openai-responses API needs/);
+  for (const api of ["openai-completions", "openai-responses", "anthropic-messages", "azure-openai-responses", "mistral-conversations"]) {
+    const harness = await pi("zdr");
+    harness.model.api = api;
+    assert.match((await harness.request({ input: "fixture" })).error ?? "", new RegExp(`has no model in its body, which the ${api} API needs`), api);
+  }
   assert.equal(gateway.inference().length, 0);
 });
 
 test("C10: pi: the held policy survives a session resume", async () => {
-  const first = await pi("notrain");
-  const resumed = new FakeHarness(gateway.base, { headerHook: true });
-  resumed.entries.push(...first.entries);
-  routePolicy(resumed.api);
-  await resumed.emit("session_start", { type: "session_start", reason: "resume" });
-  await resumed.request();
-  assert.equal(gateway.inference()[0]?.headers["route-policy"], "notrain");
+  // The latest change is what is held: after several, and after a clear.
+  for (const [changes, header] of [[["notrain", "zdr", "clear", "zdr+notrain"], "zdr+notrain"], [["notrain", "zdr", "clear"], undefined]] as const) {
+    gateway.requests.length = 0;
+    const first = await pi();
+    for (const change of changes) await first.command("route", change);
+    const resumed = new FakeHarness(gateway.base, { headerHook: true });
+    resumed.entries.push(...first.entries);
+    routePolicy(resumed.api);
+    await resumed.emit("session_start", { type: "session_start", reason: "resume" });
+    await resumed.request();
+    assert.equal(gateway.inference()[0]?.headers["route-policy"], header, changes.join(", "));
+  }
 });

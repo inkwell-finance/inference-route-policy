@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { OPENROUTER_BASE } from "../src/openrouter.ts";
 import type { FakeHarness } from "./fake-harness.ts";
 import { PATH_QUERY_CASES, WHOLE_URL_CASES } from "./url-cases.ts";
-import type { FakeGateway } from "./fixtures.ts";
+import type { FakeGateway, Reply } from "./fixtures.ts";
 
 const notices = (harness: FakeHarness): string[] => harness.shown.filter((s) => s.method === "notify").map((s) => s.text);
 
@@ -47,15 +47,27 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
 
   test(`C1, C14: ${name}: every header the request carries is in the metadata reads, a cookie and a second key included, and must leave as read`, async () => {
     const harness = await make("zdr");
-    harness.model.headers = { "x-api-key": "demo-key-zdr", Cookie: "session=east" };
-    assert.ok((await harness.request()).sent, "bearer, x-api-key and cookie all leave as they were read");
-    const gets = gateway().requests.filter((r) => r.method === "GET");
-    assert.ok(gets.length > 0 && gets.every((r) => r.headers.authorization === "Bearer demo-key" && r.headers["x-api-key"] === "demo-key-zdr" && r.headers.cookie === "session=east"));
-    // A transport that adds a cookie the metadata was not read with is stopped.
-    harness.model.headers = {};
-    harness.extraWireHeaders = { cookie: "session=west" };
-    const result = await harness.request();
-    assert.match(result.error ?? "", /is not one the plugin released: .*it carries authorization, cookie besides the usual ones/);
+    const carried = { authorization: "Bearer demo-key", "x-api-key": "demo-key-zdr", cookie: "session=east", "x-tenant-token": "t1" };
+    harness.model.headers = { "x-api-key": "demo-key-zdr", Cookie: "session=east", "x-tenant-token": "t1" };
+    assert.ok((await harness.request()).sent, "every one of them leaves as it was read");
+    const seen = (r: { method: string; path: string; headers: Record<string, unknown> }): unknown[] => [r.method, r.path.replace(/^.*\/v1/, ""), ...Object.keys(carried).map((h) => r.headers[h])];
+    assert.deepEqual(gateway().requests.map(seen), [
+      ["GET", "/route-policy", ...Object.values(carried)],
+      ["GET", "/models", ...Object.values(carried)],
+      ["POST", "/chat/completions", ...Object.values(carried)],
+    ]);
+    // Each of them changed, removed, or one added on the wire after it was read: stopped, every time.
+    const changes: [string, (wire: Headers) => void][] = [];
+    for (const header of Object.keys(carried)) {
+      changes.push([`${header} changed`, (wire) => wire.set(header, "other")]);
+      changes.push([`${header} removed`, (wire) => wire.delete(header)]);
+    }
+    changes.push(["a cookie added", (wire) => wire.append("cookie", "who=west")]);
+    changes.push(["a proxy credential added", (wire) => wire.set("proxy-authorization", "Basic eA==")]);
+    for (const [change, rewrite] of changes) {
+      harness.rewriteWire = rewrite;
+      assert.match((await harness.request()).error ?? "", /is not one the plugin released/, change);
+    }
     assert.equal(gateway().inference().length, 1);
   });
 
@@ -87,16 +99,17 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
   });
 
   test(`C10: ${name}: an API that names its model in the URL cannot carry a typed suffix in a body, so a request with one is blocked`, async () => {
-    const harness = await make(undefined);
-    harness.model = { ...harness.model, id: "demo-model+zdr", api: "google-generative-ai" };
-    harness.wireKey = "demo-key";
-    const result = await harness.request({ contents: [] });
-    assert.match(result.error ?? "", /does not carry every policy that was decided for it|no model field to carry the policy/);
+    for (const api of ["google-generative-ai", "google-vertex", "google-gemini-cli", "bedrock-converse-stream"]) {
+      const harness = await make(undefined);
+      harness.model = { ...harness.model, id: "demo-model+zdr", api };
+      const result = await harness.request({ contents: [] });
+      assert.match(result.error ?? "", /does not carry every policy that was decided for it|no model field to carry the policy/, api);
+    }
     assert.equal(gateway().inference().length, 0);
   });
 
-  test(`C10: ${name}: a payload whose model is null, a number, an empty string, or another model is blocked, never sent without its carrier`, async () => {
-    for (const model of [null, 7, "", "other-model"]) {
+  test(`C10: ${name}: a payload whose model is null, a number, or an empty string is blocked, never sent without its carrier`, async () => {
+    for (const model of [null, 7, ""]) {
       const harness = await make("zdr");
       const result = await harness.request({ model, messages: [] });
       assert.equal(result.sent, false, `model ${JSON.stringify(model)}`);
@@ -139,11 +152,13 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
 
   test(`C14: ${name}: a host the parser would spell otherwise than written reaches nothing; a scheme and host differing only in case are used`, async () => {
     const port = new URL(gateway().base).port;
+    // Every case that names a port of its own reaches this gateway when it may; the others are stopped before any
+    // read, so they need no gateway behind them.
     for (const { name: kind, written, difference } of WHOLE_URL_CASES) {
-      if (!written.includes("{port}")) continue;
+      if (!written.includes("{port}") && difference === null) continue;
       const harness = await make("zdr");
-      harness.model.baseUrl = written.replace("{port}", port).replace("GATEWAY.TEST", "127.0.0.1");
-      harness.wireUrl = `http://127.0.0.1:${port}/v1/chat/completions`;
+      harness.model.baseUrl = written.replace("{port}", port).replace("GATEWAY.TEST", "LOCALHOST");
+      harness.wireUrl = difference === null ? `${new URL(harness.model.baseUrl).origin}/v1/chat/completions` : `http://127.0.0.1:${port}/v1/chat/completions`;
       const before = gateway().requests.length;
       const result = await harness.request();
       const received = gateway().requests.slice(before).length;
@@ -160,6 +175,8 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
   test(`C14: ${name}: /route for a base URL that cannot be used as written, or that fetch cannot send to, reads nothing and shows no detection, as the request guard does`, async () => {
     const harness = await make("zdr");
     const origin = new URL(gateway().base).origin;
+    // A place used before, read and sent to: nothing about it is a stand-in for the places below.
+    assert.ok((await harness.request()).sent);
     const before = gateway().requests.length;
     harness.model.baseUrl = `${origin}/v1?tag=O'Brien`;
     await harness.command("route", "");
@@ -170,24 +187,59 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     harness.model.baseUrl = origin.replace("http://", "http://user:secret@") + "/v1";
     await harness.command("route", "");
     assert.match(notices(harness).at(-1) ?? "", /^Gateway: unknown, nothing was read \(the base URL ".*" is not an absolute URL fetch can send to \(one with credentials in it is not\)\)$/m);
-    assert.equal(gateway().requests.length, before, "neither /route nor the request read anything");
+    // omp says why; pi, whose header hook found no place, says its headers could not be prepared.
+    assert.match((await harness.request()).error ?? "", /is not an absolute URL fetch can send to|could not prepare the headers of a request in flight/);
+    // A read started and not awaited would still land: give one the time to.
+    await new Promise((wake) => setTimeout(wake, 100));
+    assert.equal(gateway().requests.length, before, "neither /route nor the request read anything, at either place or the one used before");
   });
 
   test(`C3, C5: ${name}: the status line and every notice about a response name the request they are about, each its own`, async () => {
     const harness = await make("zdr");
-    const escaped = gateway().base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const about = new RegExp(`\\(request for demo-model(\\+zdr)? to ${escaped}\\)$`);
-    await harness.request();
-    const status = harness.shown.filter((line) => line.method === "setStatus").at(-1)?.text ?? "";
-    assert.match(status, /^route policy honored: served by aurora/);
-    assert.match(status, about);
-    // The second request goes to another place, so the notice must name this one, not the first.
-    gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
-    harness.model.baseUrl = `${gateway().base}?t=2`;
-    harness.wireUrl = `${gateway().base}/chat/completions?t=2`;
-    await harness.request();
-    assert.match(notices(harness).at(-1) ?? "", /^route policy refused by the gateway: unsatisfiable \(request for /);
-    assert.match(notices(harness).at(-1) ?? "", new RegExp(`\\(request for demo-model(\\+zdr)? to ${escaped}\\?t=2\\)$`));
+    const base = gateway().base;
+    // Three requests, each to a place of its own and answered differently: everything shown for each, status
+    // line and notices alike, is exactly its report followed by its own request.
+    const cases: { query: string; reply: Reply; report: string; notify: boolean }[] = [
+      { query: "", reply: { status: 200, headers: { "route-applied": "provider=aurora" }, body: {} }, report: "route policy honored: served by aurora; its published facts meet the policy (they are the gateway's claims, not verified by this client)", notify: false },
+      { query: "?t=2", reply: { status: 400, headers: { "route-refused": "reason=unsupported+key=zdr" }, body: {} }, report: "route policy refused by the gateway: unsupported (key zdr)", notify: true },
+      { query: "?t=3", reply: { status: 200, headers: { "route-applied": "provider=basalt" }, body: {} }, report: 'route policy NOT honored: provider "basalt" is not among the model\'s published routes', notify: true },
+    ];
+    for (const { query, reply, report, notify } of cases) {
+      gateway().replies.inference = reply;
+      harness.model.baseUrl = `${base}${query}`;
+      harness.wireUrl = `${base}/chat/completions${query}`;
+      const from = harness.shown.length;
+      const sentBefore = gateway().inference().length;
+      assert.ok((await harness.request()).sent, query);
+      const model = (JSON.parse(gateway().inference()[sentBefore]?.body ?? "{}") as { model?: string }).model;
+      const text = `${report} (request for ${model} to ${base}${query})`;
+      const expected = [{ method: "setStatus", text }, ...(notify ? [{ method: "notify", text }] : [])];
+      assert.deepEqual(harness.shown.slice(from), expected, query || "no query");
+    }
+  });
+
+  test(`C11: ${name}: each UI channel is used on its own: a status line that throws silences no notice, a notice that throws leaves the status line set, and with both gone the request and /route are unaffected`, async () => {
+    const harness = await make("zdr");
+    gateway().replies.inference = { status: 400, headers: { "route-refused": "reason=unsupported+key=zdr" }, body: {} };
+    const text = (model: string): string => `route policy refused by the gateway: unsupported (key zdr) (request for ${model} to ${gateway().base})`;
+    const modelSent = (): string => (JSON.parse(gateway().inference().at(-1)?.body ?? "{}") as { model?: string }).model ?? "";
+    harness.statusThrows = true;
+    let from = harness.shown.length;
+    assert.equal((await harness.request()).status, 400);
+    assert.deepEqual(harness.shown.slice(from), [{ method: "notify", text: text(modelSent()) }], "the notice shows the reason and key");
+    harness.statusThrows = false;
+    harness.notifyThrows = true;
+    from = harness.shown.length;
+    assert.equal((await harness.request()).status, 400);
+    assert.deepEqual(harness.shown.slice(from), [{ method: "setStatus", text: text(modelSent()) }], "the status line is set");
+    harness.statusThrows = true;
+    from = harness.shown.length;
+    const result = await harness.request();
+    assert.deepEqual([result.sent, result.status, harness.shown.slice(from), harness.handlerErrors], [true, 400, [], []]);
+    harness.statusThrows = false;
+    harness.notifyThrows = false;
+    await harness.command("route", "");
+    assert.match(notices(harness).at(-1) ?? "", new RegExp(`^Last result \\(request for .*\\): route policy refused by the gateway: unsupported \\(key zdr\\)$`, "m"));
   });
 
   test(`C2, C14: ${name}: a policy of preferences alone is not sent to a base URL that cannot be used as written either`, async () => {
@@ -196,24 +248,34 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     const before = gateway().requests.length;
     const result = await harness.request();
     assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: the base URL ".*" cannot be used exactly as written: its query "\?tag=a b" would be sent as "\?tag=a%20b"; a policy is not sent anywhere else$/);
-    assert.equal(gateway().requests.length, before);
+    // A read started and not awaited would still land: give one the time to.
+    await new Promise((wake) => setTimeout(wake, 100));
+    assert.equal(gateway().requests.length, before, "nothing reaches the gateway, a metadata read included");
   });
 
   test(`C3, C15: ${name}: a response to a request the previous session sent is not shown in the next one, though what it says of the gateway still counts`, async () => {
     const harness = await make("zdr");
+    // Another place, read before: what the late response says is about its own place, not this one.
+    assert.ok((await harness.request()).sent);
+    const reading = (query: string): number => gateway().requests.filter((r) => r.path.endsWith(`/route-policy${query}`)).length;
+    harness.model.baseUrl = `${gateway().base}?t=9`;
+    harness.wireUrl = `${gateway().base}/chat/completions?t=9`;
     gateway().replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 200 };
+    const posted = gateway().inference().length;
     const pending = harness.request();
-    for (let i = 0; i < 400 && gateway().inference().length === 0; i++) await new Promise((wake) => setTimeout(wake, 5));
+    for (let i = 0; i < 400 && gateway().inference().length === posted; i++) await new Promise((wake) => setTimeout(wake, 5));
     await harness.emit("session_start", { type: "session_start", reason: "new" });
     const shownAtStart = harness.shown.length;
     assert.ok((await pending).sent);
     assert.deepEqual(harness.shown.slice(shownAtStart), [], "nothing about it is shown in the new session");
-    const reads = gateway().requests.filter((r) => r.path.endsWith("/route-policy")).length;
+    const reads = [reading(""), reading("?t=9")];
     await harness.command("route", "");
     const text = notices(harness).at(-1) ?? "";
     assert.match(text, /^Last result: none yet in this session$/m);
-    // Not honored, it discarded the detection reply: /route reads it again.
-    assert.equal(gateway().requests.filter((r) => r.path.endsWith("/route-policy")).length, reads + 1);
+    // Not honored, it discarded its place's detection reply: /route reads it again there, and only there.
+    harness.model.baseUrl = gateway().base;
+    await harness.command("route", "");
+    assert.deepEqual([reading(""), reading("?t=9")], [reads[0], (reads[1] ?? 0) + 1]);
   });
 
   test(`C3, C15: ${name}: a session started again after a result has heard of none: /route says so, and the status line is cleared`, async () => {
@@ -221,8 +283,9 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     await harness.request();
     await harness.command("route", "");
     assert.match(notices(harness).at(-1) ?? "", /^Last result \(request for .*\): route policy honored/m);
+    const from = harness.shown.length;
     await harness.emit("session_start", { type: "session_start", reason: "resume" });
-    assert.equal(harness.shown.filter((line) => line.method === "setStatus").at(-1)?.text, undefined, "the status line is cleared");
+    assert.deepEqual(harness.shown.slice(from), [{ method: "setStatus", text: undefined }], "the status line is cleared, and nothing else shown");
     await harness.command("route", "");
     assert.match(notices(harness).at(-1) ?? "", /^Last result: none yet in this session$/m);
   });
@@ -231,7 +294,11 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     const harness = await make("zdr");
     Object.assign(harness.model, { headers: { "x-tenant": 7 } });
     assert.match((await harness.request()).error ?? "", /is not one the plugin released: .*it carries authorization, x-tenant besides the usual ones/);
-    assert.ok(gateway().requests.filter((r) => r.method === "GET").every((r) => r.headers["x-tenant"] === undefined), "the metadata reads did not carry it");
+    assert.deepEqual(
+      gateway().requests.map((r) => [r.method, r.path.slice(r.path.lastIndexOf("/")), r.headers.authorization, r.headers["x-tenant"]]),
+      [["GET", "/route-policy", "Bearer demo-key", undefined], ["GET", "/models", "Bearer demo-key", undefined]],
+      "both metadata reads were made, without it",
+    );
     assert.equal(gateway().inference().length, 0);
   });
 
@@ -242,14 +309,26 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     gateway().replies.inference = (request) =>
       (request.headers["route-policy"] ?? request.body).includes("notrain")
         ? { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {}, delayMs: 20 }
-        : { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {}, delayMs: 200 };
+        : { status: 200, headers: { "route-applied": "provider=basalt" }, body: {}, delayMs: 200 };
     const firstSent = first.request();
     for (let i = 0; i < 400 && gateway().inference().length === 0; i++) await new Promise((wake) => setTimeout(wake, 5));
     assert.equal(gateway().inference().length, 1, "the first request reached the gateway before the second left");
-    await Promise.all([firstSent, second.request()]);
-    const results = (harness: FakeHarness): string[] => notices(harness).filter((text) => /refused|honored/i.test(text));
-    assert.deepEqual(results(first).map((text) => text.replace(/:.*/, "")), ["route policy NOT honored"], "the first session hears only its own not-honored result");
-    assert.deepEqual(results(second).map((text) => text.replace(/ \(request for .*\)$/, "")), ["route policy refused by the gateway: unsatisfiable"], "the second session hears only its own refusal");
+    const firstFrom = first.shown.length;
+    const secondFrom = second.shown.length;
+    const refusal = `route policy refused by the gateway: unsatisfiable (request for ${name === "omp" ? "demo-model+notrain" : "demo-model"} to ${gateway().base})`;
+    // The second's refusal is back while the first is still out: it shows in the second session alone, status
+    // line and /route included, before anything of the first's could cover a leak.
+    await second.request();
+    assert.deepEqual(first.shown.slice(firstFrom), [], "nothing of the second's shows in the first");
+    assert.deepEqual(second.shown.slice(secondFrom), [{ method: "setStatus", text: refusal }, { method: "notify", text: refusal }]);
+    await first.command("route", "");
+    assert.match(notices(first).at(-1) ?? "", /^Last result: none yet in this session$/m);
+    await firstSent;
+    const notHonored = `route policy NOT honored: provider "basalt" is not among the model's published routes (request for ${name === "omp" ? "demo-model+zdr" : "demo-model"} to ${gateway().base})`;
+    assert.deepEqual(first.shown.slice(firstFrom + 1), [{ method: "setStatus", text: notHonored }, { method: "notify", text: notHonored }], "the first's own result, in the first session");
+    assert.deepEqual(second.shown.slice(secondFrom + 2), [], "and nothing of it in the second");
+    await second.command("route", "");
+    assert.match(notices(second).at(-1) ?? "", new RegExp(`^Last result \\(.*\\): route policy refused by the gateway: unsatisfiable$`, "m"));
   });
 
   test(`C10: ${name}: a payload whose own toJSON names another model, or none, is blocked: what is checked is what would be sent`, async () => {
@@ -263,11 +342,22 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
 
   test(`C9: ${name}: a payload whose own toJSON drops OpenRouter's fields is blocked, not released without them`, async () => {
     gateway().replies.detection = { status: 404 };
-    const harness = await make("only=aurora");
-    harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
-    const payload = { model: "vendor/model", messages: [], toJSON: () => ({ model: "vendor/model", messages: [] }) };
-    const result = await harness.request(payload);
-    assert.match(result.error ?? "", /does not carry OpenRouter's provider\.only as translated/);
+    // Each translated field dropped on its own, the others kept as translated.
+    for (const field of ["only", "ignore", "sort", "order"]) {
+      const harness = await make("only=aurora,cobalt+ignore=basalt+sort=price+order=cobalt");
+      harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
+      const payload = {
+        model: "vendor/model",
+        messages: [],
+        toJSON(this: Record<string, unknown>): unknown {
+          const { toJSON: _own, provider, ...rest } = this;
+          const kept = typeof provider === "object" && provider !== null ? Object.fromEntries(Object.entries(provider).filter(([key]) => key !== field)) : {};
+          return { ...rest, provider: kept };
+        },
+      };
+      const result = await harness.request(payload);
+      assert.match(result.error ?? "", new RegExp(`does not carry OpenRouter's provider\\.${field} as translated`), field);
+    }
     assert.equal(gateway().inference().length, 0);
   });
 
@@ -301,19 +391,26 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     gateway().replies.detection = { status: 404 };
     const harness = await make("only=aurora");
     harness.model = { id: "vendor/model+sort=price", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
+    // A response that names a route and evidence as if it had applied a policy: still unconfirmed, and only that.
+    gateway().replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt", "route-evidence": "https://basalt.example/attestation" }, body: {} };
+    const from = harness.shown.length;
     assert.ok((await harness.request({ model: harness.model.id, messages: [] })).sent);
     const [request] = gateway().inference();
     assert.deepEqual(JSON.parse(request?.body ?? "{}"), { model: "vendor/model", messages: [], provider: { only: ["aurora"], sort: "price" } });
     assert.equal(request?.headers["route-policy"], undefined);
-    assert.match(notices(harness).at(-1) ?? "", /unconfirmed, not applied/);
+    const text = `route policy translated into the gateway's own fields; the result is unconfirmed, not applied (request for vendor/model to ${OPENROUTER_BASE})`;
+    assert.deepEqual(harness.shown.slice(from), [{ method: "setStatus", text }, { method: "notify", text }]);
   });
 
   test(`C9: ${name}: a policy OpenRouter has no hard filter for is not sent there`, async () => {
     gateway().replies.detection = { status: 404 };
-    const harness = await make("notrain");
-    harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
-    const result = await harness.request({ model: "vendor/model", messages: [] });
-    assert.match(result.error ?? "", /notrain has no hard filter there/);
+    // Each requirement OpenRouter has no hard filter for, each for its own reason.
+    for (const [policy, why] of [["zdr", /zdr has no hard filter there/], ["notrain", /notrain has no hard filter there/], ["bits=8", /bits has no hard filter there/], ["region=us", /region has no request field there/], ["attest=weights", /attest has no counterpart there/]] as const) {
+      const harness = await make(policy);
+      harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "openai-completions" };
+      const result = await harness.request({ model: "vendor/model", messages: [] });
+      assert.match(result.error ?? "", why, policy);
+    }
     assert.equal(gateway().inference().length, 0);
   });
 
@@ -323,6 +420,14 @@ export function adapterContract(name: string, make: (policy?: string) => Promise
     harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "google-generative-ai" };
     const result = await harness.request({ model: "vendor/model", contents: [] });
     assert.match(result.error ?? "", /OpenRouter documents its provider field for openai-completions, openai-responses, anthropic-messages requests, not google-generative-ai/);
+    // Every other API too, an unnamed one included.
+    for (const api of ["google-vertex", "bedrock-converse-stream", "mistral-conversations", "azure-openai-responses"]) {
+      harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api };
+      assert.match((await harness.request({ model: "vendor/model", messages: [] })).error ?? "", new RegExp(`requests, not ${api}$`), api);
+    }
+    harness.contextModel = { id: "vendor/model", baseUrl: OPENROUTER_BASE };
+    assert.match((await harness.request({ model: "vendor/model", messages: [] })).error ?? "", /requests, not an unnamed API$/);
+    harness.contextModel = undefined;
     assert.equal(gateway().inference().length, 0);
     // The Chat Completions, Responses, and Messages APIs are the ones.
     harness.model = { id: "vendor/model", baseUrl: OPENROUTER_BASE, api: "anthropic-messages" };

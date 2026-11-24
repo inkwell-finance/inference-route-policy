@@ -37,9 +37,20 @@ const notices = (harness: FakeHarness): string[] => harness.shown.filter((s) => 
 test("C1: omp: a requirement with no valid detection reply is blocked before serialization, and nothing reaches the gateway", async () => {
   gateway.replies.detection = { status: 404 };
   const harness = await omp("zdr");
-  const result = await harness.request();
+  // The payload counts each time it is serialized: the plugin blocks without serializing it at all.
+  let serialized = 0;
+  const payload = {
+    model: "demo-model",
+    messages: [{ role: "user", content: "secret prompt" }],
+    toJSON(): unknown {
+      serialized += 1;
+      return { model: "demo-model", messages: [] };
+    },
+  };
+  const result = await harness.request(payload);
   assert.equal(result.sent, false);
   assert.match(result.error ?? "", /^Blocked by the route policy plugin, nothing was sent: .* has no valid detection reply/);
+  assert.equal(serialized, 0, "the payload was never serialized");
   assert.equal(gateway.inference().length, 0);
   assert.match(notices(harness).at(-1) ?? "", /^request blocked by the route policy plugin/);
 });
@@ -56,8 +67,10 @@ test("C10: omp: the held policy rides the model suffix, combined with one the us
 
 test("C3, C4: omp: an honored response is checked against the model list and shown quietly in the status line", async () => {
   const harness = await omp("zdr");
+  const from = harness.shown.length;
   await harness.request();
-  assert.equal(harness.shown.at(-1)?.method, "setStatus");
+  // Quietly: one status line, and no notice at all.
+  assert.deepEqual(harness.shown.slice(from).map((line) => line.method), ["setStatus"]);
   assert.match(harness.shown.at(-1)?.text ?? "", /^route policy honored: served by aurora; its published facts meet the policy/);
   gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
   await harness.request();
@@ -113,7 +126,12 @@ test("C2: omp: with no policy at all, a request goes as it is and nothing is fet
   const harness = await omp();
   const payload = { model: "demo-model", messages: [{ role: "user", content: "hi" }] };
   assert.ok((await harness.request(payload)).sent);
-  assert.deepEqual(JSON.parse(gateway.inference()[0]?.body ?? "{}"), payload);
+  assert.deepEqual(gateway.inference().map((r) => JSON.parse(r.body)), [payload]);
+  // Its headers as the harness set them: no policy header added, nothing else either.
+  assert.deepEqual(
+    gateway.inference().map((r) => Object.fromEntries(Object.entries(r.headers).filter(([h]) => !["host", "connection", "content-length", "accept", "accept-language", "accept-encoding", "sec-fetch-mode", "user-agent"].includes(h)))),
+    [{ authorization: "Bearer demo-key", "content-type": "application/json" }],
+  );
   assert.equal(gateway.requests.filter((r) => r.method === "GET").length, 0);
 });
 
@@ -131,18 +149,29 @@ test("C10: omp: /route sets, shows, and clears the policy; an invalid one change
 });
 
 test("C10: omp: the held policy survives a session resume", async () => {
-  const first = await omp("notrain");
-  const resumed = new FakeHarness(gateway.base, { headerHook: false });
-  resumed.entries.push(...first.entries);
-  routePolicy(resumed.api);
-  await resumed.emit("session_start", { type: "session_start" });
-  await resumed.request();
-  assert.equal(JSON.parse(gateway.inference()[0]?.body ?? "{}").model, "demo-model+notrain");
+  // The latest change is what is held: after several, and after a clear.
+  for (const [changes, model] of [[["notrain", "zdr", "clear", "zdr+notrain"], "demo-model+zdr+notrain"], [["notrain", "zdr", "clear"], "demo-model"]] as const) {
+    gateway.requests.length = 0;
+    const first = await omp();
+    for (const change of changes) await first.command("route", change);
+    const resumed = new FakeHarness(gateway.base, { headerHook: false });
+    resumed.entries.push(...first.entries);
+    routePolicy(resumed.api);
+    await resumed.emit("session_start", { type: "session_start" });
+    await resumed.request();
+    assert.equal(JSON.parse(gateway.inference()[0]?.body ?? "{}").model, model, changes.join(", "));
+  }
 });
 
 test("C15: omp: the session records the held policy and nothing a gateway said", async () => {
   const harness = await omp("zdr");
+  // Every kind of thing a gateway says: honored, refused, not honored, and a detection reply that changed.
   await harness.request();
+  gateway.replies.inference = { status: 400, headers: { "route-refused": "reason=unsatisfiable" }, body: {} };
+  await harness.request();
+  gateway.replies.inference = { status: 200, headers: { "route-applied": "provider=cobalt" }, body: {} };
+  await harness.request();
+  gateway.replies.detection = { status: 200, body: { route_policy: "1", keys: ["zdr"] } };
   await harness.command("route", "");
   assert.deepEqual(harness.entries.map((e) => [e.customType, e.data]), [["inference-route-policy", { policy: "zdr" }]]);
 });
@@ -155,6 +184,21 @@ test("C10: omp: a payload that names the selected model without its typed suffix
   const result = await harness.request({ model: "demo-model", messages: [] });
   assert.match(result.error ?? "", /the request names the model "demo-model" while "demo-model\+only=east" is selected/);
   assert.equal(gateway.inference().length, 0);
+});
+
+test("C10: omp: a payload naming another model is decided for the model it names, and blocked when it and the selected model disagree on a typed suffix", async () => {
+  gateway.replies.models = { status: 200, body: { data: [{ id: "demo-model", routes: [{ provider: "aurora", facts: "zdr+notrain" }] }, { id: "other-model", routes: [{ provider: "aurora", facts: "zdr" }] }] } };
+  const harness = await omp("zdr");
+  // The harness may name the selected model otherwise on the wire: its request carries the policy on that name.
+  assert.ok((await harness.request({ model: "other-model", messages: [] })).sent);
+  assert.deepEqual(gateway.inference().map((r) => JSON.parse(r.body).model), ["other-model+zdr"]);
+  // A typed suffix in one name and not the other: neither can be trusted, whatever the base ids.
+  const typed = await harness.request({ model: "other-model+notrain", messages: [] });
+  assert.match(typed.error ?? "", /the request names the model "other-model\+notrain" while "demo-model" is selected; the policy typed into one is not in the other/);
+  harness.model.id = "demo-model+notrain";
+  const dropped = await harness.request({ model: "other-model", messages: [] });
+  assert.match(dropped.error ?? "", /the request names the model "other-model" while "demo-model\+notrain" is selected/);
+  assert.equal(gateway.inference().length, 1);
 });
 
 test("C10: omp: a request with no model field to carry the policy in is blocked", async () => {
